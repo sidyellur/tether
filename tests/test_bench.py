@@ -6,18 +6,20 @@ from tether.store import Store
 
 
 class FakeEmbedder:
-    """Deterministic bag-of-words-ish vector: one dim per known token."""
+    """Deterministic bag-of-words embedder: one dim per known vocab token.
+    Matches the store's embedder contract (.embed(text)->unit vector, .name,
+    .dims) — mirrors tests/test_store.py's fake, not a batch .encode API."""
+    name = "fake-bench"
     _VOCAB = ["login", "500", "load", "dave", "orm", "neovim", "car",
               "office", "auth", "break", "distrusts", "drive"]
+    dims = len(_VOCAB)
 
-    def encode(self, texts):
-        import numpy as np
-        out = []
-        for t in texts:
-            v = np.array([1.0 if w in t.lower() else 0.0 for w in self._VOCAB])
-            n = np.linalg.norm(v)
-            out.append(v / n if n else v)
-        return np.array(out)
+    def embed(self, text):
+        import math
+        t = text.lower()
+        v = [1.0 if w in t else 0.0 for w in self._VOCAB]
+        n = math.sqrt(sum(x * x for x in v))
+        return [x / n for x in v] if n else v
 
 
 def _store(assoc=False, embedder=None):
@@ -78,3 +80,39 @@ def test_loader_maps_keys_to_ids_and_links():
     # a recall for the target returns it (sanity that memories landed)
     hits = s.recall("login returns 500 under load", limit=5)
     assert id_of["bug"] in [h["id"] for h in hits]
+
+
+def test_assert_golds_far_passes_and_flags():
+    import pytest
+    pytest.importorskip("numpy")
+    from bench import selfcheck, corpus as corpus_mod
+    e = FakeEmbedder()
+    # MINI graph_only gold ("dave distrusts the ORM layer") shares no vocab
+    # token with query ("why did login break") -> cosine 0 -> passes.
+    selfcheck.assert_golds_far(corpus_mod.MINI, e, threshold=0.35)
+    # A rigged corpus: gold body shares the query's tokens -> must raise.
+    rigged = corpus_mod.Corpus(
+        name="rigged",
+        memories=[corpus_mod.Memory("a", "note", "t", "login 500 load"),
+                  corpus_mod.Memory("b", "note", "t", "login 500 load again")],
+        tasks=[corpus_mod.Task("x", ["a", "b"])],
+        queries=[corpus_mod.Query("login 500 load", "a", ["b"], "graph_only")],
+    )
+    with pytest.raises(AssertionError):
+        selfcheck.assert_golds_far(rigged, e, threshold=0.35)
+
+
+def test_assert_targets_found_passes_and_flags():
+    import pytest
+    pytest.importorskip("numpy")
+    from bench import selfcheck, loader, corpus as corpus_mod
+    s = _store(assoc=False, embedder=FakeEmbedder())
+    id_of = loader.load(corpus_mod.MINI, s)
+    selfcheck.assert_targets_found(corpus_mod.MINI, s, id_of, k=10)
+    # A query whose target is unfindable by v0.2 must raise.
+    bad = corpus_mod.Corpus(
+        name="bad", memories=corpus_mod.MINI.memories, tasks=[],
+        queries=[corpus_mod.Query("xyzzy nonexistent terms", "car",
+                                  ["car"], "control")])
+    with pytest.raises(AssertionError):
+        selfcheck.assert_targets_found(bad, s, id_of, k=10)
