@@ -34,8 +34,11 @@ def _get_store() -> Store:
         if config.semantic_enabled():
             from . import embed
             embedder = embed.get_embedder(config.embedding_model())
-        store = Store(conn, device_id=config.device_id(),
-                      sync_now=sync_now, embedder=embedder)
+        store = Store(conn, device_id=config.device_id(), sync_now=sync_now,
+                      embedder=embedder, author=config.author(),
+                      consolidate=config.consolidate_enabled(),
+                      dedup_threshold=config.dedup_threshold(),
+                      decay_half_life_days=config.decay_half_life_days())
         store.migrate()
         if embedder is not None:
             store.backfill_embeddings()
@@ -57,7 +60,8 @@ def remember(type: str, title: str, body: str,
         tags: optional comma-separated tags.
         links: optional list of related memory ids.
 
-    Returns {"id", "action"} where action is "created" or "updated".
+    Returns {"id", "action"} where action is "created", "updated", or (with
+    TETHER_CONSOLIDATE on) "consolidated" - a near-duplicate was superseded.
     """
     try:
         return _get_store().remember(type, title, body, tags=tags, links=links)

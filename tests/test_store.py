@@ -314,3 +314,176 @@ def test_recall_degrades_when_numpy_missing(monkeypatch):
     monkeypatch.setitem(sys.modules, "numpy", None)  # `import numpy` now raises
     assert len(s.recall("car")) == 1           # keyword still works, no crash
     assert s.recall("automobile") == []        # semantic unavailable -> empty, not an error
+
+
+def test_migrate_adds_consolidation_columns():
+    s = make_store()
+    cols = {r[1] for r in s._conn.execute("PRAGMA table_info(memories)").fetchall()}
+    assert {"author", "valid_from", "valid_to", "superseded_by"} <= cols
+
+
+def test_migrate_backfills_valid_from_for_existing_rows():
+    # A pre-consolidation row (has created_at, no valid_from) gets valid_from set.
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s.migrate()
+    s.remember("user", "A", "a note")
+    conn.execute("UPDATE memories SET valid_from=NULL")  # simulate a legacy row
+    conn.commit()
+    s.migrate()  # idempotent + heals valid_from
+    vf, ca = conn.execute(
+        "SELECT valid_from, created_at FROM memories").fetchone()
+    assert vf == ca and vf is not None
+
+
+def make_authored_store(author="sid", **kw):
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, device_id="dev", sync_now=lambda *a, **k: None,
+              author=author, **kw)
+    s.migrate()
+    return s
+
+
+def test_remember_records_author_and_valid_from():
+    s = make_authored_store("sid")
+    r = s.remember("user", "A", "a note")
+    row = s._conn.execute(
+        "SELECT author, valid_from, valid_to, created_at FROM memories WHERE id=?",
+        (r["id"],)).fetchone()
+    author, valid_from, valid_to, created_at = row
+    assert author == "sid"
+    assert valid_from == created_at
+    assert valid_to is None  # brand-new fact is current
+
+
+def test_remember_upsert_skips_superseded():
+    s = make_authored_store()
+    a = s.remember("user", "A", "first")["id"]
+    # Manually supersede it (as Task 4 would): mark it not-current.
+    s._conn.execute("UPDATE memories SET valid_to='t', superseded_by=999 WHERE id=?", (a,))
+    s._conn.commit()
+    again = s.remember("user", "A", "second")  # same title, but old one is superseded
+    assert again["action"] == "created"        # a fresh current row, not an update
+    assert again["id"] != a
+
+
+def test_remember_action_unchanged_without_consolidate():
+    s = make_authored_store()  # consolidate defaults False
+    assert s.remember("user", "A", "x")["action"] == "created"
+    assert s.remember("user", "A", "y")["action"] == "updated"  # exact-title refine
+
+
+def make_consolidating_store(threshold=0.92):
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, device_id="dev", sync_now=lambda *a, **k: None,
+              embedder=FakeEmbedder(), author="sid",
+              consolidate=True, dedup_threshold=threshold)
+    s.migrate()
+    return s
+
+
+def test_consolidate_supersedes_near_duplicate():
+    pytest.importorskip("numpy")
+    s = make_consolidating_store(threshold=0.9)
+    a = s.remember("user", "Commute A", "I drive my car to work")["id"]
+    # Different title, same meaning (vehicle axis) -> should consolidate.
+    r = s.remember("user", "Commute B", "driving the car every day")
+    assert r["action"] == "consolidated"
+    old = s._conn.execute(
+        "SELECT valid_to, superseded_by FROM memories WHERE id=?", (a,)).fetchone()
+    assert old[0] is not None and old[1] == r["id"]   # old row retained + linked
+    assert s._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 2  # not deleted
+
+
+def test_consolidate_keeps_distinct_facts_separate():
+    pytest.importorskip("numpy")
+    s = make_consolidating_store(threshold=0.9)
+    s.remember("user", "Car", "I drive my car")            # vehicle axis
+    r = s.remember("user", "Lunch", "pizza and food today")  # food axis, unrelated
+    assert r["action"] == "created"                        # NOT merged
+    assert s._conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL").fetchone()[0] == 2
+
+
+def test_consolidate_noop_without_embedder():
+    # consolidate=True but no embedder -> plain insert, never raises.
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "dev", lambda *a, **k: None, consolidate=True)
+    s.migrate()
+    s.remember("user", "A", "car")
+    assert s.remember("user", "B", "car")["action"] == "created"
+
+
+def test_rrf_fuse_still_orders_by_combined_rank():
+    from tether.store import _rrf_fuse
+    fused = _rrf_fuse([[1, 2, 3], [2, 5, 1]])
+    assert fused[0] == 2 and set(fused) == {1, 2, 3, 5}
+
+
+def test_decay_factor_math():
+    from tether.store import _decay_factor
+    assert _decay_factor(0.0, 30.0) == 1.0
+    assert abs(_decay_factor(30.0, 30.0) - 0.5) < 1e-9
+    assert _decay_factor(60.0, 30.0) < 0.3
+
+
+def test_recall_excludes_superseded():
+    pytest.importorskip("numpy")
+    s = make_consolidating_store(threshold=0.9)
+    a = s.remember("user", "Commute A", "I drive my car to work")["id"]
+    r = s.remember("user", "Commute B", "driving the car every day")
+    assert r["action"] == "consolidated"           # a is now superseded
+    hits = s.recall("car")
+    ids = [h["id"] for h in hits]
+    assert r["id"] in ids and a not in ids          # only the current fact
+
+
+def test_boot_index_excludes_superseded():
+    pytest.importorskip("numpy")
+    s = make_consolidating_store(threshold=0.9)
+    s.remember("user", "Commute A", "I drive my car to work")
+    r = s.remember("user", "Commute B", "driving the car every day")
+    lines = s.boot_index().splitlines()
+    assert len(lines) == 1 and f"#{r['id']}" in lines[0]
+
+
+def test_recency_breaks_ties():
+    # Two equally-relevant keyword hits; the newer updated_at wins.
+    s = make_authored_store()
+    old = s.remember("user", "Old", "the keyword apple")["id"]
+    new = s.remember("project", "New", "the keyword apple")["id"]
+    s._conn.execute("UPDATE memories SET updated_at='2000-01-01T00:00:00+00:00' WHERE id=?", (old,))
+    s._conn.execute("UPDATE memories SET updated_at='2030-01-01T00:00:00+00:00' WHERE id=?", (new,))
+    s._conn.commit()
+    hits = s.recall("apple")
+    assert [h["id"] for h in hits][0] == new
+
+
+def test_decay_downranks_old_memories():
+    # With decay on, a very old memory is pushed below a fresh one of equal relevance.
+    s = make_authored_store(decay_half_life_days=1.0)  # 1-day half-life
+    old = s.remember("user", "Old", "the keyword apple")["id"]
+    new = s.remember("project", "New", "the keyword apple")["id"]
+    s._conn.execute("UPDATE memories SET updated_at='2000-01-01T00:00:00+00:00' WHERE id=?", (old,))
+    s._conn.commit()
+    hits = s.recall("apple")
+    assert [h["id"] for h in hits][0] == new
+
+
+def test_recency_does_not_override_strong_match():
+    # A memory that matches BOTH keyword and semantic signals (agreeing at
+    # rank 0 in both lists) outranks a memory that only weakly matches -
+    # even when the weak match is decades newer. The relevance gap from two
+    # agreeing signals is large enough that the gentle 0.25 recency weight
+    # (which only ever pulls from a single ranked list) cannot flip it.
+    pytest.importorskip("numpy")
+    s = make_semantic_store()
+    best = s.remember("user", "Best", "I drive my car to work every day")["id"]
+    weak = s.remember("reference", "Weak",
+                       "a note mostly about pizza and food, "
+                       "with one incidental car mention")["id"]
+    s._conn.execute("UPDATE memories SET updated_at='2000-01-01T00:00:00+00:00' WHERE id=?", (best,))
+    s._conn.execute("UPDATE memories SET updated_at='2030-01-01T00:00:00+00:00' WHERE id=?", (weak,))
+    s._conn.commit()
+    hits = s.recall("car")
+    assert [h["id"] for h in hits][0] == best
