@@ -103,16 +103,22 @@ def _unpack(blob: bytes) -> tuple:
 
 _RECENCY_WEIGHT = 0.25
 _PRIMING_WEIGHT = 0.25
-# Associative ranking protects the head and re-ranks the tail. Semantic recall
-# returns the whole store as near-tied seeds, so a direct hit is distinguished
-# only by sitting in the top few by v0.2 score. _PROTECT_HEAD locks that many
-# top v0.2 hits in place (so a direct hit can't be buried by spreading - the #25
-# regression), and everything below is re-ranked by spread activation to surface
-# connected-but-weakly-matched memories. Larger == more protection, less upside.
-# 8 is the bench-validated default (see bench/): control nDCG stays == v0.2 while
-# warmed graph-only recall beats it; below ~8 unwarmed recall dips under v0.2, and
-# above ~10 the associative upside disappears.
+# Associative ranking protects the head and re-ranks the tail. _PROTECT_HEAD
+# locks that many top v0.2 hits in place (so a direct hit can't be buried by
+# spreading - the #25 regression), and everything below is re-ranked by spread
+# activation to surface connected-but-weakly-matched memories. Larger == more
+# protection, less upside. 8 predates the #15 seed floor, which bounds the seed
+# set to genuinely-relevant hits (so `head` is now "protect the real seeds", not
+# "protect the top 8 of the whole store"); the default likely wants re-tuning
+# downward now that spread governs real slots -- tracked as a bench follow-up.
 _PROTECT_HEAD = 8
+# Minimum cosine a vector hit needs to seed an associative walk (#15). Without
+# it, _vector_ids returns the whole store as near-tied seeds, so the associative
+# tier can never label an edge-reached memory (everything is already a seed) and
+# protect-head guards a meaningless order. 0.35 sits in the clean gap the bench
+# corpus shows between entry targets (>=0.49) and distant golds (<=0.29 -- these
+# should be reached by edges, not seeded); it leaves margin for real paraphrases.
+_SEED_FLOOR = 0.35
 
 
 def _rrf_scores(ranked_lists, k=60):
@@ -146,7 +152,7 @@ class Store:
     def __init__(self, conn, device_id: str, sync_now, embedder=None,
                  author="", consolidate=False, dedup_threshold=0.92,
                  decay_half_life_days=None, assoc=False, recall_budget=8,
-                 protect_head=_PROTECT_HEAD,
+                 protect_head=_PROTECT_HEAD, seed_floor=_SEED_FLOOR,
                  boot_index_cap=50, forget=False, forget_age_days=90,
                  forget_interval=20, forget_max_per_sweep=10):
         self._conn = conn
@@ -159,6 +165,7 @@ class Store:
         self._decay_half_life_days = decay_half_life_days
         self._recall_budget = recall_budget
         self._protect_head = protect_head
+        self._seed_floor = seed_floor
         self._graph = Graph(conn, enabled=assoc)
         self._boot_index_cap = boot_index_cap
         self._forget = forget
@@ -437,7 +444,11 @@ class Store:
                                 dtype="<f4").reshape(len(ids), -1)
             # stored vectors and q are unit-normalized, so dot == cosine
             sims = mat @ q
-            order = np.argsort(-sims)[:limit]
+            # #15: only genuinely-similar rows seed the walk. Rows below the
+            # floor are left for the graph to reach by edge, not seeded as
+            # near-tied noise. (floor 0 -> pre-#15 behavior: keep the whole store.)
+            order = [i for i in np.argsort(-sims)[:limit]
+                     if sims[i] >= self._seed_floor]
             return [ids[i] for i in order]
         except Exception:
             return []
@@ -499,13 +510,13 @@ class Store:
         if not activated:
             return []
         activation, receipts = self._graph.spread(activated, budget, type)
-        # protect-head / re-rank-tail. Semantic recall returns the whole store as
-        # near-tied seeds, so a direct hit is distinguished only by sitting in the
-        # top few by v0.2 score. Lock that head in exact v0.2 order (a direct hit
-        # can't be demoted -> no #25 regression), then re-rank everything below it
-        # by spread activation, which surfaces connected-but-weakly-matched
-        # memories (huge activation, deep in the v0.2 tail) into the slots the
-        # direct hits didn't claim. HEAD is the protected-prefix size.
+        # protect-head / re-rank-tail. The #15 seed floor bounds `seeds` to
+        # genuinely-relevant hits, so the head is the real direct matches. Lock
+        # that head in exact v0.2 order (a direct hit can't be demoted -> no #25
+        # regression), then re-rank everything below it by spread activation,
+        # which surfaces connected-but-weakly-matched memories (reached by edge,
+        # now below the floor as seeds) into the slots the direct hits didn't
+        # claim. HEAD is the protected-prefix size.
         seed_order = [m for m, _ in sorted(
             seeds.items(), key=lambda kv: (-kv[1], kv[0]))]
         head = seed_order[:self._protect_head]

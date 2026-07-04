@@ -121,6 +121,21 @@ def test_protect_head_default_and_parsing(monkeypatch):
     assert config.protect_head() == 8
 
 
+def test_seed_floor_default_and_parsing(monkeypatch):
+    monkeypatch.delenv("TETHER_SEED_FLOOR", raising=False)
+    assert config.seed_floor() == 0.35
+    monkeypatch.setenv("TETHER_SEED_FLOOR", "0.5")
+    assert config.seed_floor() == 0.5
+    monkeypatch.setenv("TETHER_SEED_FLOOR", "0")
+    assert config.seed_floor() == 0.0            # 0 disables the floor
+    monkeypatch.setenv("TETHER_SEED_FLOOR", "1.5")
+    assert config.seed_floor() == 0.35           # out of [0,1] -> default
+    monkeypatch.setenv("TETHER_SEED_FLOOR", "-0.2")
+    assert config.seed_floor() == 0.35
+    monkeypatch.setenv("TETHER_SEED_FLOOR", "junk")
+    assert config.seed_floor() == 0.35
+
+
 def test_boot_index_cap_default_and_parsing(monkeypatch):
     monkeypatch.delenv("TETHER_BOOT_INDEX_CAP", raising=False)
     assert config.boot_index_cap() == 50
