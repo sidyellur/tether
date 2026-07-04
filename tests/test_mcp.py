@@ -86,6 +86,24 @@ def test_server_wires_semantic_recall(monkeypatch, tmp_path):
         server._store = None
 
 
+def test_server_consolidation_defaults_off(monkeypatch, tmp_path):
+    from tether import server
+    monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
+    monkeypatch.delenv("TETHER_CONSOLIDATE", raising=False)
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")  # keep it hermetic
+    monkeypatch.delenv("TETHER_SYNC_URL", raising=False)
+    monkeypatch.delenv("TETHER_SYNC_TOKEN", raising=False)
+
+    server._store = None
+    try:
+        store = server._get_store()
+        assert store._consolidate is False
+        assert store._decay_half_life_days is None
+        assert store._author  # falls back to device id, never empty
+    finally:
+        server._store = None
+
+
 @pytest.mark.skipif(os.environ.get("TETHER_TEST_REAL_MODEL") != "1",
                     reason="set TETHER_TEST_REAL_MODEL=1 to run the real model over stdio")
 def test_mcp_roundtrip_with_real_semantic(tmp_path):

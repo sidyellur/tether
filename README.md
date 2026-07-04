@@ -102,6 +102,23 @@ Environment:
 | `TETHER_SEMANTIC` | on | set `0`/`false`/`off` to force keyword-only recall |
 | `TETHER_EMBEDDING_MODEL` | `minishlab/potion-base-8M` | override the local static model |
 
+## Consolidation (optional)
+
+tether keeps a superseded fact rather than overwriting it: when a memory is
+replaced, the old one is marked no longer current (retained for history) and
+excluded from `recall` and the boot index. Recall also gently favors more
+recent facts. Two opt-in behaviors go further:
+
+| Var | Default | Effect |
+|---|---|---|
+| `TETHER_CONSOLIDATE` | off | on (`1`/`true`) merges a near-duplicate on write — supersedes the old fact instead of fragmenting the store (needs the `[semantic]` extra) |
+| `TETHER_DEDUP_THRESHOLD` | `0.92` | cosine similarity required to treat two facts as duplicates |
+| `TETHER_DECAY_HALF_LIFE_DAYS` | off | set a positive number to exponentially down-rank older facts in recall |
+| `TETHER_AUTHOR` | device id | attribution recorded on each memory |
+
+Consolidation never deletes — only `forget` does. All of this degrades to
+plain keyword recall when the semantic extra is absent.
+
 ## Tools
 
 | Tool | What it does |
