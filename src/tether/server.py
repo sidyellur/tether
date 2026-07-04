@@ -119,6 +119,16 @@ def link(id_a: int, id_b: int) -> dict:
 
 
 @mcp.tool()
+def dismiss_cluster(id_a: int, id_b: int) -> dict:
+    """Reflection control: dismiss the crystallization candidate nucleated by the
+    peak edge (id_a, id_b) so it is not re-surfaced. Not a memory operation."""
+    try:
+        return _get_store().dismiss_cluster(id_a, id_b)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
 def forget(id: int) -> dict:
     """Permanently delete a memory by id. Returns {"forgotten", "existed"}."""
     try:

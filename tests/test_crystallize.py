@@ -51,3 +51,25 @@ def test_min_cluster_filters_small():
     conn = _store_with_edges(
         [(1, "a"), (2, "b")], [(1, 2, "explicit", 1.0)])
     assert crystallize.candidates(conn) == []
+
+
+def test_dedup_suppresses_recovered_principle_basis():
+    # principle 10 crystallizes sources {1,2,3}; a candidate re-covering >=60%
+    # of that basis is suppressed.
+    conn = _store_with_edges(
+        [(1, "a"), (2, "b"), (3, "c"), (10, "principle")],
+        [(1, 2, "explicit", 1.0), (2, 3, "semantic", 0.9),
+         (10, 1, "crystallized", 1.0), (10, 2, "crystallized", 1.0),
+         (10, 3, "crystallized", 1.0)])
+    assert crystallize.candidates(conn) == []       # basis {1,2,3} fully re-covered
+
+
+def test_dismissed_peak_suppresses_candidate():
+    conn = _store_with_edges(
+        [(1, "a"), (2, "b"), (3, "c")],
+        [(1, 2, "explicit", 1.0), (2, 3, "semantic", 0.9)])
+    assert len(crystallize.candidates(conn)) == 1   # visible first
+    conn.execute("CREATE TABLE crystallize_dismissed(src INTEGER, dst INTEGER, "
+                 "PRIMARY KEY(src,dst));")
+    conn.execute("INSERT INTO crystallize_dismissed VALUES(1,2)")  # dismiss the peak
+    assert crystallize.candidates(conn) == []

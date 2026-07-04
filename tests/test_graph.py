@@ -243,3 +243,10 @@ def test_on_crystallize_disabled_is_noop():
     conn.execute("INSERT INTO memories(id, type) VALUES(1, 'project')")
     g.on_crystallize(1, [2])
     assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+
+
+def test_dismiss_peak_is_canonical_and_readable():
+    conn, g = _graph()
+    g.migrate()
+    g.dismiss_peak(5, 2)                             # order-independent
+    assert g.dismissed_peaks() == {(2, 5)}

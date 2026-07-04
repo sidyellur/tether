@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS session_members (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (session_id, memory_id)
 );
+CREATE TABLE IF NOT EXISTS crystallize_dismissed (
+    src INTEGER NOT NULL,
+    dst INTEGER NOT NULL,
+    PRIMARY KEY (src, dst)
+);
 """
 
 
@@ -134,6 +139,23 @@ class Graph:
                     (principle_id, src, now))
         except Exception:
             return
+
+    def dismiss_peak(self, a, b) -> None:
+        try:
+            src, dst = (a, b) if a < b else (b, a)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO crystallize_dismissed(src, dst) VALUES(?,?)",
+                (src, dst))
+            self._conn.commit()
+        except Exception:
+            return
+
+    def dismissed_peaks(self) -> set:
+        try:
+            return {(r[0], r[1]) for r in self._conn.execute(
+                "SELECT src, dst FROM crystallize_dismissed").fetchall()}
+        except Exception:
+            return set()
 
     def backfill_semantic(self) -> None:
         if not self.enabled:

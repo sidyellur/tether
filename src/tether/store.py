@@ -579,6 +579,10 @@ class Store:
         self._sync_now()
         return {"linked": [id_a, id_b]}
 
+    def dismiss_cluster(self, id_a, id_b) -> dict:
+        self._graph.dismiss_peak(id_a, id_b)
+        return {"dismissed": [id_a, id_b]}
+
     def forget(self, id) -> dict:
         cur = self._conn.execute("DELETE FROM memories WHERE id=?", (id,))
         self._graph.on_forget(id)

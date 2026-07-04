@@ -13,6 +13,7 @@ PEAK_FLOOR = 0.5                          # boundness a peak edge must clear to 
 EXPAND_COS = 0.5                          # semantic edge weight (== cosine) to admit a member
 EXPAND_HOPS = 1                           # membership hop cap (precision boundary)
 MIN_CLUSTER = 3                           # min members to surface
+DEDUP_OVERLAP = 0.6                        # basis-recovery fraction to suppress
 
 
 def _current_ids(conn):
@@ -86,6 +87,35 @@ def _descriptor(conn, member_ids):
     return titles + (f" [tags: {', '.join(tags)}]" if tags else "")
 
 
+def _principle_bases(conn, current):
+    """{principle_id: frozenset(source_ids)} from directional crystallized edges,
+    restricted to still-current memories. on_forget deletes a node's edges, but a
+    soft-forgotten (valid_to set, edges retained) principle or source must not
+    suppress a live candidate via stale basis-recovery overlap."""
+    bases = {}
+    for src, dst in conn.execute(
+            "SELECT src, dst FROM edges WHERE kind='crystallized'").fetchall():
+        if src in current and dst in current:
+            bases.setdefault(src, set()).add(dst)
+    return {p: frozenset(s) for p, s in bases.items()}
+
+
+def _covered(member_ids, bases):
+    members = set(member_ids)
+    for sources in bases.values():
+        if sources and len(members & sources) / len(sources) >= DEDUP_OVERLAP:
+            return True
+    return False
+
+
+def _dismissed(conn):
+    try:
+        return {(r[0], r[1]) for r in conn.execute(
+            "SELECT src, dst FROM crystallize_dismissed").fetchall()}
+    except Exception:
+        return set()
+
+
 def candidates(conn, embedder=None):
     """Raw candidate clusters (no dedup/dismissed/fallback yet — Tasks 4-5)."""
     try:
@@ -99,6 +129,8 @@ def candidates(conn, embedder=None):
         peaks_by_root = {}
         for a, b in peaks:
             peaks_by_root.setdefault(find(a), []).append((a, b))
+        bases = _principle_bases(conn, current)
+        dismissed = _dismissed(conn)
         out = []
         for root, seed in sorted(groups.items()):
             members = _expand(seed, conn, current)
@@ -106,6 +138,10 @@ def candidates(conn, embedder=None):
                 continue
             member_ids = sorted(members)
             root_peaks = sorted(peaks_by_root.get(root, []))
+            if root_peaks[0] in dismissed:           # dismissed nucleus
+                continue
+            if _covered(member_ids, bases):          # basis already crystallized
+                continue
             out.append({
                 "peak_key": root_peaks[0],
                 "member_ids": member_ids,
