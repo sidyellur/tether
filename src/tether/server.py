@@ -42,6 +42,7 @@ def _get_store() -> Store:
                       assoc=config.assoc_enabled(),
                       recall_budget=config.recall_budget(),
                       protect_head=config.protect_head(),
+                      seed_floor=config.seed_floor(),
                       boot_index_cap=config.boot_index_cap(),
                       forget=config.forget_enabled(),
                       forget_age_days=config.forget_age_days(),

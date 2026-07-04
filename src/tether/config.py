@@ -90,6 +90,7 @@ def decay_half_life_days():
 _ASSOC_OFF = {"0", "false", "no", "off"}
 _DEFAULT_RECALL_BUDGET = 8
 _DEFAULT_PROTECT_HEAD = 8
+_DEFAULT_SEED_FLOOR = 0.35
 
 
 def assoc_enabled() -> bool:
@@ -124,6 +125,20 @@ def protect_head() -> int:
     except ValueError:
         return _DEFAULT_PROTECT_HEAD
     return val if val >= 0 else _DEFAULT_PROTECT_HEAD
+
+
+def seed_floor() -> float:
+    """Minimum cosine a vector hit needs to seed an associative walk (#15).
+    Below it a memory is reachable only by edge, not seeded as near-tied noise.
+    Out-of-range or unparseable values fall back to the default; 0 disables."""
+    raw = os.environ.get("TETHER_SEED_FLOOR")
+    if not raw:
+        return _DEFAULT_SEED_FLOOR
+    try:
+        val = float(raw)
+    except ValueError:
+        return _DEFAULT_SEED_FLOOR
+    return val if 0.0 <= val <= 1.0 else _DEFAULT_SEED_FLOOR
 
 
 _FORGET_ON = {"1", "true", "yes", "on"}

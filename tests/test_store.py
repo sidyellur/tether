@@ -749,3 +749,34 @@ def test_forget_trigger_disabled_never_fires():
         s.remember("user", f"T{i}", "b")
     assert s._conn.execute(
         "SELECT value FROM meta WHERE key='forget_counter'").fetchone() is None
+
+
+def test_seed_floor_excludes_low_cosine_from_seeds():
+    # #15: a memory whose cosine to the query is below the seed floor must not
+    # be seeded (it should be reachable only via edges, not as a near-tied
+    # whole-store seed). Query "automobile" (axis0) has no lexical overlap with
+    # either body, so ONLY the vector arm can seed them -> the floor is decisive.
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              seed_floor=0.5)
+    s.migrate()
+    keep = s.remember("user", "keep", "car")["id"]            # cos=1.0  >= 0.5
+    drop = s.remember("user", "drop", "car pizza food")["id"] # cos=0.447 < 0.5
+    seeds = s._seed_scores("automobile", None)
+    assert keep in seeds
+    assert drop not in seeds
+
+
+def test_seed_floor_zero_keeps_all_vector_hits():
+    # Floor at 0 reproduces the pre-#15 behavior: every embedded row is a seed.
+    # Proves the floor is what excludes the low-cosine row, nothing else.
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              seed_floor=0.0)
+    s.migrate()
+    keep = s.remember("user", "keep", "car")["id"]
+    drop = s.remember("user", "drop", "car pizza food")["id"]
+    seeds = s._seed_scores("automobile", None)
+    assert keep in seeds and drop in seeds
