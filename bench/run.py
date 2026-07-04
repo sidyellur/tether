@@ -11,8 +11,15 @@ from bench import metrics, selfcheck, conditions
 
 def evaluate(store, id_of, corpus, kind, k=10, budget=None):
     per_query = []
-    for q in corpus.by_kind(kind):
-        ranked = [h["id"] for h in store.recall(q.query, limit=k, budget=budget)]
+    for i, q in enumerate(corpus.by_kind(kind)):
+        # Each query gets its OWN fresh session id. recall() primes from and
+        # learns into the session working set, so a shared session would let
+        # query N's results reorder query N+1 (priming carryover) — measuring
+        # eval-order, not the graph. A unique per-query session isolates the
+        # measurement to the warmed graph alone. (The design's "fresh session
+        # for the headline" pin, applied per query.)
+        ranked = [h["id"] for h in store.recall(
+            q.query, limit=k, budget=budget, session=f"eval-{kind}-{i}")]
         gold = {id_of[g] for g in q.gold_keys}
         per_query.append({
             "query": q.query,
