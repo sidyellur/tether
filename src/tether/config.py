@@ -88,7 +88,7 @@ def decay_half_life_days():
 
 
 _ASSOC_OFF = {"0", "false", "no", "off"}
-_DEFAULT_RECALL_BUDGET = 24
+_DEFAULT_RECALL_BUDGET = 8
 
 
 def assoc_enabled() -> bool:

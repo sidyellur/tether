@@ -562,6 +562,56 @@ def test_recall_budget_zero_is_passthrough():
     assert ids == [a]                             # no spreading -> only the direct match
 
 
+def test_recall_seed_not_buried_by_high_weight_hebbian_neighbor():
+    # #25: a within-task co-recalled neighbor (NOT a query match), reached over a
+    # capped Hebbian edge (factor 5.0*0.4=2.0, amplifying), must not outrank the
+    # query's own direct hit.
+    # NOTE: with only 2 memories in this store, budget>=2 lets `b` fire back
+    # across the same (bidirectional) edge and re-boost `a`'s own activation
+    # enough that the old single-tier sort accidentally keeps a > b anyway
+    # (verified: budget=8 does NOT reproduce #25 here). budget=1 caps the walk
+    # to the single a->b hop the bug report describes, so this reproduces the
+    # bug under the pre-fix code and is a real regression check post-fix.
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]     # matches query
+    b = s.remember("project", "Picnic", "quarterly pizza budget review")["id"]  # no match
+    s._graph._upsert_edge(a, b, "hebbian", 5.0, "2026-01-01T00:00:00+00:00", mode="max")
+    s._conn.commit()
+    ids = [h["id"] for h in s.recall("JWT tokens", budget=1)]
+    assert a in ids and b in ids
+    assert ids.index(a) < ids.index(b)          # seed dominates the spread-reached node
+
+
+def test_recall_seed_tier_keeps_v2_order():
+    # two query matches of different relevance; a fat Hebbian edge into the
+    # weaker match's neighbor must not lift the weaker seed above the stronger.
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    strong = s.remember("user", "A", "JWT tokens JWT tokens JWT tokens auth login")["id"]
+    weak = s.remember("project", "B", "JWT tokens mentioned once in passing")["id"]
+    c = s.remember("reference", "C", "quarterly pizza budget review")["id"]  # non-seed
+    s._graph._upsert_edge(weak, c, "hebbian", 5.0, "2026-01-01T00:00:00+00:00", mode="max")
+    s._conn.commit()
+    order = [h["id"] for h in s.recall("JWT tokens", budget=8)]
+    assert order.index(strong) < order.index(weak)   # v0.2 relevance order preserved
+
+
+def test_recall_primed_nonseed_ranks_below_seeds():
+    # priming is an associative boost, not a direct hit: a primed node that is
+    # not a v0.2 match must land in the spread tier, below every seed.
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]           # seed
+    b = s.remember("project", "Picnic", "quarterly pizza budget review")["id"]  # not a match
+    s._conn.execute(
+        "INSERT INTO session_members(session_id, memory_id, activation, updated_at) "
+        "VALUES ('s1', ?, 100.0, '2026-01-01T00:00:00+00:00')", (b,))
+    s._conn.commit()
+    order = [h["id"] for h in s.recall("JWT tokens", budget=8, session="s1")]
+    assert order.index(a) < order.index(b)
+
+
 def make_b1_store(assoc=True, **kw):
     conn = sqlite3.connect(":memory:")
     s = Store(conn, "d", lambda *a, **k: None, assoc=assoc, **kw)

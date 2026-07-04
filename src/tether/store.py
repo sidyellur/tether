@@ -135,7 +135,7 @@ def _decay_factor(age_days: float, half_life_days: float) -> float:
 class Store:
     def __init__(self, conn, device_id: str, sync_now, embedder=None,
                  author="", consolidate=False, dedup_threshold=0.92,
-                 decay_half_life_days=None, assoc=False, recall_budget=24,
+                 decay_half_life_days=None, assoc=False, recall_budget=8,
                  boot_index_cap=50, forget=False, forget_age_days=90,
                  forget_interval=20, forget_max_per_sweep=10):
         self._conn = conn
@@ -468,30 +468,40 @@ class Store:
     def recall(self, query, type=None, limit=20, budget=None, session=None) -> list:
         if not query or not query.strip():
             return []
-        scores = self._seed_scores(query, type)
+        seeds = self._seed_scores(query, type)
         if not self._graph.enabled:
-            if not scores:
+            if not seeds:
                 return []
             order = [mid for mid, _ in sorted(
-                scores.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
+                seeds.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
             return self._hydrate(order)          # v0.2 shape, no `via`
-        # associative path: seed -> prime -> spread -> rank -> learn -> receipts
+        # associative path: seed -> prime -> spread -> two-tier rank -> learn -> receipts
         if budget is None:
             budget = self._recall_budget
         sid = self._graph.resolve_session(session, self._meta_get, self._meta_set)
+        # `seeds` stays the immutable v0.2 result (the protected tier); prime a copy
+        # so priming/spread never reorder the seed tier.
+        activated = dict(seeds)
         for mid, a in self._graph.session_activation(sid).items():
-            scores[mid] = scores.get(mid, 0.0) + _PRIMING_WEIGHT * a
-        if not scores:
+            activated[mid] = activated.get(mid, 0.0) + _PRIMING_WEIGHT * a
+        if not activated:
             return []
-        activation, receipts = self._graph.spread(scores, budget, type)
-        order = [mid for mid, _ in sorted(
-            activation.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
+        activation, receipts = self._graph.spread(activated, budget, type)
+        # two-tier ranking: v0.2 seeds keep their exact v0.2 order at the top;
+        # everything reached by priming/spread fills in below, by activation. A
+        # direct hit can never be outranked by a spread-only node (fixes #25).
+        tier1 = [mid for mid, _ in sorted(
+            seeds.items(), key=lambda kv: (-kv[1], kv[0]))]
+        tier2 = [mid for mid, _ in sorted(
+            ((m, a) for m, a in activation.items() if m not in seeds),
+            key=lambda kv: (-kv[1], kv[0]))]
+        order = (tier1 + tier2)[:limit]
         self._graph.touch_session(sid, order)
         self._conn.commit()
         hits = self._hydrate(order)
         for h in hits:
             r = receipts.get(h["id"])
-            if r is not None and h["id"] not in scores:
+            if r is not None and h["id"] not in seeds:
                 h["via"] = {"path": [{"from": r["from"], "kind": r["kind"], "w": r["w"]}],
                             "hops": r["hops"]}
             else:
