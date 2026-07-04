@@ -64,11 +64,19 @@ behavioral co-recall are what rise *above* that uniform floor. So:
    precision; without it a peak expands straight across the uniformly-connected
    store.
 4. **Emit** each cluster (size ≥ `MIN_CLUSTER`) as a candidate:
-   `{cluster_id (ephemeral display handle only), member_ids, member_titles,
-   why (the seed edges), descriptor}`.
-5. **Dedup** at read time by **source-set overlap** against existing crystallized
-   principles (suppress if overlap ≥ `DEDUP_OVERLAP`). Robust to membership
-   drift; needs no stored cluster identity (see Interaction adjustment A).
+   `{cluster_id (ephemeral display handle only), peak_key (the seeding edge —
+   stable identity, see Dismissed candidates), member_ids, member_titles,
+   why (the seed edges), descriptor}`. The **descriptor** is the naming context
+   handed to the agent — concatenated member titles + shared tags (exact form is
+   plan-level, but load-bearing: naming quality is bounded by the context the
+   agent gets, so it is not cosmetic).
+5. **Dedup** at read time against existing crystallized principles by
+   **basis-recovery overlap**: suppress a candidate when
+   `|candidate.members ∩ principle.sources| / |principle.sources| ≥ DEDUP_OVERLAP`
+   — "is this principle's basis mostly re-covered?" The denominator is the
+   principle's agent-selected **`sources`**, *not* the semantic-expanded
+   candidate (different populations — the agent discards some surfaced members).
+   Robust to membership drift; needs no stored cluster identity (see adjustment A).
 
 **Why seed-from-peak and not global weighted community detection (Louvain):**
 - We want **nuclei + a large unclustered remainder**, not an exhaustive
@@ -94,6 +102,10 @@ but **never via a magic number on a blended scale** (won't survive an embedder
 change). A semantic neighborhood seeds a candidate only if its internal density
 is an **outlier against the store's own baseline** (top percentile, or
 `mean + k·σ` of pairwise cosine). Self-calibrating across stores and models.
+**Cost bound / domain:** density is computed only *within the already-materialized
+semantic-kNN neighborhoods* (the semantic edges tether already stores), **never
+all-pairs** — an `O(n²)` cosine at read time would defeat the read-time (fork 1)
+decision.
 
 **Because crystallization is a batch reflection pass, not a live interrupt, this
 can lean permissive** — a dud in an overnight pass is cheap (the agent triages
@@ -110,9 +122,11 @@ eval moves the bar.
    The read-time compute is **process-memoized, invalidated by a write
    dirty-flag**, so repeated reads in one pass don't recompute (adjustment C).
    Detection is a **derived view exactly like B1 hub-curation** (computes, does
-   not mutate) → read-time by B1's own precedent, not a maintained table.
-2. **Name — the calling agent** reads the candidates, discards topics, and for
-   each real principle writes it back.
+   not mutate) → read-time by B1's own precedent, not a maintained table. Each
+   candidate carries the Detection §4 shape (`peak_key`, members, `why`,
+   descriptor; `cluster_id` display-only).
+2. **Name — the calling agent** reads the candidates, discards topics (dismissing
+   them — see Dismissed candidates), and for each real principle writes it back.
 3. **Write-back — extend `remember(crystallizes=[source_ids])`.** With derived
    dedup (adjustment A) there is **no crystallization-specific state to write** —
    this collapses to "create memory + add typed links," which is inside
@@ -127,14 +141,40 @@ nearby memory → semantic expansion pulls it in → hash changes → the princi
 re-surfaces). Derive "already covered" at read time from **crystallized-edge
 source-set overlap**. `cluster_id` is an ephemeral display handle only.
 
+### Dismissed candidates — closing the async-loop wart
+
+Dedup (Detection §5) only suppresses clusters that were *crystallized*. But the
+agent also **dismisses** candidates it judges *not* a principle — and a dismissed
+cluster has no crystallized principle, so naive dedup would **re-surface it every
+reflection pass, forever**, re-asking the agent to re-judge what it already
+rejected. B2 takes an explicit position: a **persistent dismissed-set keyed on
+the peak edge**, not the member set. The peak (an `explicit`/`hebbian` edge) has
+a stable identity, so "the agent dismissed the cluster nucleated by edge `(a,b)`"
+stays valid even as semantic expansion pulls new members in — the same insight
+that killed member-set hashing in adjustment A. A candidate whose peak edge is in
+the dismissed-set is suppressed. Cost: one small table (or a `meta` blob). The
+agent records a dismissal through a minimal affordance (exact surface is
+plan-level — a `dismiss(peak)` tool or a `remember` sentinel — but the
+**peak-edge keying and suppress-on-dismissed-peak semantics are fixed here**).
+Dismissal is sticky by default; re-surfacing a dismissed peak *only if its
+boundness materially strengthens* (new evidence) is a noted future refinement,
+not launch behavior.
+
 ### The `crystallized` edge-kind role matrix
 
 | role | `crystallized` | why |
 |---|---|---|
 | B2 peak-seeding | **excluded** | else a principle re-seeds the cluster it just named — principles-of-principles runaway |
 | B1 `degree_map` / hubs | included | a named principle becomes a boot-index hub |
-| B1 forgetting | included (via degree) | a principle protects its sources from disconnection-forgetting |
+| B1 forgetting | included (via degree) | preserves the principle's provenance (its sources); subsumption deferred — see below |
 | Tier A recall spreading (`KIND_W`) | **included, bench-guarded** | recalling a source surfaces its principle — the retrieval payoff — but must not regress control recall |
+
+**Edges are undirected** (canonical `src<dst`, as in Tier A), so a `crystallized`
+edge is **bidirectional**: recalling the *principle* floods activation to all its
+sources, and recalling *any source* surfaces the principle. Both the recall
+`KIND_W` weight and the `degree_map` weight for `crystallized` are **new,
+eval-tuned constants** (see knobs); the spreading weight is load-bearing for the
+#25-style hub risk below.
 
 Reusing `explicit` could not separate peak-seeding-out from hub-degree-in
 (`explicit` seeds peaks), so the distinct kind is a **loop-correctness**
@@ -148,6 +188,20 @@ source — **named** — alongside **used** (hebbian) and **linked** (explicit).
 is defensible: an agent judging something principle-worthy is a strong
 importance signal. But it is no longer strictly "importance = use," and we say so
 plainly rather than let it read as drift from B1's thesis.
+
+### Principles preserve provenance; subsumption is deferred
+
+The matrix says a principle *protects* its sources from disconnection-forgetting.
+The honest counter-case: once a principle captures the generalization, the raw
+sources are arguably *more* disposable — the principle subsumes them — and
+crystallizing actively could pin enough sources alive to blunt B1's forgetting.
+We **keep protection**, but reframe the *why*: not "the sources are important"
+but **provenance preservation** — the sources are the evidence the principle was
+abstracted from, and losing them orphans the principle (a claim with no
+citations). **Source subsumption / fading** (letting a well-established principle
+release its sources to forgetting) is a real future capability, **explicitly
+deferred**; this tier takes the conservative, reversible position of keeping the
+evidence.
 
 ## Degrade-never / opt-in
 
@@ -168,8 +222,10 @@ plainly rather than let it read as drift from B1's thesis.
 | `W_e` / `W_b` | explicit / behavioral peak weight | `W_e > 0`, **`W_b = 0`** |
 | expansion cosine floor + hop cap | membership boundary | conservative (tight) |
 | `MIN_CLUSTER` | min members to emit | 3 (tunable) |
-| `DEDUP_OVERLAP` | source-overlap fraction to suppress | conservative |
+| `DEDUP_OVERLAP` | basis-recovery fraction to suppress | conservative |
 | semantic-density fallback | percentile / `mean+k·σ`; on/off | **off-or-conservative** |
+| `crystallized` recall `KIND_W` | spreading weight, principle↔source | eval-tuned |
+| `crystallized` degree weight | hub-degree contribution | eval-tuned |
 
 ## Eval plan (bench-driven, the project's discipline)
 
@@ -180,8 +236,11 @@ The design is deliberately measurable:
   Low reject → lower the bar; high reject → keep it tight. Measured, not guessed.
 - **`W_b` unlock.** Behavioral booster stays at 0 until the eval shows
   behavioral-seeded clusters raise acceptance without adding noise.
-- **Recall no-regression.** Adding `crystallized` to spreading must keep the
-  control class green (the same guard that gates all recall changes).
+- **Recall no-regression — the #25 back-door.** A crystallized principle is a
+  max-fan-out, bidirectional hub — the exact shape that broke seed-dominance in
+  #25. Generic control queries won't stress it; the guard must include an
+  explicit query against a store **with a crystallized hub present**, or #25
+  could re-regress through the back door unseen.
 
 ## Test Strategy
 
@@ -193,13 +252,23 @@ The design is deliberately measurable:
   hit/invalidate on write, empty when `TETHER_CRYSTALLIZE` off / no graph.
 - **`remember(crystallizes=…)`:** creates the memory + `crystallized` edges to
   each source; off-flag ignores it; degrade-never on bad ids.
-- **Recall spreading:** `crystallized` edge lets a source-query reach its
-  principle; the bench no-regression guard stays PASS with crystallized edges
-  present (`FakeEmbedder` e2e).
+- **Recall spreading + #25 back-door:** the (bidirectional) `crystallized` edge
+  lets a source-query reach its principle; and a **dedicated control query
+  against a store containing a max-fan-out crystallized hub** keeps the
+  no-regression guard PASS — a principle's fan-out must not bury direct hits
+  (`FakeEmbedder` e2e).
+- **Dismissed-set:** a candidate whose peak edge was dismissed is suppressed on
+  the next read; a *crystallized* cluster is suppressed by basis-recovery
+  overlap; both survive membership drift (hand-inserted edges).
 - **Config resolvers:** defaults + parsing for every knob above.
 
 ## Open items for the plan (not open decisions)
 
-Exact values for the expansion cosine floor, hop cap, `DEDUP_OVERLAP`,
-`MIN_CLUSTER`, and the fallback percentile are eval-tuned constants the plan
-pins with bench evidence; they are knobs, not design forks.
+- Exact values for the expansion cosine floor, hop cap, `DEDUP_OVERLAP`,
+  `MIN_CLUSTER`, the fallback percentile, and the two `crystallized` weights are
+  eval-tuned constants the plan pins with bench evidence — knobs, not forks.
+- The **dismissal affordance surface** (a `dismiss(peak)` tool vs a `remember`
+  sentinel) is plan-level; the peak-edge keying and suppression semantics are
+  fixed by this spec.
+- The **descriptor** exact form (titles, shared tags, both) is plan-level; its
+  role as the agent's naming context is fixed here.
