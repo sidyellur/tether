@@ -143,6 +143,38 @@ edge it came through), and two optional `recall` args tune it:
 With `TETHER_ASSOC=0` (or `budget=0`, or an empty graph), `recall` behaves exactly
 as before — associative recall is purely additive and never breaks a lookup.
 
+## Self-organizing store (optional)
+
+As a store grows, tether keeps it legible using the same usage graph:
+
+- **Hub-curated boot-index.** The auto-loaded memory index is capped once it
+  passes `TETHER_BOOT_INDEX_CAP` (default 50) and a graph exists. Above the cap
+  it shows two labeled slices — **load-bearing** memories (highest *behavioral*
+  degree: `explicit` links + learned co-recall, never mere similarity) and the
+  most **recent** ones — so the index stays small and shows what actually
+  matters. Below the cap, or without a graph, it's the full newest-first list as
+  before.
+- **Forgetting-by-disconnection** (opt-in, `TETHER_FORGET`). A bounded sweep
+  runs every `TETHER_FORGET_INTERVAL` writes and *soft-archives* memories that
+  are both **old** (`TETHER_FORGET_AGE_DAYS`, default 90) and **behaviorally
+  isolated** (no `explicit`/`hebbian` edge — semantic similarity doesn't count).
+  Archived memories drop out of recall and the boot-index but are **retained and
+  reversible** (it reuses the same mark-invalid machinery as consolidation;
+  nothing is deleted). Safety rails: never runs without a live behavioral graph,
+  below `2 × CAP` memories, or more than `TETHER_FORGET_MAX_PER_SWEEP` (default
+  10) per sweep.
+
+| var | default | effect |
+|---|---|---|
+| `TETHER_BOOT_INDEX_CAP` | `50` | curate the boot-index above this size |
+| `TETHER_FORGET` | off | enable the forgetting sweep |
+| `TETHER_FORGET_AGE_DAYS` | `90` | minimum age to be eligible to fade |
+| `TETHER_FORGET_INTERVAL` | `20` | writes between sweeps |
+| `TETHER_FORGET_MAX_PER_SWEEP` | `10` | max archived per sweep |
+
+With `TETHER_FORGET` off (default) and a normal store size, recall and the
+boot-index behave exactly as before.
+
 ## Tools
 
 | Tool | What it does |
