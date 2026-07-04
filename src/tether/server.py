@@ -67,7 +67,8 @@ def remember(type: str, title: str, body: str,
 
 @mcp.tool()
 def recall(query: str, type: str = None, limit: int = 20) -> dict:
-    """Search memories by keyword (title/body/tags), newest-relevant first.
+    """Search memories by keyword and (if enabled) semantic similarity, most
+    relevant first.
 
     Each hit carries {id, type, title, body, tags, updated_at} - use
     `updated_at` to judge staleness (an old fact may no longer hold; verify
