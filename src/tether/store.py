@@ -133,3 +133,39 @@ class Store:
              "body": r[3], "tags": r[4], "updated_at": r[5]}
             for r in rows
         ]
+
+    def _links_of(self, mid) -> list:
+        row = self._conn.execute("SELECT links FROM memories WHERE id=?", (mid,)).fetchone()
+        if row is None:
+            raise ValueError(f"no memory with id {mid}")
+        return json.loads(row[0])
+
+    def link(self, id_a, id_b) -> dict:
+        a = self._links_of(id_a)
+        b = self._links_of(id_b)
+        if id_b not in a:
+            a.append(id_b)
+        if id_a not in b:
+            b.append(id_a)
+        now = _now()
+        self._conn.execute("UPDATE memories SET links=?, updated_at=? WHERE id=?",
+                           (json.dumps(a), now, id_a))
+        self._conn.execute("UPDATE memories SET links=?, updated_at=? WHERE id=?",
+                           (json.dumps(b), now, id_b))
+        self._conn.commit()
+        self._sync_now()
+        return {"linked": [id_a, id_b]}
+
+    def forget(self, id) -> dict:
+        cur = self._conn.execute("DELETE FROM memories WHERE id=?", (id,))
+        self._conn.commit()
+        self._sync_now()
+        return {"forgotten": id, "existed": cur.rowcount > 0}
+
+    def boot_index(self) -> str:
+        rows = self._conn.execute(
+            "SELECT id, type, title FROM memories ORDER BY updated_at DESC, id DESC"
+        ).fetchall()
+        if not rows:
+            return "(no memories yet)"
+        return "\n".join(f"[{t}] #{i} {title}" for i, t, title in rows)
