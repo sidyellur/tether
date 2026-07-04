@@ -85,3 +85,24 @@ def test_decay_half_life_off_by_default_and_positive_only(monkeypatch):
     assert config.decay_half_life_days() is None
     monkeypatch.setenv("TETHER_DECAY_HALF_LIFE_DAYS", "junk")
     assert config.decay_half_life_days() is None
+
+
+def test_assoc_enabled_default_true(monkeypatch):
+    monkeypatch.delenv("TETHER_ASSOC", raising=False)
+    assert config.assoc_enabled() is True
+    for v in ("0", "false", "off", "NO"):
+        monkeypatch.setenv("TETHER_ASSOC", v)
+        assert config.assoc_enabled() is False
+
+
+def test_recall_budget_default_and_parsing(monkeypatch):
+    monkeypatch.delenv("TETHER_RECALL_BUDGET", raising=False)
+    assert config.recall_budget() == 24
+    monkeypatch.setenv("TETHER_RECALL_BUDGET", "8")
+    assert config.recall_budget() == 8
+    monkeypatch.setenv("TETHER_RECALL_BUDGET", "0")
+    assert config.recall_budget() == 0
+    monkeypatch.setenv("TETHER_RECALL_BUDGET", "-5")
+    assert config.recall_budget() == 24
+    monkeypatch.setenv("TETHER_RECALL_BUDGET", "junk")
+    assert config.recall_budget() == 24
