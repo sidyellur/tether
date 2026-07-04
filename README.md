@@ -22,9 +22,7 @@ agent more useful when present, and never breaks the agent's work when degraded.
 
 ## Status
 
-Early. The design is written up in
-[`docs/superpowers/specs/2026-07-03-tether-design.md`](docs/superpowers/specs/2026-07-03-tether-design.md);
-implementation has not started yet.
+v0.1 is implemented. Design and rationale: [`docs/superpowers/specs/2026-07-03-tether-design.md`](docs/superpowers/specs/2026-07-03-tether-design.md). Implementation plan: [`docs/superpowers/plans/2026-07-03-tether-v0.1-implementation.md`](docs/superpowers/plans/2026-07-03-tether-v0.1-implementation.md).
 
 ## Design at a glance
 
@@ -39,6 +37,53 @@ implementation has not started yet.
   configured; degradation never throws.
 - **Keyword search now, embeddings later** — the SQLite schema is built so
   semantic search and a full entity/edge graph slot in without migrating data.
+
+## Install
+
+Requires Python ≥3.10 on a POSIX system (Linux/macOS).
+
+Register it with Claude Code — with [uv](https://docs.astral.sh/uv/):
+
+```sh
+claude mcp add tether -- uvx tether
+```
+
+…or install it first:
+
+```sh
+pip install tether
+claude mcp add tether -- tether
+```
+
+By default memory lives in a local SQLite file at
+`~/.local/share/tether/memory.db` (override with `TETHER_DB`). No accounts, no
+network — this is the whole tool for a single machine.
+
+## Sync across devices (optional)
+
+Point tether at a [Turso](https://turso.tech) / libSQL database and the local
+file becomes an embedded replica — local-speed reads, writes that propagate to
+your other devices. Install the extra and set two env vars:
+
+```sh
+pip install 'tether[sync]'
+export TETHER_SYNC_URL='libsql://<your-db>.turso.io'
+export TETHER_SYNC_TOKEN='<your-auth-token>'
+```
+
+If the backend is unreachable, tether logs `sync offline` and keeps working
+against the local file; writes converge when it comes back.
+
+## Tools
+
+| Tool | What it does |
+|---|---|
+| `remember(type, title, body, tags?, links?)` | Save a memory; upserts on `type`+`title` so facts refine rather than duplicate |
+| `recall(query, type?, limit?)` | Keyword search; returns id/type/title/body/tags/updated_at |
+| `link(id_a, id_b)` | Bidirectional link between two memories |
+| `forget(id)` | Delete a memory |
+
+Plus an auto-loaded resource `tether://memory-index` — a compact one-line-per-memory index surfaced each session.
 
 ## License
 
