@@ -28,17 +28,18 @@ B1 makes the store *self-organizing*: the boot-index surfaces the load-bearing m
 ## Design decisions (the frame)
 
 - **Two features, two execution models.** Hub-curation is *read-time* — `boot_index()` is already recomputed per load, so hub-ranking is just a different ORDER BY; nothing is stored or maintained. Forgetting is the only *mutator*, so it alone uses the amortized-inline trigger.
-- **One graph primitive powers both.** `Graph.degree_map()` — weighted degree per current node — feeds boot-index ranking (hub = high degree) and forgetting (isolated = zero degree). Weighted degree over PageRank: O(edges), deterministic, no iteration/convergence knob, and it's the exact signal forgetting needs.
-- **Gates and slices, never blended scores.** The bet-2 recency bug came from two different-scaled signals fighting at a tie-break. B1 refuses to blend: the boot-index uses two *labeled slices* (load-bearing ∪ recent), and forgetting uses three *conjunctive gates* (old ∧ isolated ∧ unrehearsed). Each piece is independently legible and independently testable.
+- **One graph primitive powers both.** `Graph.degree_map()` — weighted degree per current node — feeds boot-index ranking (hub = high degree) and forgetting (isolated = zero degree). Weighted degree over PageRank: O(memories + edges), deterministic, no iteration/convergence knob, and it's the exact signal forgetting needs.
+- **Behavioral degree, not semantic — the load-bearing decision.** Degree is measured over **behavioral edges only (`explicit` + `hebbian`), never `semantic`.** Semantic edges say "these are *similar*" (automatic, content-derived, and — because Tier A's kNN has no similarity floor — every embedded memory carries ~8 of them). Explicit + Hebbian say "these are *actually used together*" — the retention/importance signal both features are reaching for. Including semantic degree would (1) make forgetting's `degree == 0` gate almost never fire in the default embedder-on config (the "one-off note connected to nothing" would carry 8 semantic edges), and (2) make hub-ranking reward the densest *semantic* neighborhoods — i.e. the most redundant/generic notes — instead of the load-bearing ones. So `degree_map` counts only behavioral kinds. This keeps the change B1-local (no reopening Tier A's edge creation) and makes "isolated = not behaviorally connected" true to intent.
+- **Gates and slices, never blended scores.** The bet-2 recency bug came from two different-scaled signals fighting at a tie-break. B1 refuses to blend: the boot-index uses two *labeled slices* (load-bearing ∪ recent), and forgetting uses two *conjunctive gates* (old ∧ behaviorally-isolated). Each piece is independently legible and independently testable.
 - **Reuse, don't add.** No new verb, no new module, no schema migration. Hub-curation lives in `boot_index()`; forgetting archives by reusing the supersession columns (`valid_to`/`superseded_by`) and a `meta` counter.
-- **Degrade-never.** No Tier A / no edges ⇒ boot-index is exactly today's unbounded newest-first and forgetting is a hard no-op. `TETHER_FORGET` off (default) + default CAP ⇒ behavior byte-identical to pre-B1.
+- **Degrade-never.** No Tier A / no behavioral edges ⇒ boot-index falls back to today's unbounded newest-first and forgetting is a hard no-op. Precise byte-identical guarantee: with `TETHER_FORGET` off (default), `recall` and forgetting are byte-identical to pre-B1; the boot-index is byte-identical when `count ≤ CAP` **or** no graph exists, and switches to the curated two-slice format only above `CAP` with a graph present (hub-curation is on by default, independent of `TETHER_FORGET`; set `CAP` very large to disable it).
 
 ## Architecture
 
 Follows Tier A's seam: `graph.py` owns *how memories relate*; `store.py` owns *what memories are* and orchestrates.
 
 - **`graph.py`** gains one method:
-  - `degree_map(type=None) -> dict[int, float]` — weighted degree for every current node: for each edge between two current (`valid_to IS NULL`) memories, add its `weight` to both endpoints' totals. Type filter optional. Pure read over `edges`; deterministic. Failure → `{}`.
+  - `degree_map(kinds=("explicit", "hebbian")) -> dict[int, float]` — **behavioral** weighted degree for **every** current node, including explicit zeros. Implemented as a LEFT JOIN of current (`valid_to IS NULL`) memories against `edges` filtered to `kinds`, summing incident edge `weight` per node (edges to non-current nodes ignored); a node with no matching edge appears with degree `0.0`. Emitting explicit zeros is deliberate — forgetting needs the degree-`0` *set*, which a pure edge-scan can't produce. `kinds` is a parameter (defaults to behavioral) so a future feature could request semantic-inclusive degree without changing callers. Deterministic; O(memories + edges). Failure → `{}`.
 - **`store.py`** consumes it in two places:
   - `boot_index()` — hub-ranked when a graph exists and the store is large (below); unchanged otherwise.
   - `_run_forgetting_sweep()` — the bounded, opt-in archiving pass, invoked amortized from `remember`.
@@ -48,21 +49,21 @@ No other files change except `config.py` (new resolvers) and `server.py` is unto
 ## Feature 1 — Hub-curated boot-index
 
 **Behavior by regime:**
-- **No Tier A / empty `degree_map`** → today's behavior exactly: all current memories, newest-first, unbounded. Curation is a *benefit* of the graph; a non-graph user's index is never silently truncated.
-- **Graph present, `count ≤ CAP`** → also today's behavior (small stores don't need curating).
-- **Graph present, `count > CAP`** → two reserved, labeled slices, capped at `CAP` total:
+- **`count ≤ CAP`** → today's behavior exactly: all current memories, newest-first, unbounded-but-small. (No curation needed.)
+- **`count > CAP`, no behavioral hubs** (no `explicit`/`hebbian` edges yet — e.g. a fresh Tier A store with only semantic edges) → the load-bearing slice is empty, so the index is the recent slice alone (bounded newest-first). Honest: "no behavioral hubs yet." Hubs emerge as the store is used.
+- **`count > CAP`, behavioral hubs present** → two reserved, labeled slices, capped at `CAP` total:
 
 ```
 # Load-bearing
-[type] #id title      (top nodes by degree_map, degree desc; ties → updated_at desc, then id)
+[type] #id title      (top nodes by behavioral degree_map, degree desc; ties → updated_at desc, then id; degree-0 nodes excluded)
 ...
 # Recent
 [type] #id title      (most recent RECENT_RESERVE memories, updated_at desc)
 ...
 ```
 
-- `RECENT_RESERVE ≈ CAP // 4`; the load-bearing slice fills the remaining budget. Union is deduped (a memory that is both a hub and recent appears once, in the load-bearing slice).
-- **Why a recent reserve:** a brand-new memory has degree 0, so a pure hub ranking would bury the thing just saved — usually the most relevant item. The reserve guarantees fresh memories always appear.
+- `RECENT_RESERVE ≈ CAP // 4`; the load-bearing slice fills the remaining budget from nodes with **positive** behavioral degree. Union is deduped (a memory that is both a hub and recent appears once, in the load-bearing slice).
+- **Why a recent reserve:** a brand-new memory has behavioral degree 0, so a pure hub ranking would bury the thing just saved — usually the most relevant item. The reserve guarantees fresh memories always appear.
 - **Why two labeled slices, not one blended `degree + w·recency` score:** avoids scale-mixing (the bet-2 bug class), and the labels are *legibility* — the agent sees why each memory is in its starting context, consistent with Tier A's `via` receipts.
 - Per-line format is byte-identical to today (`[type] #id title`); section headers appear only when curation is active.
 - `CAP = TETHER_BOOT_INDEX_CAP` (default 50); a very large value disables curation.
@@ -73,7 +74,7 @@ No other files change except `config.py` (new resolvers) and `server.py` is unto
 
 **Eligibility — two conjunctive gates (both must hold):**
 1. **Old** — `age > FORGET_AGE_DAYS` (default 90), measured on `updated_at`. Nothing recently written/refined is eligible.
-2. **Isolated / unrehearsed** — `degree_map` value `== 0` (`FORGET_DEGREE_MAX = 0`, fixed): no edge of any kind to a current memory. This single gate carries *both* "unconnected" and "unrehearsed": Tier A co-recall accretes Hebbian edges, so a memory that is actually reached alongside others gains degree and is spared. (Fable's #16 insight — the Hebbian layer doubles as a retention signal.)
+2. **Behaviorally isolated / unrehearsed** — behavioral `degree_map` value `== 0` (`FORGET_DEGREE_MAX = 0`, fixed): no `explicit` or `hebbian` edge to a current memory. Semantic similarity does **not** count — a memory being *like* others is not a reason to keep it. This single gate carries both "unconnected" and "unrehearsed": Tier A co-recall accretes Hebbian edges (a recall returns a ranked list and `touch_session` wires those co-returned hits together), so a memory actually reached in real recalls gains behavioral degree and is spared, and an explicitly `link()`-ed memory has degree > 0 and is protected intrinsically. (Fable's #16 insight — the Hebbian layer doubles as a retention signal.)
 
 **Known limitation (accepted):** a memory recalled only ever *in isolation* — never co-recalled with another — accretes no Hebbian edge, so it stays degree-0 and, if also old, can fade. This is acceptable because the archive is reversible (a later recall surfaces it, or `valid_to` is cleared) and we refuse to add a durable `last_recalled_at` column (would violate the no-migration constraint). Rehearsal-by-*writing* is fully captured (it refreshes `updated_at`, failing gate 1).
 
@@ -84,10 +85,10 @@ No other files change except `config.py` (new resolvers) and `server.py` is unto
 - **Edges left dormant** — `degree_map`/`_neighbors` already ignore non-current nodes, so an archived memory's edges are inert but retained (so an un-forget restores connectivity). Only a hard `forget` deletes edges (Tier A `on_forget`).
 
 **Safety rails:**
-- **Requires a graph** — empty `degree_map` (Tier A off / no edges) ⇒ hard no-op. An edgeless store makes everything look isolated; refuse rather than mass-archive.
+- **Requires a live behavioral graph** — if the store has **zero** `explicit`/`hebbian` edges (Tier A off, or on but never used/linked), the sweep is a hard no-op. Without any behavioral signal every memory looks isolated; refuse rather than mass-archive. (Once *some* behavioral edges exist, the gates + rails below bound the blast radius even while much of an early store is still behaviorally isolated: only *old* memories are eligible, capped per sweep.)
 - **Store-size floor** — never runs below `2 × CAP` current memories.
 - **Bounded per sweep** — at most `FORGET_MAX_PER_SWEEP` (default 10) archives per run, so even a misconfiguration erodes gradually and visibly.
-- **Explicit links protected** — a memory with any explicit-kind edge is never archived (gate 2 already excludes it, since a link gives degree > 0; restated as a hard rule).
+- **Explicit links protected** — a memory with any `explicit`-kind edge is never archived. Now *intrinsic*: explicit edges are part of behavioral degree, so a linked memory has degree > 0 and fails gate 2 directly (no separate special-case needed).
 
 **Trigger (amortized inline):** a `meta` counter (`forget_counter`) increments on each `remember`; when it reaches `FORGET_INTERVAL` (default 20) the bounded sweep runs and the counter resets. No daemon, no new tool.
 
@@ -116,25 +117,32 @@ No other files change except `config.py` (new resolvers) and `server.py` is unto
 
 Full detail belongs in the plan's Test Strategy section; the shape:
 
-- **Fully hermetic — no embedder, no numpy.** `degree_map` is pure SQL over `edges`; every B1 test hand-inserts edges. Nothing needs Model2Vec or vector math.
-- **`degree_map`** — weighted degree correct; counts only current (`valid_to IS NULL`) nodes; empty on no edges.
-- **Boot-index** — `count ≤ CAP` unchanged; `count > CAP` + graph ⇒ two labeled slices, recent memories always present, deterministic order, deduped; `count > CAP` + no graph ⇒ today's unbounded behavior.
-- **Forgetting gates** — each independently: old-but-connected → kept; isolated-but-recent → kept; old + isolated → archived. Plus the known-limitation case: solo-recalled (degree-0) + old → archived, then reversible.
-- **Forgetting safety** — disabled → no-op; no-graph → no-op; below size-floor → no-op; `FORGET_MAX_PER_SWEEP` respected; explicit-link protection.
+- **Fully hermetic — no embedder, no numpy.** `degree_map` is pure SQL over `edges`; every B1 test hand-inserts edges of specific kinds. Nothing needs Model2Vec or vector math.
+- **`degree_map`** — behavioral weighted degree correct; **`semantic` edges excluded** (a node with only semantic edges reports degree 0); **degree-0 current nodes are emitted** (LEFT JOIN, not edge-scan); counts only current (`valid_to IS NULL`) endpoints.
+- **Boot-index** — `count ≤ CAP` unchanged; `count > CAP` + behavioral hubs ⇒ two labeled slices, recent memories always present, degree-0 nodes excluded from load-bearing, deterministic order, deduped; `count > CAP` + only-semantic-edges ⇒ recent slice only (empty load-bearing); `count > CAP` + no graph ⇒ today's unbounded behavior.
+- **Forgetting gates** — each independently: old-but-behaviorally-connected → kept; behaviorally-isolated-but-recent → kept; **semantic-only-connected + old → archived** (semantic doesn't protect); old + behaviorally-isolated → archived, reversible.
+- **Forgetting safety** — disabled → no-op; zero behavioral edges in store → no-op; below size-floor → no-op; `FORGET_MAX_PER_SWEEP` respected; explicit-link protection (intrinsic via degree).
 - **Archive mechanics** — `valid_to` set + `superseded_by` NULL; excluded from `recall` and `boot_index`; edges retained; reversibility (clearing `valid_to` restores).
 - **Trigger** — counter increments per write; sweep fires at `FORGET_INTERVAL`; counter resets.
-- **Degrade guarantee** — `TETHER_FORGET` off + default CAP ⇒ boot-index and recall byte-identical to pre-B1.
+- **Degrade guarantee** — `TETHER_FORGET` off ⇒ `recall` and forgetting byte-identical to pre-B1; boot-index byte-identical when `count ≤ CAP` or no graph (curated only above `CAP` with behavioral hubs).
 
 ## Coverage matrix (guarantee → test area)
 
 | Guarantee | Test area |
 |---|---|
-| Weighted degree, current-only | `degree_map` |
+| Behavioral weighted degree (semantic excluded), zeros emitted, current-only | `degree_map` |
 | Small store unchanged | boot-index ≤ CAP |
-| Large store bounded + load-bearing + fresh | boot-index > CAP + graph |
+| Large store bounded + load-bearing + fresh; hubs mean "used", not "similar" | boot-index > CAP + behavioral hubs |
+| Only-semantic store ⇒ recent-only, not redundancy-filled | boot-index > CAP + semantic-only |
 | Non-graph user never truncated | boot-index > CAP + no graph |
-| Only old+isolated archived (isolation carries "unrehearsed") | forgetting gates |
-| No accidental mass-archive | safety rails (no-graph, size-floor, per-sweep cap, links) |
+| Only old + behaviorally-isolated archived; semantic doesn't protect | forgetting gates |
+| No accidental mass-archive | safety rails (zero-behavioral-edges, size-floor, per-sweep cap, links) |
 | Archive is reversible & audit-preserving | archive mechanics |
 | Amortized trigger fires correctly | trigger |
-| Feature-off ⇒ identical to pre-B1 | degrade guarantee |
+| Feature-off ⇒ identical to pre-B1 (scoped) | degrade guarantee |
+
+## Known limitations & inherited concerns
+
+- **Solo-recall never protects.** A memory only ever recalled in isolation (never co-returned with another) accretes no Hebbian edge, so it stays behaviorally degree-0 and can fade if old. Narrow in practice — real recalls return a ranked list whose hits get co-wired — and always reversible. We decline a durable `last_recalled_at` column (would break the no-migration constraint).
+- **Un-decayed Hebbian skews centrality (inherited from Tier A).** Tier A has no edge decay in scope, so a constantly co-recalled pair saturates its Hebbian weight (capped at `HEBBIAN_CAP = 5.0`) and stays a permanent hub. Bounded by the cap and by relative ranking, but real; the proper fix is edge decay (Fable #6, a later tier). Deferring crystallization to B2 avoids compounding this.
+- **`boot_index()` cost shifts from O(memories) to O(memories + edges)** per session load (it's auto-loaded). At ~5k memories × a handful of behavioral edges this is a sub-millisecond scan, but it is a real change from the current pure row-list; noted so the plan can add a cheap ceiling if a giant store ever needs it.
