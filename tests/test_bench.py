@@ -116,3 +116,19 @@ def test_assert_targets_found_passes_and_flags():
                                   ["car"], "control")])
     with pytest.raises(AssertionError):
         selfcheck.assert_targets_found(bad, s, id_of, k=10)
+
+
+def test_warm_creates_hebbian_edges():
+    import pytest
+    pytest.importorskip("numpy")
+    from bench import warmup, loader, corpus as corpus_mod
+    s = _store(assoc=True, embedder=FakeEmbedder())
+    id_of = loader.load(corpus_mod.MINI, s)
+    # before warm-up: no hebbian edges
+    before = s._conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='hebbian'").fetchone()[0]
+    assert before == 0
+    warmup.warm(corpus_mod.MINI, s, id_of, repeats=3)
+    after = s._conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='hebbian'").fetchone()[0]
+    assert after >= 1  # bug <-> pref co-recalled in the "auth" task
