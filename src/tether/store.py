@@ -302,7 +302,25 @@ class Store:
         self._graph.on_remember(mid, emb)
         self._conn.commit()
         self._sync_now()
+        self._maybe_forget()
         return {"id": mid, "action": action}
+
+    def _maybe_forget(self) -> None:
+        """Amortized trigger: every forget_interval writes, run one bounded
+        sweep. No-op (and no meta writes) when forgetting is disabled."""
+        if not self._forget:
+            return
+        try:
+            n = int(self._meta_get("forget_counter") or 0) + 1
+            if n >= self._forget_interval:
+                self._meta_set("forget_counter", 0)
+                self._conn.commit()
+                self._run_forgetting_sweep()
+            else:
+                self._meta_set("forget_counter", n)
+                self._conn.commit()
+        except Exception:
+            return
 
     def _run_forgetting_sweep(self) -> int:
         """Soft-archive old + behaviorally-isolated memories (opt-in, bounded,

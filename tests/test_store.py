@@ -707,3 +707,25 @@ def test_forgetting_is_reversible():
     s._conn.commit()
     assert ids[0] in [h["id"] for h in s.recall("T0")]           # un-forgotten
     assert s._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] >= 1   # edges retained
+
+
+def test_forget_trigger_fires_at_interval():
+    s = make_forget_store(forget_interval=3)
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(6)]
+    _add_edge(s, ids[4], ids[5], "hebbian")
+    _age(s, ids[0])                                # now old + isolated
+    before = s._conn.execute(
+        "SELECT valid_to FROM memories WHERE id=?", (ids[0],)).fetchone()[0]
+    for i in range(3):                             # 3 writes -> counter hits interval
+        s.remember("user", f"X{i}", "b")
+    after = s._conn.execute(
+        "SELECT valid_to FROM memories WHERE id=?", (ids[0],)).fetchone()[0]
+    assert before is None and after is not None    # the trigger archived it
+
+
+def test_forget_trigger_disabled_never_fires():
+    s = make_b1_store(assoc=True, forget=False, boot_index_cap=2)
+    for i in range(6):
+        s.remember("user", f"T{i}", "b")
+    assert s._conn.execute(
+        "SELECT value FROM meta WHERE key='forget_counter'").fetchone() is None
