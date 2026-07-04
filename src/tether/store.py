@@ -85,3 +85,31 @@ class Store:
     def migrate(self) -> None:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+
+    def remember(self, type, title, body, tags=None, links=None) -> dict:
+        if type not in VALID_TYPES:
+            raise ValueError(f"type must be one of {VALID_TYPES}, got {type!r}")
+        now = _now()
+        norm = _norm(title)
+        tags_s = _tags_to_str(tags)
+        links_s = json.dumps(links or [])
+        existing = self._conn.execute(
+            "SELECT id FROM memories WHERE type=? AND title_norm=?", (type, norm)
+        ).fetchone()
+        if existing:
+            mid = existing[0]
+            self._conn.execute(
+                "UPDATE memories SET title=?, body=?, tags=?, links=?, "
+                "updated_at=?, device_id=? WHERE id=?",
+                (title, body, tags_s, links_s, now, self._device_id, mid))
+            action = "updated"
+        else:
+            cur = self._conn.execute(
+                "INSERT INTO memories(type, title, title_norm, body, tags, links, "
+                "created_at, updated_at, device_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                (type, title, norm, body, tags_s, links_s, now, now, self._device_id))
+            mid = cur.lastrowid
+            action = "created"
+        self._conn.commit()
+        self._sync_now()
+        return {"id": mid, "action": action}
