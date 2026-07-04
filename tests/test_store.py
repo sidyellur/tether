@@ -560,3 +560,55 @@ def test_recall_budget_zero_is_passthrough():
     s.link(a, b)
     ids = [h["id"] for h in s.recall("JWT tokens", budget=0)]
     assert ids == [a]                             # no spreading -> only the direct match
+
+
+def make_b1_store(assoc=True, **kw):
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, assoc=assoc, **kw)
+    s.migrate()
+    return s
+
+
+def _add_edge(s, a, b, kind="hebbian", w=1.0):
+    lo, hi = (a, b) if a < b else (b, a)
+    s._conn.execute("INSERT INTO edges(src, dst, kind, weight, updated_at) "
+                    "VALUES (?,?,?,?,?)", (lo, hi, kind, w, "t"))
+    s._conn.commit()
+
+
+def test_boot_index_small_store_unchanged():
+    s = make_b1_store(boot_index_cap=50)
+    for i in range(3):
+        s.remember("user", f"T{i}", "b")
+    idx = s.boot_index()
+    assert "# Load-bearing" not in idx
+    assert len(idx.splitlines()) == 3
+
+
+def test_boot_index_curates_above_cap_with_hubs():
+    s = make_b1_store(boot_index_cap=4)
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(8)]
+    hub = ids[0]                                  # oldest -> not in the recent reserve
+    for other in ids[1:4]:
+        _add_edge(s, hub, other, "hebbian", 1.0)
+    idx = s.boot_index()
+    assert "# Load-bearing" in idx and "# Recent" in idx
+    assert f"#{hub} " in idx.split("# Recent")[0]         # hub is in the load-bearing slice
+    body = [ln for ln in idx.splitlines() if not ln.startswith("#")]
+    assert len(body) <= 4                                 # capped
+
+
+def test_boot_index_recent_only_when_no_behavioral_hubs():
+    s = make_b1_store(boot_index_cap=4)
+    for i in range(8):
+        s.remember("user", f"T{i}", "b")          # no edges at all
+    idx = s.boot_index()
+    assert "# Load-bearing" not in idx            # no hubs -> recent-only, no headers
+    assert len(idx.splitlines()) == 4             # bounded to cap
+
+
+def test_boot_index_unbounded_when_graph_disabled():
+    s = make_b1_store(assoc=False, boot_index_cap=4)   # graph OFF
+    for i in range(8):
+        s.remember("user", f"T{i}", "b")
+    assert len(s.boot_index().splitlines()) == 8       # no curation without a graph

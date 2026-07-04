@@ -135,7 +135,9 @@ def _decay_factor(age_days: float, half_life_days: float) -> float:
 class Store:
     def __init__(self, conn, device_id: str, sync_now, embedder=None,
                  author="", consolidate=False, dedup_threshold=0.92,
-                 decay_half_life_days=None, assoc=False, recall_budget=24):
+                 decay_half_life_days=None, assoc=False, recall_budget=24,
+                 boot_index_cap=50, forget=False, forget_age_days=90,
+                 forget_interval=20, forget_max_per_sweep=10):
         self._conn = conn
         self._device_id = device_id
         self._sync_now = sync_now
@@ -146,6 +148,11 @@ class Store:
         self._decay_half_life_days = decay_half_life_days
         self._recall_budget = recall_budget
         self._graph = Graph(conn, enabled=assoc)
+        self._boot_index_cap = boot_index_cap
+        self._forget = forget
+        self._forget_age_days = forget_age_days
+        self._forget_interval = forget_interval
+        self._forget_max_per_sweep = forget_max_per_sweep
 
     def migrate(self) -> None:
         fts_existed = self._table_exists("memories_fts")
@@ -486,9 +493,46 @@ class Store:
 
     def boot_index(self) -> str:
         rows = self._conn.execute(
-            "SELECT id, type, title FROM memories WHERE valid_to IS NULL "
+            "SELECT id, type, title, updated_at FROM memories WHERE valid_to IS NULL "
             "ORDER BY updated_at DESC, id DESC"
         ).fetchall()
         if not rows:
             return "(no memories yet)"
-        return "\n".join(f"[{t}] #{i} {title}" for i, t, title in rows)
+        full = "\n".join(f"[{t}] #{i} {title}" for i, t, title, _ in rows)
+        if not self._graph.enabled or len(rows) <= self._boot_index_cap:
+            return full                                  # today's behavior
+        try:
+            return self._curated_index(rows, self._graph.degree_map(),
+                                       self._boot_index_cap)
+        except Exception:
+            return full                                  # curation failure -> full list
+
+    def _curated_index(self, rows, deg, cap) -> str:
+        # rows: [(id, type, title, updated_at)] newest-first
+        meta = {r[0]: (r[1], r[2]) for r in rows}        # id -> (type, title)
+        upd = {r[0]: r[3] for r in rows}                 # id -> updated_at (tie-break)
+        newest = [r[0] for r in rows]
+        reserve = max(1, cap // 4)
+        recent = newest[:reserve]
+        recent_set = set(recent)
+        hubs = sorted(
+            (mid for mid in deg if deg[mid] > 0 and mid not in recent_set),
+            key=lambda mid: (deg[mid], upd[mid], mid), reverse=True,
+        )[: cap - reserve]                               # degree desc, then updated_at desc, then id desc
+        chosen = set(hubs) | recent_set
+        for mid in newest:                               # fill remaining budget with recency
+            if len(chosen) >= cap:
+                break
+            if mid not in chosen:
+                recent.append(mid)
+                chosen.add(mid)
+
+        def line(mid):
+            t, title = meta[mid]
+            return f"[{t}] #{mid} {title}"
+
+        if not hubs:
+            return "\n".join(line(mid) for mid in recent)
+        parts = ["# Load-bearing"] + [line(mid) for mid in hubs]
+        parts += ["# Recent"] + [line(mid) for mid in recent]
+        return "\n".join(parts)
