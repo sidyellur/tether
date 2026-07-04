@@ -49,3 +49,39 @@ def semantic_enabled() -> bool:
 
 def embedding_model() -> str:
     return os.environ.get("TETHER_EMBEDDING_MODEL") or _DEFAULT_EMBEDDING_MODEL
+
+
+_CONSOLIDATE_ON = {"1", "true", "yes", "on"}
+_DEFAULT_DEDUP_THRESHOLD = 0.92
+
+
+def author() -> str:
+    return os.environ.get("TETHER_AUTHOR") or device_id()
+
+
+def consolidate_enabled() -> bool:
+    val = os.environ.get("TETHER_CONSOLIDATE")
+    if val is None:
+        return False
+    return val.strip().lower() in _CONSOLIDATE_ON
+
+
+def dedup_threshold() -> float:
+    raw = os.environ.get("TETHER_DEDUP_THRESHOLD")
+    if not raw:
+        return _DEFAULT_DEDUP_THRESHOLD
+    try:
+        return float(raw)
+    except ValueError:
+        return _DEFAULT_DEDUP_THRESHOLD
+
+
+def decay_half_life_days():
+    raw = os.environ.get("TETHER_DECAY_HALF_LIFE_DAYS")
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+    except ValueError:
+        return None
+    return val if val > 0 else None
