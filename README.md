@@ -180,6 +180,23 @@ As a store grows, tether keeps it legible using the same usage graph:
 With `TETHER_FORGET` off (default) and a normal store size, recall and the
 boot-index behave exactly as before.
 
+## Crystallization (optional, off by default)
+
+With `TETHER_CRYSTALLIZE=1`, tether reflects: it detects dense clusters of
+related memories and offers them for naming. Read `tether://crystallization`
+during a reflection pass (it is pull-only, never auto-loaded) to get candidate
+clusters; name a real principle with `remember(..., crystallizes=[source_ids])`
+— which writes the principle and links it over its sources — or drop a candidate
+with `dismiss_cluster(id_a, id_b)`. Clusters are seeded by explicit links +
+usage (semantic similarity fills out membership), so this finds *"these belong
+together"* structure, not mere topical similarity. tether finds the structure;
+your agent supplies the words.
+
+A crystallized principle becomes a boot-index hub and is reachable from its
+sources in recall. Note: this makes "named" a third importance signal alongside
+"used" and "linked" — deliberate, since an agent judging something
+principle-worthy is a strong signal.
+
 ## Tools
 
 | Tool | What it does |
