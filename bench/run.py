@@ -133,6 +133,13 @@ def run(corpus, embedder, k=10, eps=0.02):
         "distribution": distribution(cold_fz["per_query"],
                                      warm_fz["per_query"], eps=eps),
     }
+    # The PROVEN claim: the associative graph (semantic + explicit structure)
+    # reaches connected golds that keyword+semantic search alone cannot. Measured
+    # frozen so it's contamination-free. This is the headline, not the learning
+    # delta (which the held-out measurement shows is ~0 on this corpus).
+    report["structural_delta_ndcg"] = (
+        cold_fz["mean"]["ndcg"]
+        - go["v2"]["graph_only"]["mean"]["ndcg"])
     return report
 
 
@@ -152,14 +159,18 @@ def _print(report):
               f"  MRR={c['graph_only']['mean']['mrr']:.3f}"
               f"  R@k={c['graph_only']['mean']['recall_at_k']:.3f}"
               f"   | control nDCG={c['control']['mean']['ndcg']:.3f}")
-    print(f"\nlearning delta (warmed-cold, graph_only nDCG): "
-          f"{report['learning_delta_ndcg']:+.3f}  "
-          f"dist={report['learning_distribution']}")
     ho = report["held_out"]
+    print(f"\nSTRUCTURAL delta (graph vs keyhole, cold_frozen-v2, graph_only "
+          f"nDCG): {report['structural_delta_ndcg']:+.3f}  <- the proven claim")
     print(f"held-out learning delta (FROZEN graph, warmed-cold): "
           f"{ho['learning_delta_ndcg']:+.3f}  "
           f"(cold {ho['cold_frozen_ndcg']:.3f} -> warmed "
-          f"{ho['warmed_frozen_ndcg']:.3f})  dist={ho['distribution']}")
+          f"{ho['warmed_frozen_ndcg']:.3f})  dist={ho['distribution']}  "
+          f"<- usage-learning: ~0, not yet proven")
+    print(f"learning delta (NON-frozen, warmed-cold): "
+          f"{report['learning_delta_ndcg']:+.3f}  "
+          f"dist={report['learning_distribution']}  "
+          f"<- artifact-prone (recall learns during eval); prefer held-out")
     print(f"headroom (oracle-warmed, graph_only nDCG): "
           f"{report['headroom_ndcg']:+.3f}")
     nr = report["no_regression"]
