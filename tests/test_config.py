@@ -106,3 +106,39 @@ def test_recall_budget_default_and_parsing(monkeypatch):
     assert config.recall_budget() == 24
     monkeypatch.setenv("TETHER_RECALL_BUDGET", "junk")
     assert config.recall_budget() == 24
+
+
+def test_boot_index_cap_default_and_parsing(monkeypatch):
+    monkeypatch.delenv("TETHER_BOOT_INDEX_CAP", raising=False)
+    assert config.boot_index_cap() == 50
+    monkeypatch.setenv("TETHER_BOOT_INDEX_CAP", "10")
+    assert config.boot_index_cap() == 10
+    monkeypatch.setenv("TETHER_BOOT_INDEX_CAP", "0")
+    assert config.boot_index_cap() == 50          # <1 → default
+    monkeypatch.setenv("TETHER_BOOT_INDEX_CAP", "junk")
+    assert config.boot_index_cap() == 50
+
+
+def test_forget_enabled_default_off(monkeypatch):
+    monkeypatch.delenv("TETHER_FORGET", raising=False)
+    assert config.forget_enabled() is False
+    for v in ("1", "true", "on", "YES"):
+        monkeypatch.setenv("TETHER_FORGET", v)
+        assert config.forget_enabled() is True
+    monkeypatch.setenv("TETHER_FORGET", "0")
+    assert config.forget_enabled() is False
+
+
+def test_forget_numeric_configs(monkeypatch):
+    cases = [("TETHER_FORGET_AGE_DAYS", config.forget_age_days, 90),
+             ("TETHER_FORGET_INTERVAL", config.forget_interval, 20),
+             ("TETHER_FORGET_MAX_PER_SWEEP", config.forget_max_per_sweep, 10)]
+    for name, fn, default in cases:
+        monkeypatch.delenv(name, raising=False)
+        assert fn() == default
+        monkeypatch.setenv(name, "5")
+        assert fn() == 5
+        monkeypatch.setenv(name, "0")
+        assert fn() == default                    # <1 → default
+        monkeypatch.setenv(name, "x")
+        assert fn() == default
