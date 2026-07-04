@@ -177,6 +177,56 @@ def test_run_smoke_all_conditions_both_classes():
     assert isinstance(rep["learning_delta_ndcg"], float)
     assert isinstance(rep["headroom_ndcg"], float)
     assert "no_regression" in rep and "passed" in rep["no_regression"]
+    # rec 2: held-out (frozen, contamination-free) learning delta present
+    ho = rep["held_out"]
+    assert isinstance(ho["learning_delta_ndcg"], float)
+    assert set(ho["distribution"]) == {"improved", "unchanged", "regressed"}
+
+
+def test_evaluate_freeze_leaves_graph_unchanged():
+    # A frozen eval pass must not persist any eval-time learning: every query
+    # sees the identical post-warmup graph. This is what makes the held-out
+    # learning delta contamination-free.
+    import pytest
+    pytest.importorskip("numpy")
+    from bench import run, conditions, corpus as corpus_mod
+    s, id_of = conditions.build(corpus_mod.MINI, "warmed", FakeEmbedder())
+    q = "SELECT src,dst,kind,weight FROM edges ORDER BY 1,2,3,4"
+    before = s._conn.execute(q).fetchall()
+    run.evaluate(s, id_of, corpus_mod.MINI, "graph_only", k=5, freeze=True)
+    assert s._conn.execute(q).fetchall() == before        # rolled back
+
+
+def test_evaluate_without_freeze_mutates_graph():
+    # The contamination the freeze exists to remove: an ordinary eval pass calls
+    # touch_session on each recall, so the graph changes as it is measured.
+    import pytest
+    pytest.importorskip("numpy")
+    from bench import run, conditions, corpus as corpus_mod
+    s, id_of = conditions.build(corpus_mod.MINI, "warmed", FakeEmbedder())
+    q = "SELECT src,dst,kind,weight FROM edges ORDER BY 1,2,3,4"
+    before = s._conn.execute(q).fetchall()
+    run.evaluate(s, id_of, corpus_mod.MINI, "graph_only", k=5, freeze=False)
+    assert s._conn.execute(q).fetchall() != before        # learned during eval
+
+
+def test_assert_warmup_disjoint_passes_and_flags():
+    import pytest
+    from bench import selfcheck, corpus as corpus_mod
+    # MINI: member titles ("auth 500s", ...) are disjoint from the eval queries.
+    selfcheck.assert_warmup_disjoint(corpus_mod.MINI)
+    # rigged: an eval query IS a member title -> warmup would train on the exact
+    # eval query -> not held out -> must raise.
+    rigged = corpus_mod.Corpus(
+        name="rig",
+        memories=[corpus_mod.Memory("a", "project",
+                                    "login returns 500 under load", "x"),
+                  corpus_mod.Memory("b", "user", "pref", "y")],
+        tasks=[corpus_mod.Task("t", ["a", "b"])],
+        queries=[corpus_mod.Query("login returns 500 under load", "a",
+                                  ["b"], "graph_only")])
+    with pytest.raises(AssertionError):
+        selfcheck.assert_warmup_disjoint(rigged)
 
 
 def test_distribution_counts():

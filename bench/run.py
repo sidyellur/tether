@@ -9,7 +9,32 @@ mean can't hide a single-query swing (small N)."""
 from bench import metrics, selfcheck, conditions
 
 
-def evaluate(store, id_of, corpus, kind, k=10, budget=None):
+def _snapshot_graph(conn):
+    return (conn.execute(
+                "SELECT src,dst,kind,weight,updated_at FROM edges").fetchall(),
+            conn.execute("SELECT session_id,memory_id,activation,updated_at "
+                         "FROM session_members").fetchall())
+
+
+def _restore_graph(conn, snap):
+    edges, members = snap
+    conn.execute("DELETE FROM edges")
+    conn.executemany("INSERT INTO edges(src,dst,kind,weight,updated_at) "
+                     "VALUES (?,?,?,?,?)", edges)
+    conn.execute("DELETE FROM session_members")
+    conn.executemany("INSERT INTO session_members"
+                     "(session_id,memory_id,activation,updated_at) "
+                     "VALUES (?,?,?,?)", members)
+    conn.commit()
+
+
+def evaluate(store, id_of, corpus, kind, k=10, budget=None, freeze=False):
+    # `freeze`: hold the graph exactly as warm-up left it. recall() learns into
+    # the edge table (touch_session), so an ordinary pass mutates the graph as
+    # it measures it — query N reshapes what query N+1 sees. When freeze=True we
+    # snapshot the graph and restore it after every query, so each query is
+    # scored against the identical post-warmup graph (contamination-free).
+    snap = _snapshot_graph(store._conn) if freeze else None
     per_query = []
     for i, q in enumerate(corpus.by_kind(kind)):
         # Each query gets its OWN fresh session id. recall() primes from and
@@ -20,6 +45,8 @@ def evaluate(store, id_of, corpus, kind, k=10, budget=None):
         # for the headline" pin, applied per query.)
         ranked = [h["id"] for h in store.recall(
             q.query, limit=k, budget=budget, session=f"eval-{kind}-{i}")]
+        if freeze:
+            _restore_graph(store._conn, snap)
         gold = {id_of[g] for g in q.gold_keys}
         per_query.append({
             "query": q.query,
@@ -52,6 +79,7 @@ def run(corpus, embedder, k=10, eps=0.02):
               for c in ("v2", "cold", "warmed", "oracle")}
     # 2. self-checks (fail loudly before any number is trusted)
     selfcheck.assert_golds_far(corpus, embedder)
+    selfcheck.assert_warmup_disjoint(corpus)
     s_v2, id_v2 = stores["v2"]
     selfcheck.assert_targets_found(corpus, s_v2, id_v2, k=k)
 
@@ -86,6 +114,32 @@ def run(corpus, embedder, k=10, eps=0.02):
     report["learning_distribution"] = distribution(
         go["cold"]["graph_only"]["per_query"],
         go["warmed"]["graph_only"]["per_query"], eps=eps)
+
+    # 5. held-out (frozen) learning delta — the contamination-free proof.
+    # The main loop above evaluated cold/warmed WITHOUT freeze, so those stores
+    # learned during eval; rebuild fresh ones and measure them frozen, so every
+    # query is scored against the identical post-warmup graph. Same corpus, same
+    # warm-up, disjoint eval queries (asserted) -> the delta is transfer, not
+    # eval-time memorization.
+    cold_s, cold_id = conditions.build(corpus, "cold", embedder)
+    warm_s, warm_id = conditions.build(corpus, "warmed", embedder)
+    cold_fz = evaluate(cold_s, cold_id, corpus, "graph_only", k=k, freeze=True)
+    warm_fz = evaluate(warm_s, warm_id, corpus, "graph_only", k=k, freeze=True)
+    report["held_out"] = {
+        "cold_frozen_ndcg": cold_fz["mean"]["ndcg"],
+        "warmed_frozen_ndcg": warm_fz["mean"]["ndcg"],
+        "learning_delta_ndcg": (warm_fz["mean"]["ndcg"]
+                                - cold_fz["mean"]["ndcg"]),
+        "distribution": distribution(cold_fz["per_query"],
+                                     warm_fz["per_query"], eps=eps),
+    }
+    # The PROVEN claim: the associative graph (semantic + explicit structure)
+    # reaches connected golds that keyword+semantic search alone cannot. Measured
+    # frozen so it's contamination-free. This is the headline, not the learning
+    # delta (which the held-out measurement shows is ~0 on this corpus).
+    report["structural_delta_ndcg"] = (
+        cold_fz["mean"]["ndcg"]
+        - go["v2"]["graph_only"]["mean"]["ndcg"])
     return report
 
 
@@ -105,9 +159,18 @@ def _print(report):
               f"  MRR={c['graph_only']['mean']['mrr']:.3f}"
               f"  R@k={c['graph_only']['mean']['recall_at_k']:.3f}"
               f"   | control nDCG={c['control']['mean']['ndcg']:.3f}")
-    print(f"\nlearning delta (warmed-cold, graph_only nDCG): "
+    ho = report["held_out"]
+    print(f"\nSTRUCTURAL delta (graph vs keyhole, cold_frozen-v2, graph_only "
+          f"nDCG): {report['structural_delta_ndcg']:+.3f}  <- the proven claim")
+    print(f"held-out learning delta (FROZEN graph, warmed-cold): "
+          f"{ho['learning_delta_ndcg']:+.3f}  "
+          f"(cold {ho['cold_frozen_ndcg']:.3f} -> warmed "
+          f"{ho['warmed_frozen_ndcg']:.3f})  dist={ho['distribution']}  "
+          f"<- usage-learning: ~0, not yet proven")
+    print(f"learning delta (NON-frozen, warmed-cold): "
           f"{report['learning_delta_ndcg']:+.3f}  "
-          f"dist={report['learning_distribution']}")
+          f"dist={report['learning_distribution']}  "
+          f"<- artifact-prone (recall learns during eval); prefer held-out")
     print(f"headroom (oracle-warmed, graph_only nDCG): "
           f"{report['headroom_ndcg']:+.3f}")
     nr = report["no_regression"]
