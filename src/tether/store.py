@@ -304,6 +304,40 @@ class Store:
         self._sync_now()
         return {"id": mid, "action": action}
 
+    def _run_forgetting_sweep(self) -> int:
+        """Soft-archive old + behaviorally-isolated memories (opt-in, bounded,
+        reversible). Returns the number archived. Never raises."""
+        if not self._forget:
+            return 0
+        try:
+            deg = self._graph.degree_map()          # behavioral, {} if unavailable
+            if not any(v > 0 for v in deg.values()):
+                return 0                            # no live behavioral graph -> refuse
+            count = self._conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL").fetchone()[0]
+            if count < 2 * self._boot_index_cap:
+                return 0                            # store-size floor
+            now = _now()
+            rows = self._conn.execute(
+                "SELECT id, updated_at FROM memories WHERE valid_to IS NULL "
+                "ORDER BY updated_at ASC, id ASC").fetchall()   # oldest first
+            archived = 0
+            for mid, updated_at in rows:
+                if archived >= self._forget_max_per_sweep:
+                    break
+                if _age_days(updated_at, now) <= self._forget_age_days:
+                    break                           # rest are younger (ordered) -> done
+                if deg.get(mid, 0.0) > 0:
+                    continue                        # behaviorally connected -> keep
+                self._conn.execute(
+                    "UPDATE memories SET valid_to=? WHERE id=?", (now, mid))
+                archived += 1
+            if archived:
+                self._conn.commit()
+            return archived
+        except Exception:
+            return 0
+
     def _find_near_duplicate(self, type, emb):
         """Id of the most-similar CURRENT same-type memory whose cosine
         similarity to `emb` meets the dedup threshold, or None. Degrades to

@@ -612,3 +612,98 @@ def test_boot_index_unbounded_when_graph_disabled():
     for i in range(8):
         s.remember("user", f"T{i}", "b")
     assert len(s.boot_index().splitlines()) == 8       # no curation without a graph
+
+
+_OLD = "2020-01-01T00:00:00+00:00"
+
+
+def make_forget_store(**kw):
+    kw.setdefault("boot_index_cap", 2)            # size floor = 2*2 = 4
+    kw.setdefault("forget_max_per_sweep", 10)
+    return make_b1_store(assoc=True, forget=True, **kw)
+
+
+def _age(s, mid, iso=_OLD):
+    s._conn.execute("UPDATE memories SET updated_at=? WHERE id=?", (iso, mid))
+    s._conn.commit()
+
+
+def test_forgetting_archives_old_isolated():
+    s = make_forget_store()
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(6)]
+    _add_edge(s, ids[4], ids[5], "hebbian")       # live behavioral graph elsewhere
+    _age(s, ids[0])                                # old + isolated
+    assert s._run_forgetting_sweep() == 1
+    vt, sb = s._conn.execute(
+        "SELECT valid_to, superseded_by FROM memories WHERE id=?", (ids[0],)).fetchone()
+    assert vt is not None and sb is None           # archived, not superseded
+    assert ids[0] not in [h["id"] for h in s.recall("T0")]
+
+
+def test_forgetting_keeps_old_but_connected():
+    s = make_forget_store()
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(6)]
+    _add_edge(s, ids[0], ids[1], "explicit")       # behaviorally connected
+    _age(s, ids[0])
+    assert s._run_forgetting_sweep() == 0
+
+
+def test_forgetting_keeps_isolated_but_recent():
+    s = make_forget_store()
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(6)]
+    _add_edge(s, ids[4], ids[5], "hebbian")
+    # ids[0] isolated but NOT aged -> kept
+    assert s._run_forgetting_sweep() == 0
+
+
+def test_forgetting_semantic_only_does_not_protect():
+    s = make_forget_store()
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(6)]
+    _add_edge(s, ids[4], ids[5], "hebbian")        # live behavioral graph
+    _add_edge(s, ids[0], ids[1], "semantic")       # ids[0] has ONLY a semantic edge
+    _age(s, ids[0])
+    assert s._run_forgetting_sweep() == 1          # semantic doesn't protect
+
+
+def test_forgetting_noop_when_disabled():
+    s = make_b1_store(assoc=True, forget=False, boot_index_cap=2)
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(6)]
+    _add_edge(s, ids[4], ids[5], "hebbian")
+    _age(s, ids[0])
+    assert s._run_forgetting_sweep() == 0
+
+
+def test_forgetting_noop_without_behavioral_graph():
+    s = make_forget_store()
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(6)]
+    _age(s, ids[0])                                # old + isolated, but NO behavioral edges anywhere
+    assert s._run_forgetting_sweep() == 0
+
+
+def test_forgetting_respects_size_floor():
+    s = make_forget_store()                        # cap=2 -> floor 4
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(3)]   # only 3 < 4
+    _add_edge(s, ids[1], ids[2], "hebbian")
+    _age(s, ids[0])
+    assert s._run_forgetting_sweep() == 0
+
+
+def test_forgetting_bounded_per_sweep():
+    s = make_forget_store(forget_max_per_sweep=2)
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(8)]
+    _add_edge(s, ids[6], ids[7], "hebbian")        # keep two connected (live graph)
+    for i in range(6):
+        _age(s, ids[i])                            # 6 old + isolated
+    assert s._run_forgetting_sweep() == 2          # capped
+
+
+def test_forgetting_is_reversible():
+    s = make_forget_store()
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(6)]
+    _add_edge(s, ids[4], ids[5], "hebbian")
+    _age(s, ids[0])
+    s._run_forgetting_sweep()
+    s._conn.execute("UPDATE memories SET valid_to=NULL WHERE id=?", (ids[0],))
+    s._conn.commit()
+    assert ids[0] in [h["id"] for h in s.recall("T0")]           # un-forgotten
+    assert s._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] >= 1   # edges retained
