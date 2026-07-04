@@ -468,3 +468,22 @@ def test_decay_downranks_old_memories():
     s._conn.commit()
     hits = s.recall("apple")
     assert [h["id"] for h in hits][0] == new
+
+
+def test_recency_does_not_override_strong_match():
+    # A memory that matches BOTH keyword and semantic signals (agreeing at
+    # rank 0 in both lists) outranks a memory that only weakly matches -
+    # even when the weak match is decades newer. The relevance gap from two
+    # agreeing signals is large enough that the gentle 0.25 recency weight
+    # (which only ever pulls from a single ranked list) cannot flip it.
+    pytest.importorskip("numpy")
+    s = make_semantic_store()
+    best = s.remember("user", "Best", "I drive my car to work every day")["id"]
+    weak = s.remember("reference", "Weak",
+                       "a note mostly about pizza and food, "
+                       "with one incidental car mention")["id"]
+    s._conn.execute("UPDATE memories SET updated_at='2000-01-01T00:00:00+00:00' WHERE id=?", (best,))
+    s._conn.execute("UPDATE memories SET updated_at='2030-01-01T00:00:00+00:00' WHERE id=?", (weak,))
+    s._conn.commit()
+    hits = s.recall("car")
+    assert [h["id"] for h in hits][0] == best
