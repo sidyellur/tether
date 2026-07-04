@@ -73,3 +73,23 @@ def test_dismissed_peak_suppresses_candidate():
                  "PRIMARY KEY(src,dst));")
     conn.execute("INSERT INTO crystallize_dismissed VALUES(1,2)")  # dismiss the peak
     assert crystallize.candidates(conn) == []
+
+
+def test_fallback_seeds_tight_neighborhood_only_when_enabled():
+    # No explicit/hebbian peaks. Node 1 is a genuine semantic-density OUTLIER:
+    # strength 1.9 (two 0.95 edges) against a diffuse baseline of eight nodes at
+    # 0.4. Its neighbours 2,3 (strength 0.95) are NOT outliers themselves, so
+    # only node 1 seeds — then _expand pulls its tight neighbours in.
+    # NOTE: the seed must clear mean + FALLBACK_Z*std. A *balanced* bimodal split
+    # (equal-size tight vs loose groups) puts the tight nodes at only ~+1 std and
+    # can never satisfy Z=2.0 — the tight cluster must be a minority against a
+    # larger diffuse background for the threshold to mean anything.
+    conn = _store_with_edges(
+        [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"),
+         (6, "f"), (7, "g"), (8, "h"), (9, "i"), (10, "j"), (11, "k")],
+        [(1, 2, "semantic", 0.95), (1, 3, "semantic", 0.95),
+         (4, 5, "semantic", 0.40), (6, 7, "semantic", 0.40),
+         (8, 9, "semantic", 0.40), (10, 11, "semantic", 0.40)])
+    assert crystallize.candidates(conn) == []                 # off by default
+    cands = crystallize.candidates(conn, fallback=True)
+    assert len(cands) == 1 and cands[0]["member_ids"] == [1, 2, 3]
