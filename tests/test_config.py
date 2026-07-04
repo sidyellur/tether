@@ -97,15 +97,28 @@ def test_assoc_enabled_default_true(monkeypatch):
 
 def test_recall_budget_default_and_parsing(monkeypatch):
     monkeypatch.delenv("TETHER_RECALL_BUDGET", raising=False)
-    assert config.recall_budget() == 24
-    monkeypatch.setenv("TETHER_RECALL_BUDGET", "8")
     assert config.recall_budget() == 8
+    monkeypatch.setenv("TETHER_RECALL_BUDGET", "16")
+    assert config.recall_budget() == 16
     monkeypatch.setenv("TETHER_RECALL_BUDGET", "0")
     assert config.recall_budget() == 0
     monkeypatch.setenv("TETHER_RECALL_BUDGET", "-5")
-    assert config.recall_budget() == 24
+    assert config.recall_budget() == 8
     monkeypatch.setenv("TETHER_RECALL_BUDGET", "junk")
-    assert config.recall_budget() == 24
+    assert config.recall_budget() == 8
+
+
+def test_protect_head_default_and_parsing(monkeypatch):
+    monkeypatch.delenv("TETHER_PROTECT_HEAD", raising=False)
+    assert config.protect_head() == 8
+    monkeypatch.setenv("TETHER_PROTECT_HEAD", "3")
+    assert config.protect_head() == 3
+    monkeypatch.setenv("TETHER_PROTECT_HEAD", "0")
+    assert config.protect_head() == 0
+    monkeypatch.setenv("TETHER_PROTECT_HEAD", "-2")
+    assert config.protect_head() == 8
+    monkeypatch.setenv("TETHER_PROTECT_HEAD", "junk")
+    assert config.protect_head() == 8
 
 
 def test_boot_index_cap_default_and_parsing(monkeypatch):

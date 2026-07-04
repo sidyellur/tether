@@ -138,7 +138,12 @@ edge it came through), and two optional `recall` args tune it:
 | `budget` (per call) | `TETHER_RECALL_BUDGET` | how far to follow associations; `0` = direct matches only |
 | `session` (per call) | time-bucketed | group related recalls so they prime each other |
 | `TETHER_ASSOC` | on | set `0`/`false`/`off` for plain keyword+semantic recall |
-| `TETHER_RECALL_BUDGET` | `24` | default association breadth |
+| `TETHER_RECALL_BUDGET` | `8` | default association breadth |
+| `TETHER_PROTECT_HEAD` | `8` | how many top direct hits are locked above associations |
+
+Associative recall is **seed-dominant**: the top direct matches are locked in
+place, and associations only fill the slots below them — so turning association
+on never demotes a hit that keyword/semantic search already ranked highly.
 
 With `TETHER_ASSOC=0` (or `budget=0`, or an empty graph), `recall` behaves exactly
 as before — associative recall is purely additive and never breaks a lookup.

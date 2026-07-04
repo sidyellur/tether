@@ -562,6 +562,26 @@ def test_recall_budget_zero_is_passthrough():
     assert ids == [a]                             # no spreading -> only the direct match
 
 
+def test_recall_seed_not_buried_by_high_weight_hebbian_neighbor():
+    # #25: a within-task co-recalled neighbor (NOT a query match), reached over a
+    # capped Hebbian edge (factor 5.0*0.4=2.0, amplifying), must not outrank the
+    # query's own direct hit. The seed-activation floor guarantees this for a
+    # single hop (seed_score + floor > one hop's transmit).
+    # NOTE: budget=1 caps the walk to the single a->b hop the bug report
+    # describes. (With only 2 memories, budget>=2 lets `b` fire back across the
+    # same bidirectional edge and re-boost `a`, which masked the bug pre-fix; the
+    # floor makes a>b hold at any budget, but budget=1 is the tightest check.)
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]     # matches query
+    b = s.remember("project", "Picnic", "quarterly pizza budget review")["id"]  # no match
+    s._graph._upsert_edge(a, b, "hebbian", 5.0, "2026-01-01T00:00:00+00:00", mode="max")
+    s._conn.commit()
+    ids = [h["id"] for h in s.recall("JWT tokens", budget=1)]
+    assert a in ids and b in ids
+    assert ids.index(a) < ids.index(b)          # seed dominates the spread-reached node
+
+
 def make_b1_store(assoc=True, **kw):
     conn = sqlite3.connect(":memory:")
     s = Store(conn, "d", lambda *a, **k: None, assoc=assoc, **kw)

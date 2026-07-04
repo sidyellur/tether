@@ -103,6 +103,16 @@ def _unpack(blob: bytes) -> tuple:
 
 _RECENCY_WEIGHT = 0.25
 _PRIMING_WEIGHT = 0.25
+# Associative ranking protects the head and re-ranks the tail. Semantic recall
+# returns the whole store as near-tied seeds, so a direct hit is distinguished
+# only by sitting in the top few by v0.2 score. _PROTECT_HEAD locks that many
+# top v0.2 hits in place (so a direct hit can't be buried by spreading - the #25
+# regression), and everything below is re-ranked by spread activation to surface
+# connected-but-weakly-matched memories. Larger == more protection, less upside.
+# 8 is the bench-validated default (see bench/): control nDCG stays == v0.2 while
+# warmed graph-only recall beats it; below ~8 unwarmed recall dips under v0.2, and
+# above ~10 the associative upside disappears.
+_PROTECT_HEAD = 8
 
 
 def _rrf_scores(ranked_lists, k=60):
@@ -135,7 +145,8 @@ def _decay_factor(age_days: float, half_life_days: float) -> float:
 class Store:
     def __init__(self, conn, device_id: str, sync_now, embedder=None,
                  author="", consolidate=False, dedup_threshold=0.92,
-                 decay_half_life_days=None, assoc=False, recall_budget=24,
+                 decay_half_life_days=None, assoc=False, recall_budget=8,
+                 protect_head=_PROTECT_HEAD,
                  boot_index_cap=50, forget=False, forget_age_days=90,
                  forget_interval=20, forget_max_per_sweep=10):
         self._conn = conn
@@ -147,6 +158,7 @@ class Store:
         self._dedup_threshold = dedup_threshold
         self._decay_half_life_days = decay_half_life_days
         self._recall_budget = recall_budget
+        self._protect_head = protect_head
         self._graph = Graph(conn, enabled=assoc)
         self._boot_index_cap = boot_index_cap
         self._forget = forget
@@ -468,30 +480,45 @@ class Store:
     def recall(self, query, type=None, limit=20, budget=None, session=None) -> list:
         if not query or not query.strip():
             return []
-        scores = self._seed_scores(query, type)
+        seeds = self._seed_scores(query, type)
         if not self._graph.enabled:
-            if not scores:
+            if not seeds:
                 return []
             order = [mid for mid, _ in sorted(
-                scores.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
+                seeds.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
             return self._hydrate(order)          # v0.2 shape, no `via`
-        # associative path: seed -> prime -> spread -> rank -> learn -> receipts
+        # associative path: seed -> prime -> spread -> two-tier rank -> learn -> receipts
         if budget is None:
             budget = self._recall_budget
         sid = self._graph.resolve_session(session, self._meta_get, self._meta_set)
+        # `seeds` stays the immutable v0.2 result (the protected tier); prime a copy
+        # so priming/spread never reorder the seed tier.
+        activated = dict(seeds)
         for mid, a in self._graph.session_activation(sid).items():
-            scores[mid] = scores.get(mid, 0.0) + _PRIMING_WEIGHT * a
-        if not scores:
+            activated[mid] = activated.get(mid, 0.0) + _PRIMING_WEIGHT * a
+        if not activated:
             return []
-        activation, receipts = self._graph.spread(scores, budget, type)
-        order = [mid for mid, _ in sorted(
-            activation.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
+        activation, receipts = self._graph.spread(activated, budget, type)
+        # protect-head / re-rank-tail. Semantic recall returns the whole store as
+        # near-tied seeds, so a direct hit is distinguished only by sitting in the
+        # top few by v0.2 score. Lock that head in exact v0.2 order (a direct hit
+        # can't be demoted -> no #25 regression), then re-rank everything below it
+        # by spread activation, which surfaces connected-but-weakly-matched
+        # memories (huge activation, deep in the v0.2 tail) into the slots the
+        # direct hits didn't claim. HEAD is the protected-prefix size.
+        seed_order = [m for m, _ in sorted(
+            seeds.items(), key=lambda kv: (-kv[1], kv[0]))]
+        head = seed_order[:self._protect_head]
+        head_set = set(head)
+        tail = sorted((m for m in activation if m not in head_set),
+                      key=lambda m: (-activation[m], m))
+        order = (head + tail)[:limit]
         self._graph.touch_session(sid, order)
         self._conn.commit()
         hits = self._hydrate(order)
         for h in hits:
             r = receipts.get(h["id"])
-            if r is not None and h["id"] not in scores:
+            if r is not None and h["id"] not in seeds:
                 h["via"] = {"path": [{"from": r["from"], "kind": r["kind"], "w": r["w"]}],
                             "hops": r["hops"]}
             else:
