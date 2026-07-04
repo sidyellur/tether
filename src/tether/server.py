@@ -60,7 +60,8 @@ def remember(type: str, title: str, body: str,
         tags: optional comma-separated tags.
         links: optional list of related memory ids.
 
-    Returns {"id", "action"} where action is "created" or "updated".
+    Returns {"id", "action"} where action is "created", "updated", or (with
+    TETHER_CONSOLIDATE on) "consolidated" - a near-duplicate was superseded.
     """
     try:
         return _get_store().remember(type, title, body, tags=tags, links=links)
