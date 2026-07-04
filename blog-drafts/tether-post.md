@@ -79,13 +79,25 @@ This becomes crucial as AI tooling matures. Right now, most agents are single-th
 
 tether is a small piece of that puzzle. It's deliberately boring — four verbs, SQLite, no magic. That boringness is the point. In a few years, when agents are everywhere, boring shared infrastructure will be more valuable than novel but isolated systems.
 
+## Shipping it surfaced two problems the code never would have
+
+The code was done, tested, and merged. Publishing it turned out to be its own adventure.
+
+We'd already confirmed `tether` was available on PyPI — a plain `curl` to the JSON API came back 404. Weeks later, when we actually tried to register a Trusted Publisher under that name, PyPI rejected it outright: "This project name isn't allowed." The JSON API's 404 doesn't distinguish "never registered" from "registered but blocked" — we had to check the actual Simple Index API (the one `pip` itself queries) to confirm nobody had claimed it. That left one explanation: PyPI almost certainly blocks names colliding with major non-Python brands to prevent dependency-confusion attacks, and `tether` collides with Tether/USDT, one of the largest cryptocurrencies by market cap. We renamed the *published distribution* to `tether-memory` and left the Python import, CLI command, and repo name as `tether`. Those names never have to match — treating them as independent knobs cost us nothing.
+
+Then the release workflow itself failed, in a genuinely confusing way. We'd scoped `permissions: id-token: write` for PyPI's OIDC trusted publishing — the minimal grant, we thought. But specifying *any* permission switches GitHub Actions from "inherit the repo's default permissions" to "everything unspecified is `none`." `contents: read`, which `actions/checkout` needs to clone the repo, silently disappeared. The error GitHub gave us was "repository not found" — not a permissions error, not "forbidden." On a private repo, an under-scoped token gets told the repo doesn't exist at all, as a deliberate security choice to avoid leaking whether private repos exist. The fix was one line. Finding it meant reading the actual failed-step logs instead of trusting the summary.
+
+Neither of these showed up in local testing — the build succeeded, all 21 tests passed, the package built cleanly. Both only surfaced the moment we tried to actually publish. "It builds and tests pass" and "it ships" are different bars, and only one of them is exercised by CI running on a laptop.
+
 ## Try it
 
 Install with Claude Code:
 
 ```sh
-claude mcp add tether -- uvx tether
+claude mcp add tether -- uvx --from tether-memory tether
 ```
+
+The PyPI package is `tether-memory` (see above for why); the command you actually run is still `tether`.
 
 Local memory is free. If you want cross-device sync, set `TETHER_SYNC_URL` and `TETHER_SYNC_TOKEN` pointing to a Turso database and you're done.
 
