@@ -842,3 +842,32 @@ def test_dismiss_invalidates_candidate_memo():
     s.dismiss_cluster(1, 2)                          # writes crystallize_dismissed
     s.crystallization_candidates()                  # must recompute
     assert s._cryst_sig != sig_before               # signature reflects the dismissal
+
+
+def test_crystallized_edge_surfaces_principle_from_source():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True, recall_budget=16)
+    s.migrate()
+    a = s.remember("project", "Auth", "we switched to JWT tokens")["id"]
+    p = s.remember("reference", "Principle", "fail fast under load",
+                   crystallizes=[a])["id"]
+    ids = [h["id"] for h in s.recall("JWT tokens", budget=8)]
+    assert a in ids and p in ids                    # principle reached from its source
+
+
+def test_crystallized_hub_does_not_bury_direct_hit():
+    # #25 back-door: a max-fan-out principle must not outrank a query's own hit.
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True, recall_budget=16)
+    s.migrate()
+    hits = [s.remember("project", f"n{i}", "quarterly pizza budget review")["id"]
+            for i in range(6)]
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]  # the direct hit
+    p = s.remember("reference", "Principle", "a big fan-out principle",
+                   crystallizes=hits + [a])["id"]   # hub over everything incl. a
+    ids = [h["id"] for h in s.recall("JWT tokens", budget=8)]
+    assert ids[0] == a                              # seed still dominates the hub
