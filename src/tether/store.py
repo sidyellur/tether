@@ -153,6 +153,7 @@ class Store:
                  author="", consolidate=False, dedup_threshold=0.92,
                  decay_half_life_days=None, assoc=False, recall_budget=8,
                  protect_head=_PROTECT_HEAD, seed_floor=_SEED_FLOOR,
+                 crystallize=False,
                  boot_index_cap=50, forget=False, forget_age_days=90,
                  forget_interval=20, forget_max_per_sweep=10):
         self._conn = conn
@@ -166,6 +167,9 @@ class Store:
         self._recall_budget = recall_budget
         self._protect_head = protect_head
         self._seed_floor = seed_floor
+        self._crystallize = crystallize
+        self._cryst_sig = None
+        self._cryst_cache = []
         self._graph = Graph(conn, enabled=assoc)
         self._boot_index_cap = boot_index_cap
         self._forget = forget
@@ -283,7 +287,8 @@ class Store:
         except Exception:
             return 0
 
-    def remember(self, type, title, body, tags=None, links=None) -> dict:
+    def remember(self, type, title, body, tags=None, links=None,
+                 crystallizes=None) -> dict:
         if type not in VALID_TYPES:
             raise ValueError(f"type must be one of {VALID_TYPES}, got {type!r}")
         now = _now()
@@ -319,6 +324,8 @@ class Store:
                     (now, mid, superseded))
                 action = "consolidated"
         self._graph.on_remember(mid, emb)
+        if self._crystallize and crystallizes:
+            self._graph.on_crystallize(mid, crystallizes)
         self._conn.commit()
         self._sync_now()
         self._maybe_forget()
@@ -574,6 +581,10 @@ class Store:
         self._sync_now()
         return {"linked": [id_a, id_b]}
 
+    def dismiss_cluster(self, id_a, id_b) -> dict:
+        self._graph.dismiss_peak(id_a, id_b)
+        return {"dismissed": [id_a, id_b]}
+
     def forget(self, id) -> dict:
         cur = self._conn.execute("DELETE FROM memories WHERE id=?", (id,))
         self._graph.on_forget(id)
@@ -626,3 +637,28 @@ class Store:
         parts = ["# Load-bearing"] + [line(mid) for mid in hubs]
         parts += ["# Recent"] + [line(mid) for mid in recent]
         return "\n".join(parts)
+
+    def crystallization_candidates(self) -> list:
+        """Read-time derived view of principle candidates. [] when disabled.
+        Process-memoized on a cheap graph signature (adjustment C) so repeated
+        reads in one reflection pass don't recompute. Never raises.
+
+        The signature MUST include the dismissed-set count: dismiss_cluster writes
+        to crystallize_dismissed, NOT edges, so an edges-only signature would keep
+        serving a dismissed candidate from cache for the life of the process
+        (dismissal silently no-ops). Naming a principle self-invalidates because it
+        adds crystallized edges."""
+        if not self._crystallize:
+            return []
+        try:
+            from . import crystallize
+            sig = self._conn.execute(
+                "SELECT (SELECT COUNT(*) FROM edges), "
+                "(SELECT COALESCE(MAX(updated_at), '') FROM edges), "
+                "(SELECT COUNT(*) FROM crystallize_dismissed)").fetchone()
+            if sig != self._cryst_sig:
+                self._cryst_cache = crystallize.candidates(self._conn, self._embedder)
+                self._cryst_sig = sig
+            return self._cryst_cache
+        except Exception:
+            return []

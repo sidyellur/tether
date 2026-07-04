@@ -229,6 +229,61 @@ def test_assert_warmup_disjoint_passes_and_flags():
         selfcheck.assert_warmup_disjoint(rigged)
 
 
+def test_crystallized_condition_wires_hub_edges():
+    import pytest
+    pytest.importorskip("numpy")
+    from bench import conditions, corpus as corpus_mod
+    s, id_of = conditions.build(corpus_mod.MINI, "crystallized", FakeEmbedder())
+    # MINI's 'auth' task has 2 members -> a principle crystallized over both
+    # writes 2 directional principle->source edges.
+    n = s._conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='crystallized'").fetchone()[0]
+    assert n == 2
+
+
+def test_crystallized_detected_condition_builds():
+    # MINI has no explicit links, and hebbian peaks are W_b=0, so the real
+    # detector finds no clusters -> zero principles, condition == warmed. The
+    # point is that build() runs the detector path without error.
+    import pytest
+    pytest.importorskip("numpy")
+    from bench import conditions, corpus as corpus_mod
+    s, id_of = conditions.build(
+        corpus_mod.MINI, "crystallized_detected", FakeEmbedder())
+    n = s._conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='crystallized'").fetchone()[0]
+    assert n == 0
+
+
+def test_assert_principles_far_passes_and_flags():
+    import pytest
+    pytest.importorskip("numpy")
+    from bench import selfcheck, conditions, corpus as corpus_mod
+    e = FakeEmbedder()
+    # neutral principle bodies share no vocab with MINI queries/golds -> pass.
+    selfcheck.assert_principles_far(corpus_mod.MINI, e, threshold=0.35)
+    # monkeypatch a riggable (topical) principle body -> must raise.
+    orig = conditions.principle_body
+    conditions.principle_body = lambda i: "login returns 500 under load"
+    try:
+        with pytest.raises(AssertionError):
+            selfcheck.assert_principles_far(corpus_mod.MINI, e, threshold=0.35)
+    finally:
+        conditions.principle_body = orig
+
+
+def test_run_reports_crystallization_block():
+    import pytest
+    pytest.importorskip("numpy")
+    from bench import run, corpus as corpus_mod
+    rep = run.run(corpus_mod.MINI, FakeEmbedder(), k=5)
+    cz = rep["crystallization"]
+    for key in ("cold_frozen_ndcg", "warmed_frozen_ndcg", "oracle_frozen_ndcg",
+                "crystallized_frozen_ndcg", "crystallized_detected_frozen_ndcg",
+                "delta_vs_cold", "headroom_recovered", "detected_delta_vs_warmed"):
+        assert key in cz and isinstance(cz[key], float)
+
+
 def test_distribution_counts():
     from bench import run
     base = [{"ndcg": 0.5}, {"ndcg": 0.5}, {"ndcg": 0.5}]

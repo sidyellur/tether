@@ -43,6 +43,7 @@ def _get_store() -> Store:
                       recall_budget=config.recall_budget(),
                       protect_head=config.protect_head(),
                       seed_floor=config.seed_floor(),
+                      crystallize=config.crystallize_enabled(),
                       boot_index_cap=config.boot_index_cap(),
                       forget=config.forget_enabled(),
                       forget_age_days=config.forget_age_days(),
@@ -57,7 +58,8 @@ def _get_store() -> Store:
 
 @mcp.tool()
 def remember(type: str, title: str, body: str,
-             tags: str = "", links: list = None) -> dict:
+             tags: str = "", links: list = None,
+             crystallizes: list = None) -> dict:
     """Save a durable memory. UPSERTS: a memory of the same `type` with the same
     (whitespace/case-normalized) `title` is updated in place instead of
     duplicated, so re-remembering a fact refines it rather than cluttering.
@@ -68,12 +70,15 @@ def remember(type: str, title: str, body: str,
         body: the fact. For feedback/project, a "Why:" / "How to apply:" line helps.
         tags: optional comma-separated tags.
         links: optional list of related memory ids.
+        crystallizes: optional list of source memory ids this memory abstracts;
+            links it over them as a crystallized principle (needs TETHER_CRYSTALLIZE).
 
     Returns {"id", "action"} where action is "created", "updated", or (with
     TETHER_CONSOLIDATE on) "consolidated" - a near-duplicate was superseded.
     """
     try:
-        return _get_store().remember(type, title, body, tags=tags, links=links)
+        return _get_store().remember(type, title, body, tags=tags, links=links,
+                                     crystallizes=crystallizes)
     except Exception as e:
         return {"error": str(e)}
 
@@ -114,6 +119,16 @@ def link(id_a: int, id_b: int) -> dict:
 
 
 @mcp.tool()
+def dismiss_cluster(id_a: int, id_b: int) -> dict:
+    """Reflection control: dismiss the crystallization candidate nucleated by the
+    peak edge (id_a, id_b) so it is not re-surfaced. Not a memory operation."""
+    try:
+        return _get_store().dismiss_cluster(id_a, id_b)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
 def forget(id: int) -> dict:
     """Permanently delete a memory by id. Returns {"forgotten", "existed"}."""
     try:
@@ -132,6 +147,18 @@ def memory_index() -> str:
         return _get_store().boot_index()
     except Exception as e:
         return f"(memory index unavailable: {e})"
+
+
+@mcp.resource("tether://crystallization")
+def crystallization() -> str:
+    """Pull-only reflection view: candidate clusters that may want a name. Read
+    it during a reflection pass (NOT auto-loaded). For each cluster, name it via
+    remember(..., crystallizes=member_ids) or drop it via dismiss_cluster(peak).
+    """
+    try:
+        return json.dumps({"candidates": _get_store().crystallization_candidates()})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 def main():

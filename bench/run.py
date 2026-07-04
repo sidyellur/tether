@@ -80,6 +80,7 @@ def run(corpus, embedder, k=10, eps=0.02):
     # 2. self-checks (fail loudly before any number is trusted)
     selfcheck.assert_golds_far(corpus, embedder)
     selfcheck.assert_warmup_disjoint(corpus)
+    selfcheck.assert_principles_far(corpus, embedder)
     s_v2, id_v2 = stores["v2"]
     selfcheck.assert_targets_found(corpus, s_v2, id_v2, k=k)
 
@@ -140,6 +141,34 @@ def run(corpus, embedder, k=10, eps=0.02):
     report["structural_delta_ndcg"] = (
         cold_fz["mean"]["ndcg"]
         - go["v2"]["graph_only"]["mean"]["ndcg"])
+
+    # 6. crystallization efficacy (frozen, contamination-free). Does naming
+    # principle-hubs over clusters reach the topically-distant graph_only golds,
+    # and how much of the cold->oracle headroom does hub-routing recover?
+    #   crystallized          = oracle-style, principle per ground-truth task
+    #                           (bypasses detection -> the MECHANISM ceiling)
+    #   crystallized_detected = the REAL detector's clusters (base=warmed ->
+    #                           the shipped PIPELINE's actual reach)
+    def _frozen_go(cond):
+        st, idf = conditions.build(corpus, cond, embedder)
+        return evaluate(st, idf, corpus, "graph_only", k=k, freeze=True)["mean"]["ndcg"]
+
+    cz_cold = cold_fz["mean"]["ndcg"]           # already measured frozen above
+    cz_oracle = _frozen_go("oracle")
+    cz_warm = _frozen_go("warmed")
+    cz_cryst = _frozen_go("crystallized")
+    cz_det = _frozen_go("crystallized_detected")
+    headroom = cz_oracle - cz_cold
+    report["crystallization"] = {
+        "cold_frozen_ndcg": cz_cold,
+        "warmed_frozen_ndcg": cz_warm,
+        "oracle_frozen_ndcg": cz_oracle,
+        "crystallized_frozen_ndcg": cz_cryst,
+        "crystallized_detected_frozen_ndcg": cz_det,
+        "delta_vs_cold": cz_cryst - cz_cold,
+        "headroom_recovered": (cz_cryst - cz_cold) / headroom if headroom > 1e-9 else 0.0,
+        "detected_delta_vs_warmed": cz_det - cz_warm,
+    }
     return report
 
 
@@ -173,6 +202,18 @@ def _print(report):
           f"<- artifact-prone (recall learns during eval); prefer held-out")
     print(f"headroom (oracle-warmed, graph_only nDCG): "
           f"{report['headroom_ndcg']:+.3f}")
+    cz = report.get("crystallization")
+    if cz:
+        print(f"\nCRYSTALLIZATION (graph_only nDCG, FROZEN):")
+        print(f"  MECHANISM (oracle-style hub over each task, bypasses detection): "
+              f"cold {cz['cold_frozen_ndcg']:.3f} -> crystallized "
+              f"{cz['crystallized_frozen_ndcg']:.3f}  (delta {cz['delta_vs_cold']:+.3f})")
+        print(f"    oracle ceiling {cz['oracle_frozen_ndcg']:.3f}  ->  recovered "
+              f"{cz['headroom_recovered']*100:.0f}% of the cold->oracle headroom")
+        print(f"  PIPELINE (real detector's clusters, base=warmed): warmed "
+              f"{cz['warmed_frozen_ndcg']:.3f} -> "
+              f"{cz['crystallized_detected_frozen_ndcg']:.3f}  "
+              f"(delta {cz['detected_delta_vs_warmed']:+.3f})")
     nr = report["no_regression"]
     print(f"no-regression guard (control, default budget): "
           f"{'PASS' if nr['passed'] else 'FAIL'}  dist={nr['distribution']}")

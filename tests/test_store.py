@@ -780,3 +780,94 @@ def test_seed_floor_zero_keeps_all_vector_hits():
     drop = s.remember("user", "drop", "car pizza food")["id"]
     seeds = s._seed_scores("automobile", None)
     assert keep in seeds and drop in seeds
+
+
+def test_remember_crystallizes_links_sources_when_enabled():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True)
+    s.migrate()
+    a = s.remember("project", "auth outage", "login 500s under load")["id"]
+    b = s.remember("project", "pool fix", "raised the connection pool ceiling")["id"]
+    p = s.remember("reference", "principle: fail fast on saturation",
+                   "cap the pool and time out", crystallizes=[a, b])["id"]
+    rows = conn.execute(
+        "SELECT src, dst FROM edges WHERE kind='crystallized' ORDER BY dst").fetchall()
+    assert rows == [(p, a), (p, b)]
+
+
+def test_remember_crystallizes_ignored_when_disabled():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=False)          # feature off
+    s.migrate()
+    a = s.remember("project", "x", "y")["id"]
+    s.remember("reference", "p", "z", crystallizes=[a])
+    assert conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='crystallized'").fetchone()[0] == 0
+
+
+def test_crystallization_candidates_empty_when_disabled():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=False)
+    s.migrate()
+    assert s.crystallization_candidates() == []
+
+
+def test_crystallization_candidates_memoized_until_write():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True)
+    s.migrate()
+    first = s.crystallization_candidates()
+    # same signature -> same object identity (cache hit, no recompute)
+    assert s.crystallization_candidates() is first
+
+
+def test_dismiss_invalidates_candidate_memo():
+    # Regression: dismiss_cluster writes crystallize_dismissed (not edges), so an
+    # edges-only memo signature would NOT recompute and the dismissal would no-op.
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True)
+    s.migrate()
+    s.crystallization_candidates()                  # populate the memo signature
+    sig_before = s._cryst_sig
+    s.dismiss_cluster(1, 2)                          # writes crystallize_dismissed
+    s.crystallization_candidates()                  # must recompute
+    assert s._cryst_sig != sig_before               # signature reflects the dismissal
+
+
+def test_crystallized_edge_surfaces_principle_from_source():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True, recall_budget=16)
+    s.migrate()
+    a = s.remember("project", "Auth", "we switched to JWT tokens")["id"]
+    p = s.remember("reference", "Principle", "fail fast under load",
+                   crystallizes=[a])["id"]
+    ids = [h["id"] for h in s.recall("JWT tokens", budget=8)]
+    assert a in ids and p in ids                    # principle reached from its source
+
+
+def test_crystallized_hub_does_not_bury_direct_hit():
+    # #25 back-door: a max-fan-out principle must not outrank a query's own hit.
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True, recall_budget=16)
+    s.migrate()
+    hits = [s.remember("project", f"n{i}", "quarterly pizza budget review")["id"]
+            for i in range(6)]
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]  # the direct hit
+    p = s.remember("reference", "Principle", "a big fan-out principle",
+                   crystallizes=hits + [a])["id"]   # hub over everything incl. a
+    ids = [h["id"] for h in s.recall("JWT tokens", budget=8)]
+    assert ids[0] == a                              # seed still dominates the hub
