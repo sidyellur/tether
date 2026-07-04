@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tether-memory"
-version = "0.1.1"
+version = "0.2.0"
 description = "A shared memory layer for personal agents, across devices: an MCP server over local SQLite with opt-in libSQL/Turso sync."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -23,7 +23,8 @@ dependencies = ["mcp>=1.0"]
 
 [project.optional-dependencies]
 sync = ["libsql-experimental>=0.0.30"]
-dev = ["pytest>=7", "build"]
+semantic = ["model2vec>=0.3", "numpy>=1.21"]
+dev = ["pytest>=7", "build", "numpy>=1.21"]
 
 [project.scripts]
 tether-memory = "tether.server:main"

@@ -79,12 +79,35 @@ export TETHER_SYNC_TOKEN='<your-auth-token>'
 If the backend is unreachable, tether logs `sync offline` and keeps working
 against the local file; writes converge when it comes back.
 
+## Semantic search (optional)
+
+By default `recall` is **hybrid**: keyword (FTS5) results are fused with
+semantic (vector) results, so a query finds relevant memories even when the
+exact words differ ("automobile" recalls a note about your "car"). Semantic
+recall runs a small **static** embedding model locally — no network, no API
+key, nothing to hang on. Install the extra:
+
+```sh
+pip install 'tether-memory[semantic]'
+```
+
+Without the extra (or with `TETHER_SEMANTIC=0`), tether runs keyword-only
+FTS5 — semantic is a pure add-on and never a requirement. The first run embeds
+existing memories once (a one-time backfill); after that it is incremental.
+
+Environment:
+
+| Var | Default | Effect |
+|---|---|---|
+| `TETHER_SEMANTIC` | on | set `0`/`false`/`off` to force keyword-only recall |
+| `TETHER_EMBEDDING_MODEL` | `minishlab/potion-base-8M` | override the local static model |
+
 ## Tools
 
 | Tool | What it does |
 |---|---|
 | `remember(type, title, body, tags?, links?)` | Save a memory; upserts on `type`+`title` so facts refine rather than duplicate |
-| `recall(query, type?, limit?)` | Keyword search; returns id/type/title/body/tags/updated_at |
+| `recall(query, type?, limit?)` | Hybrid keyword + semantic search; returns id/type/title/body/tags/updated_at |
 | `link(id_a, id_b)` | Bidirectional link between two memories |
 | `forget(id)` | Delete a memory |
 

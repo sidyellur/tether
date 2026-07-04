@@ -30,3 +30,22 @@ def sync_config():
 
 def device_id() -> str:
     return os.environ.get("TETHER_DEVICE_ID") or socket.gethostname()
+
+
+_SEMANTIC_OFF = {"0", "false", "no", "off"}
+_DEFAULT_EMBEDDING_MODEL = "minishlab/potion-base-8M"
+
+
+def semantic_enabled() -> bool:
+    """Semantic recall is on by default; any of 0/false/no/off disables it.
+
+    Disabling forces keyword-only recall without needing the [semantic] extra.
+    """
+    val = os.environ.get("TETHER_SEMANTIC")
+    if val is None:
+        return True
+    return val.strip().lower() not in _SEMANTIC_OFF
+
+
+def embedding_model() -> str:
+    return os.environ.get("TETHER_EMBEDDING_MODEL") or _DEFAULT_EMBEDDING_MODEL

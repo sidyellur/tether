@@ -30,8 +30,15 @@ def _get_store() -> Store:
         path = config.db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         conn, sync_now = open_connection(path, config.sync_config())
-        store = Store(conn, device_id=config.device_id(), sync_now=sync_now)
+        embedder = None
+        if config.semantic_enabled():
+            from . import embed
+            embedder = embed.get_embedder(config.embedding_model())
+        store = Store(conn, device_id=config.device_id(),
+                      sync_now=sync_now, embedder=embedder)
         store.migrate()
+        if embedder is not None:
+            store.backfill_embeddings()
         _store = store
     return _store
 
@@ -60,7 +67,8 @@ def remember(type: str, title: str, body: str,
 
 @mcp.tool()
 def recall(query: str, type: str = None, limit: int = 20) -> dict:
-    """Search memories by keyword (title/body/tags), newest-relevant first.
+    """Search memories by keyword and (if enabled) semantic similarity, most
+    relevant first.
 
     Each hit carries {id, type, title, body, tags, updated_at} - use
     `updated_at` to judge staleness (an old fact may no longer hold; verify
