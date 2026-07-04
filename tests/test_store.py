@@ -807,3 +807,38 @@ def test_remember_crystallizes_ignored_when_disabled():
     s.remember("reference", "p", "z", crystallizes=[a])
     assert conn.execute(
         "SELECT COUNT(*) FROM edges WHERE kind='crystallized'").fetchone()[0] == 0
+
+
+def test_crystallization_candidates_empty_when_disabled():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=False)
+    s.migrate()
+    assert s.crystallization_candidates() == []
+
+
+def test_crystallization_candidates_memoized_until_write():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True)
+    s.migrate()
+    first = s.crystallization_candidates()
+    # same signature -> same object identity (cache hit, no recompute)
+    assert s.crystallization_candidates() is first
+
+
+def test_dismiss_invalidates_candidate_memo():
+    # Regression: dismiss_cluster writes crystallize_dismissed (not edges), so an
+    # edges-only memo signature would NOT recompute and the dismissal would no-op.
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True)
+    s.migrate()
+    s.crystallization_candidates()                  # populate the memo signature
+    sig_before = s._cryst_sig
+    s.dismiss_cluster(1, 2)                          # writes crystallize_dismissed
+    s.crystallization_candidates()                  # must recompute
+    assert s._cryst_sig != sig_before               # signature reflects the dismissal

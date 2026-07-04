@@ -168,6 +168,8 @@ class Store:
         self._protect_head = protect_head
         self._seed_floor = seed_floor
         self._crystallize = crystallize
+        self._cryst_sig = None
+        self._cryst_cache = []
         self._graph = Graph(conn, enabled=assoc)
         self._boot_index_cap = boot_index_cap
         self._forget = forget
@@ -635,3 +637,28 @@ class Store:
         parts = ["# Load-bearing"] + [line(mid) for mid in hubs]
         parts += ["# Recent"] + [line(mid) for mid in recent]
         return "\n".join(parts)
+
+    def crystallization_candidates(self) -> list:
+        """Read-time derived view of principle candidates. [] when disabled.
+        Process-memoized on a cheap graph signature (adjustment C) so repeated
+        reads in one reflection pass don't recompute. Never raises.
+
+        The signature MUST include the dismissed-set count: dismiss_cluster writes
+        to crystallize_dismissed, NOT edges, so an edges-only signature would keep
+        serving a dismissed candidate from cache for the life of the process
+        (dismissal silently no-ops). Naming a principle self-invalidates because it
+        adds crystallized edges."""
+        if not self._crystallize:
+            return []
+        try:
+            from . import crystallize
+            sig = self._conn.execute(
+                "SELECT (SELECT COUNT(*) FROM edges), "
+                "(SELECT COALESCE(MAX(updated_at), '') FROM edges), "
+                "(SELECT COUNT(*) FROM crystallize_dismissed)").fetchone()
+            if sig != self._cryst_sig:
+                self._cryst_cache = crystallize.candidates(self._conn, self._embedder)
+                self._cryst_sig = sig
+            return self._cryst_cache
+        except Exception:
+            return []

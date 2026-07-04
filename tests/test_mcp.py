@@ -183,3 +183,30 @@ def test_server_wires_forget_config(monkeypatch, tmp_path):
         assert s._boot_index_cap == 7
     finally:
         server._store = None
+
+
+def test_mcp_crystallization_resource(tmp_path):
+    """Test that the tether://crystallization resource is wired and returns valid JSON."""
+    env = dict(os.environ, TETHER_DB=str(tmp_path / "mem.db"),
+               TETHER_DEVICE_ID="ci", TETHER_CRYSTALLIZE="1")
+    env.pop("TETHER_SYNC_URL", None)
+    env.pop("TETHER_SYNC_TOKEN", None)
+    env["TETHER_SEMANTIC"] = "0"  # keyword-only: no model download in CI
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "tether.server"], env=env)
+
+    async def run():
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+
+                # read the crystallization resource
+                res = await session.read_resource("tether://crystallization")
+                text = "".join(getattr(c, "text", "") for c in res.contents)
+                # parse as JSON and assert it has the expected shape
+                data = json.loads(text)
+                assert isinstance(data, dict)
+                assert "candidates" in data
+                assert isinstance(data["candidates"], list)
+
+    asyncio.run(run())

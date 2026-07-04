@@ -149,6 +149,18 @@ def memory_index() -> str:
         return f"(memory index unavailable: {e})"
 
 
+@mcp.resource("tether://crystallization")
+def crystallization() -> str:
+    """Pull-only reflection view: candidate clusters that may want a name. Read
+    it during a reflection pass (NOT auto-loaded). For each cluster, name it via
+    remember(..., crystallizes=member_ids) or drop it via dismiss_cluster(peak).
+    """
+    try:
+        return json.dumps({"candidates": _get_store().crystallization_candidates()})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 def main():
     mcp.run()
 
