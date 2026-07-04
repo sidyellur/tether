@@ -1,5 +1,13 @@
 # Seed-Dominant Recall Ranking Implementation Plan
 
+> **⚠️ Superseded mechanism:** this plan specifies a strict *two-tier* ranking.
+> The bench harness rejected that (it flattened graph-only recall to the v0.2
+> baseline) and a seed-floor variant (it regressed control). The shipped fix is
+> **protect-head / re-rank-tail** — see the "Design evolution" section of the
+> spec (`2026-07-04-tether-seed-dominant-recall-design.md`). The tasks below are
+> kept as the historical plan; the goal, budget change, and test intent still
+> hold, but the ranking code differs from Task 1's snippet.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make a query's own direct matches structurally undisplaceable by spread-reached nodes, fixing the #25 degrade-never violation at the quality layer, while preserving the usage-graph upside.
