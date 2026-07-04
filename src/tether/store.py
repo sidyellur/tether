@@ -160,6 +160,13 @@ class Store:
             self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
         self._ensure_consolidation_columns()
         self._graph.migrate()
+        if self._graph.enabled:
+            pairs = []
+            for (rid, links_json) in self._conn.execute(
+                    "SELECT id, links FROM memories").fetchall():
+                for other in json.loads(links_json or "[]"):
+                    pairs.append((rid, other))
+            self._graph.backfill_explicit(pairs)
         self._conn.commit()
 
     def _table_exists(self, name) -> bool:
@@ -243,6 +250,7 @@ class Store:
                         "UPDATE memories SET embedding=? WHERE id=?", (blob, mid))
                     done += 1
                 self._conn.commit()
+            self._graph.backfill_semantic()
             return done
         except Exception:
             return 0
@@ -282,6 +290,7 @@ class Store:
                     "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
                     (now, mid, superseded))
                 action = "consolidated"
+        self._graph.on_remember(mid, emb)
         self._conn.commit()
         self._sync_now()
         return {"id": mid, "action": action}
@@ -424,6 +433,7 @@ class Store:
                            (json.dumps(a), now, id_a))
         self._conn.execute("UPDATE memories SET links=?, updated_at=? WHERE id=?",
                            (json.dumps(b), now, id_b))
+        self._graph.on_link(id_a, id_b)
         self._conn.commit()
         self._sync_now()
         return {"linked": [id_a, id_b]}

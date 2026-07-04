@@ -78,3 +78,61 @@ class Graph:
             self._conn.execute("DELETE FROM session_members WHERE memory_id=?", (mid,))
         except Exception:
             pass
+
+    def on_remember(self, mid, emb_blob) -> None:
+        if not self.enabled or emb_blob is None:
+            return
+        try:
+            import numpy as np
+
+            q = np.frombuffer(emb_blob, dtype="<f4")
+            rows = self._conn.execute(
+                "SELECT id, embedding FROM memories "
+                "WHERE embedding IS NOT NULL AND valid_to IS NULL AND id != ?",
+                (mid,)).fetchall()
+            if not rows:
+                return
+            ids = [r[0] for r in rows]
+            mat = np.frombuffer(b"".join(r[1] for r in rows),
+                                dtype="<f4").reshape(len(ids), -1)
+            sims = mat @ q
+            k = min(KNN_K, len(ids))
+            top = np.argsort(-sims)[:k]
+            now = _now()
+            for i in top:
+                w = float(sims[i])
+                if w <= 0:
+                    continue
+                self._upsert_edge(mid, ids[int(i)], "semantic", w, now, mode="max")
+        except Exception:
+            return
+
+    def on_link(self, id_a, id_b) -> None:
+        if not self.enabled:
+            return
+        try:
+            self._upsert_edge(id_a, id_b, "explicit", 1.0, _now(), mode="max")
+        except Exception:
+            return
+
+    def backfill_semantic(self) -> None:
+        if not self.enabled:
+            return
+        try:
+            rows = self._conn.execute(
+                "SELECT id, embedding FROM memories "
+                "WHERE embedding IS NOT NULL AND valid_to IS NULL").fetchall()
+            for mid, blob in rows:
+                self.on_remember(mid, blob)
+        except Exception:
+            return
+
+    def backfill_explicit(self, pairs) -> None:
+        if not self.enabled:
+            return
+        try:
+            now = _now()
+            for a, b in pairs:
+                self._upsert_edge(a, b, "explicit", 1.0, now, mode="max")
+        except Exception:
+            return

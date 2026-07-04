@@ -487,3 +487,27 @@ def test_recency_does_not_override_strong_match():
     s._conn.commit()
     hits = s.recall("car")
     assert [h["id"] for h in hits][0] == best
+
+
+def test_remember_writes_semantic_edges_when_assoc_on():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder())
+    s._graph.enabled = True                     # force association on (assoc arg lands in Task 6)
+    s.migrate()
+    s.remember("user", "Commute", "I drive my car to work")
+    s.remember("user", "Errand", "driving the automobile downtown")
+    n = conn.execute("SELECT COUNT(*) FROM edges WHERE kind='semantic'").fetchone()[0]
+    assert n >= 1
+
+
+def test_link_writes_explicit_edge():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+    a = s.remember("user", "A", "x")["id"]
+    b = s.remember("project", "B", "y")["id"]
+    s.link(a, b)
+    row = conn.execute("SELECT kind, weight FROM edges").fetchone()
+    assert row == ("explicit", 1.0)
