@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 KNN_K = 8
 HOP_DECAY = 0.4
 EPSILON = 1e-4
-KIND_W = {"semantic": 1.0, "explicit": 1.2, "hebbian": 1.0}
+KIND_W = {"semantic": 1.0, "explicit": 1.2, "hebbian": 1.0, "crystallized": 1.2}
 SESSION_DECAY = 0.5
 SESSION_GAP_SECONDS = 1800
 SESSION_TTL_ACTIVATION = 0.05
@@ -115,6 +115,26 @@ class Graph:
         except Exception:
             return
 
+    def on_crystallize(self, principle_id, source_ids) -> None:
+        """Directional crystallized edges principle->source (the one kind NOT
+        canonicalized, so provenance is recoverable for dedup). Read paths
+        (_neighbors/spread/degree_map) read both endpoints, so activation stays
+        bidirectional. No-op when disabled; never raises."""
+        if not self.enabled:
+            return
+        try:
+            now = _now()
+            for src in source_ids:
+                if src == principle_id:
+                    continue
+                self._conn.execute(
+                    "INSERT INTO edges(src, dst, kind, weight, updated_at) "
+                    "VALUES (?,?,'crystallized',1.0,?) "
+                    "ON CONFLICT(src, dst, kind) DO UPDATE SET updated_at=excluded.updated_at",
+                    (principle_id, src, now))
+        except Exception:
+            return
+
     def backfill_semantic(self) -> None:
         if not self.enabled:
             return
@@ -137,7 +157,7 @@ class Graph:
         except Exception:
             return
 
-    def degree_map(self, kinds=("explicit", "hebbian")) -> dict:
+    def degree_map(self, kinds=("explicit", "hebbian", "crystallized")) -> dict:
         """Behavioral weighted degree for every current memory (semantic edges
         excluded by default). Emits explicit 0.0 for isolated current nodes -
         forgetting needs the degree-0 set, which a pure edge-scan can't produce.

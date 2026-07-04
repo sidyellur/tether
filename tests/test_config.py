@@ -170,3 +170,13 @@ def test_forget_numeric_configs(monkeypatch):
         assert fn() == default                    # <1 → default
         monkeypatch.setenv(name, "x")
         assert fn() == default
+
+
+def test_crystallize_off_by_default(monkeypatch):
+    monkeypatch.delenv("TETHER_CRYSTALLIZE", raising=False)
+    assert config.crystallize_enabled() is False
+    for v in ("1", "true", "on", "YES"):
+        monkeypatch.setenv("TETHER_CRYSTALLIZE", v)
+        assert config.crystallize_enabled() is True
+    monkeypatch.setenv("TETHER_CRYSTALLIZE", "0")
+    assert config.crystallize_enabled() is False

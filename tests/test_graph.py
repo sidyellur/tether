@@ -200,3 +200,46 @@ def test_degree_map_ignores_edges_to_noncurrent():
     _mem(g._conn, 2, valid=False)               # archived
     g._upsert_edge(1, 2, "hebbian", 1.0, "t", mode="max")
     assert g.degree_map() == {1: 0.0}           # node 2 not current; its edge doesn't count
+
+
+# Tests for crystallized edge kind and config (Task 1)
+def _graph():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY, valid_to TEXT, type TEXT);")
+    g = Graph(conn, enabled=True)
+    g.migrate()
+    return conn, g
+
+
+def test_crystallized_kind_registered_for_spreading():
+    from tether.graph import KIND_W
+    assert "crystallized" in KIND_W and KIND_W["crystallized"] > 0
+
+
+def test_on_crystallize_writes_directional_edges():
+    conn, g = _graph()
+    for i in (1, 2, 3):
+        conn.execute("INSERT INTO memories(id, type) VALUES(?, 'project')", (i,))
+    g.on_crystallize(1, [2, 3])                     # principle=1, sources 2,3
+    rows = conn.execute(
+        "SELECT src, dst, kind FROM edges WHERE kind='crystallized' "
+        "ORDER BY dst").fetchall()
+    assert rows == [(1, 2, "crystallized"), (1, 3, "crystallized")]  # NOT canonicalized
+
+
+def test_crystallized_counts_toward_hub_degree():
+    conn, g = _graph()
+    for i in (1, 2, 3):
+        conn.execute("INSERT INTO memories(id, type) VALUES(?, 'project')", (i,))
+    g.on_crystallize(1, [2, 3])
+    deg = g.degree_map()                            # default kinds
+    assert deg[1] > 0 and deg[2] > 0                # principle and sources are hubs
+
+
+def test_on_crystallize_disabled_is_noop():
+    conn, g = _graph()
+    g.enabled = False
+    conn.execute("INSERT INTO memories(id, type) VALUES(1, 'project')")
+    g.on_crystallize(1, [2])
+    assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0

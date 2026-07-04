@@ -141,6 +141,18 @@ def seed_floor() -> float:
     return val if 0.0 <= val <= 1.0 else _DEFAULT_SEED_FLOOR
 
 
+_CRYSTALLIZE_ON = {"1", "true", "yes", "on"}
+
+
+def crystallize_enabled() -> bool:
+    """Crystallization (agent-in-the-loop principle detection) is opt-in, off by
+    default."""
+    val = os.environ.get("TETHER_CRYSTALLIZE")
+    if val is None:
+        return False
+    return val.strip().lower() in _CRYSTALLIZE_ON
+
+
 _FORGET_ON = {"1", "true", "yes", "on"}
 _DEFAULT_BOOT_INDEX_CAP = 50
 _DEFAULT_FORGET_AGE_DAYS = 90
