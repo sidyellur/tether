@@ -199,3 +199,59 @@ class Graph:
         for r in receipts.values():
             r.pop("_t", None)
         return activation, receipts
+
+    def resolve_session(self, session, meta_get, meta_set) -> str:
+        now_iso = _now()
+        if session:
+            sid = str(session)
+        else:
+            last = meta_get("assoc_last_activity")
+            cur = meta_get("assoc_session")
+            gap = None
+            if last is not None:
+                try:
+                    gap = (datetime.fromisoformat(now_iso)
+                           - datetime.fromisoformat(last)).total_seconds()
+                except Exception:
+                    gap = None
+            if cur and gap is not None and gap <= SESSION_GAP_SECONDS:
+                sid = cur
+            else:
+                sid = now_iso
+        meta_set("assoc_session", sid)
+        meta_set("assoc_last_activity", now_iso)
+        return sid
+
+    def session_activation(self, session_id) -> dict:
+        try:
+            return {r[0]: r[1] for r in self._conn.execute(
+                "SELECT memory_id, activation FROM session_members WHERE session_id=?",
+                (session_id,)).fetchall()}
+        except Exception:
+            return {}
+
+    def touch_session(self, session_id, ordered_ids) -> None:
+        try:
+            now = _now()
+            self._conn.execute(
+                "UPDATE session_members SET activation = activation * ?, updated_at=? "
+                "WHERE session_id=?", (SESSION_DECAY, now, session_id))
+            for mid in ordered_ids:
+                self._conn.execute(
+                    "INSERT INTO session_members(session_id, memory_id, activation, updated_at) "
+                    "VALUES (?,?,?,?) ON CONFLICT(session_id, memory_id) "
+                    "DO UPDATE SET activation = session_members.activation + 1.0, updated_at=?",
+                    (session_id, mid, 1.0, now, now))
+            active = [r[0] for r in self._conn.execute(
+                "SELECT memory_id FROM session_members WHERE session_id=? "
+                "ORDER BY activation DESC, memory_id LIMIT ?",
+                (session_id, HEBBIAN_TOP_M)).fetchall()]
+            for i in range(len(active)):
+                for j in range(i + 1, len(active)):
+                    self._upsert_edge(active[i], active[j], "hebbian",
+                                      HEBBIAN_INCREMENT, now, mode="add")
+            self._conn.execute(
+                "DELETE FROM session_members WHERE activation < ?",
+                (SESSION_TTL_ACTIVATION,))
+        except Exception:
+            return

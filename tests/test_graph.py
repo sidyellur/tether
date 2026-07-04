@@ -135,3 +135,39 @@ def test_spread_respects_type_and_validity():
     act, _ = g.spread({1: 1.0}, budget=8, type="user")
     assert 2 not in act        # wrong type filtered
     assert 3 not in act        # superseded filtered
+
+
+def _meta_pair():
+    store = {}
+    return (lambda k: store.get(k)), (lambda k, v: store.__setitem__(k, str(v)))
+
+
+def test_resolve_session_uses_param_then_time_buckets():
+    g = make_graph()
+    get, set_ = _meta_pair()
+    assert g.resolve_session("explicit-1", get, set_) == "explicit-1"
+    sid1 = g.resolve_session(None, get, set_)
+    sid2 = g.resolve_session(None, get, set_)      # immediately after -> same bucket
+    assert sid1 == sid2
+    # simulate a long gap by rewinding last-activity far into the past
+    set_("assoc_last_activity", "2000-01-01T00:00:00+00:00")
+    sid3 = g.resolve_session(None, get, set_)
+    assert sid3 != sid1
+
+
+def test_touch_session_primes_and_decays():
+    g = make_graph()
+    g.touch_session("s", [1, 2])
+    a1 = g.session_activation("s")
+    assert a1[1] == 1.0 and a1[2] == 1.0
+    g.touch_session("s", [2])                       # decays 1&2, bumps 2
+    a2 = g.session_activation("s")
+    assert a2[1] == 0.5 and a2[2] == 1.5
+
+
+def test_touch_session_lays_hebbian_edges():
+    g = make_graph()
+    g.touch_session("s", [1, 2, 3])                 # all co-active
+    w = g._conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='hebbian'").fetchone()[0]
+    assert w == 3                                   # pairs (1,2),(1,3),(2,3)
