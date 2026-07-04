@@ -194,6 +194,7 @@ class Store:
         norm = _norm(title)
         tags_s = _tags_to_str(tags)
         links_s = json.dumps(links or [])
+        emb = self._embed_or_none(title, body)
         existing = self._conn.execute(
             "SELECT id FROM memories WHERE type=? AND title_norm=?", (type, norm)
         ).fetchone()
@@ -201,14 +202,16 @@ class Store:
             mid = existing[0]
             self._conn.execute(
                 "UPDATE memories SET title=?, body=?, tags=?, links=?, "
-                "updated_at=?, device_id=? WHERE id=?",
-                (title, body, tags_s, links_s, now, self._device_id, mid))
+                "updated_at=?, device_id=?, embedding=? WHERE id=?",
+                (title, body, tags_s, links_s, now, self._device_id, emb, mid))
             action = "updated"
         else:
             cur = self._conn.execute(
                 "INSERT INTO memories(type, title, title_norm, body, tags, links, "
-                "created_at, updated_at, device_id) VALUES (?,?,?,?,?,?,?,?,?)",
-                (type, title, norm, body, tags_s, links_s, now, now, self._device_id))
+                "created_at, updated_at, device_id, embedding) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (type, title, norm, body, tags_s, links_s, now, now,
+                 self._device_id, emb))
             mid = cur.lastrowid
             action = "created"
         self._conn.commit()

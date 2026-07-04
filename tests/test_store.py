@@ -243,3 +243,29 @@ def test_backfill_survives_a_broken_embedder():
     s1 = Store(conn, "d", lambda *a, **k: None, embedder=BrokenEmbedder())
     assert s1.backfill_embeddings() == 0     # degrades, does not raise
     assert conn.execute("SELECT embedding FROM memories").fetchone()[0] is None
+
+
+def test_remember_stores_embedding_when_embedder_present():
+    s = make_semantic_store()
+    r = s.remember("user", "A", "I love my car and driving")
+    blob = s._conn.execute(
+        "SELECT embedding FROM memories WHERE id=?", (r["id"],)).fetchone()[0]
+    assert blob is not None and len(blob) == 3 * 4
+
+
+def test_remember_updates_embedding_on_upsert():
+    from tether.store import _unpack
+    s = make_semantic_store()
+    r = s.remember("user", "A", "car and driving")           # vehicle axis
+    r2 = s.remember("user", "A", "pizza and food for lunch")  # same title -> update
+    assert r2["id"] == r["id"]
+    v = _unpack(s._conn.execute(
+        "SELECT embedding FROM memories WHERE id=?", (r["id"],)).fetchone()[0])
+    assert v[1] > v[0]  # now weighted to the 'food' axis, not 'vehicle'
+
+
+def test_remember_leaves_embedding_null_without_embedder():
+    s = make_store()  # no embedder
+    r = s.remember("user", "A", "car")
+    assert s._conn.execute(
+        "SELECT embedding FROM memories WHERE id=?", (r["id"],)).fetchone()[0] is None
