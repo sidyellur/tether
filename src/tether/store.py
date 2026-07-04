@@ -10,6 +10,8 @@ import re
 import struct
 from datetime import datetime, timezone
 
+from .graph import Graph
+
 VALID_TYPES = ("user", "feedback", "project", "reference")
 
 _SCHEMA = """
@@ -141,6 +143,7 @@ class Store:
         self._consolidate = consolidate
         self._dedup_threshold = dedup_threshold
         self._decay_half_life_days = decay_half_life_days
+        self._graph = Graph(conn, enabled=False)
 
     def migrate(self) -> None:
         fts_existed = self._table_exists("memories_fts")
@@ -156,6 +159,7 @@ class Store:
             # not-yet-rebuilt FTS5 shadow index corrupts it.
             self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
         self._ensure_consolidation_columns()
+        self._graph.migrate()
         self._conn.commit()
 
     def _table_exists(self, name) -> bool:
@@ -426,6 +430,7 @@ class Store:
 
     def forget(self, id) -> dict:
         cur = self._conn.execute("DELETE FROM memories WHERE id=?", (id,))
+        self._graph.on_forget(id)
         self._conn.commit()
         self._sync_now()
         return {"forgotten": id, "existed": cur.rowcount > 0}
