@@ -31,3 +31,21 @@ def test_device_id_defaults_to_hostname(monkeypatch):
     assert config.device_id() == socket.gethostname()
     monkeypatch.setenv("TETHER_DEVICE_ID", "laptop")
     assert config.device_id() == "laptop"
+
+
+def test_semantic_enabled_default_true(monkeypatch):
+    monkeypatch.delenv("TETHER_SEMANTIC", raising=False)
+    assert config.semantic_enabled() is True
+
+
+def test_semantic_disabled_by_env(monkeypatch):
+    for v in ("0", "false", "off", "NO"):
+        monkeypatch.setenv("TETHER_SEMANTIC", v)
+        assert config.semantic_enabled() is False
+
+
+def test_embedding_model_default_and_override(monkeypatch):
+    monkeypatch.delenv("TETHER_EMBEDDING_MODEL", raising=False)
+    assert config.embedding_model() == "minishlab/potion-base-8M"
+    monkeypatch.setenv("TETHER_EMBEDDING_MODEL", "some/other-model")
+    assert config.embedding_model() == "some/other-model"
