@@ -60,3 +60,36 @@ def test_remember_rejects_bad_type():
     s = make_store()
     with pytest.raises(ValueError):
         s.remember("nonsense", "t", "b")
+
+
+def test_recall_matches_on_body_and_title():
+    s = make_store()
+    s.remember("user", "Prefers TDD", "Wants tests written first.")
+    s.remember("project", "cleat", "Headless terminal layer for agents.")
+    hits = s.recall("tests")
+    assert len(hits) == 1
+    assert hits[0]["title"] == "Prefers TDD"
+    assert set(hits[0]) == {"id", "type", "title", "body", "tags", "updated_at"}
+
+
+def test_recall_filters_by_type():
+    s = make_store()
+    s.remember("user", "Testing habits", "Likes pytest.")
+    s.remember("project", "Testing infra", "pytest in CI.")
+    assert len(s.recall("pytest")) == 2
+    only = s.recall("pytest", type="project")
+    assert len(only) == 1 and only[0]["type"] == "project"
+
+
+def test_recall_empty_query_returns_empty():
+    s = make_store()
+    s.remember("user", "x", "y")
+    assert s.recall("   ") == []
+
+
+def test_recall_tolerates_punctuation():
+    s = make_store()
+    s.remember("user", "C++ notes", "Uses C++ and pytest.")
+    # A raw MATCH of 'C++' would be an FTS5 syntax error; must not raise.
+    hits = s.recall("C++")
+    assert isinstance(hits, list)

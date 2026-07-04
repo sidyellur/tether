@@ -113,3 +113,23 @@ class Store:
         self._conn.commit()
         self._sync_now()
         return {"id": mid, "action": action}
+
+    def recall(self, query, type=None, limit=20) -> list:
+        match = _fts_query(query)
+        if match is None:
+            return []
+        sql = ("SELECT m.id, m.type, m.title, m.body, m.tags, m.updated_at "
+               "FROM memories_fts f JOIN memories m ON m.id = f.rowid "
+               "WHERE memories_fts MATCH ?")
+        params = [match]
+        if type is not None:
+            sql += " AND m.type = ?"
+            params.append(type)
+        sql += " ORDER BY rank LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [
+            {"id": r[0], "type": r[1], "title": r[2],
+             "body": r[3], "tags": r[4], "updated_at": r[5]}
+            for r in rows
+        ]
