@@ -161,3 +161,27 @@ def test_build_conditions_edge_states():
         "AND src=? AND dst=?",
         tuple(sorted((id_of["bug"], id_of["pref"])))).fetchone()
     assert row is not None and row[0] == 5.0
+
+
+def test_run_smoke_all_conditions_both_classes():
+    import pytest
+    pytest.importorskip("numpy")
+    from bench import run, corpus as corpus_mod
+    rep = run.run(corpus_mod.MINI, FakeEmbedder(), k=5)
+    # all four conditions present, both classes measured
+    for cond in ("v2", "cold", "warmed", "oracle"):
+        assert cond in rep["conditions"]
+        assert "graph_only" in rep["conditions"][cond]
+        assert "control" in rep["conditions"][cond]
+    # derived numbers exist and are numbers
+    assert isinstance(rep["learning_delta_ndcg"], float)
+    assert isinstance(rep["headroom_ndcg"], float)
+    assert "no_regression" in rep and "passed" in rep["no_regression"]
+
+
+def test_distribution_counts():
+    from bench import run
+    base = [{"ndcg": 0.5}, {"ndcg": 0.5}, {"ndcg": 0.5}]
+    cond = [{"ndcg": 0.9}, {"ndcg": 0.5}, {"ndcg": 0.1}]  # up / flat / down
+    d = run.distribution(base, cond, eps=0.02)
+    assert d == {"improved": 1, "unchanged": 1, "regressed": 1}
