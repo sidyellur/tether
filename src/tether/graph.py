@@ -137,6 +137,29 @@ class Graph:
         except Exception:
             return
 
+    def degree_map(self, kinds=("explicit", "hebbian")) -> dict:
+        """Behavioral weighted degree for every current memory (semantic edges
+        excluded by default). Emits explicit 0.0 for isolated current nodes -
+        forgetting needs the degree-0 set, which a pure edge-scan can't produce.
+        Only edges between two current nodes count. Never raises."""
+        try:
+            current = {r[0] for r in self._conn.execute(
+                "SELECT id FROM memories WHERE valid_to IS NULL").fetchall()}
+            deg = {mid: 0.0 for mid in current}
+            if not kinds:
+                return deg
+            ph = ",".join("?" for _ in kinds)
+            rows = self._conn.execute(
+                f"SELECT src, dst, weight FROM edges WHERE kind IN ({ph})",
+                tuple(kinds)).fetchall()
+            for src, dst, w in rows:
+                if src in current and dst in current:
+                    deg[src] += w
+                    deg[dst] += w
+            return deg
+        except Exception:
+            return {}
+
     def _neighbors(self, node, type=None):
         rows = self._conn.execute(
             "SELECT CASE WHEN src=? THEN dst ELSE src END, kind, weight "

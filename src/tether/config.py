@@ -110,3 +110,47 @@ def recall_budget() -> int:
     except ValueError:
         return _DEFAULT_RECALL_BUDGET
     return val if val >= 0 else _DEFAULT_RECALL_BUDGET
+
+
+_FORGET_ON = {"1", "true", "yes", "on"}
+_DEFAULT_BOOT_INDEX_CAP = 50
+_DEFAULT_FORGET_AGE_DAYS = 90
+_DEFAULT_FORGET_INTERVAL = 20
+_DEFAULT_FORGET_MAX_PER_SWEEP = 10
+
+
+def _pos_int(env: str, default: int) -> int:
+    """A positive integer from the env, or the default (also on <1/unparseable)."""
+    raw = os.environ.get(env)
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    return val if val >= 1 else default
+
+
+def boot_index_cap() -> int:
+    """Boot-index size above which hub-curation kicks in (needs a graph)."""
+    return _pos_int("TETHER_BOOT_INDEX_CAP", _DEFAULT_BOOT_INDEX_CAP)
+
+
+def forget_enabled() -> bool:
+    """Forgetting sweep is opt-in, off by default."""
+    val = os.environ.get("TETHER_FORGET")
+    if val is None:
+        return False
+    return val.strip().lower() in _FORGET_ON
+
+
+def forget_age_days() -> int:
+    return _pos_int("TETHER_FORGET_AGE_DAYS", _DEFAULT_FORGET_AGE_DAYS)
+
+
+def forget_interval() -> int:
+    return _pos_int("TETHER_FORGET_INTERVAL", _DEFAULT_FORGET_INTERVAL)
+
+
+def forget_max_per_sweep() -> int:
+    return _pos_int("TETHER_FORGET_MAX_PER_SWEEP", _DEFAULT_FORGET_MAX_PER_SWEEP)

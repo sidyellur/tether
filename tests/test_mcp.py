@@ -168,3 +168,18 @@ def test_server_recall_budget_session(monkeypatch, tmp_path):
         assert any(h["id"] == b for h in hits)     # reached via the explicit edge
     finally:
         server._store = None
+
+
+def test_server_wires_forget_config(monkeypatch, tmp_path):
+    from tether import server
+    monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")     # no embedder needed
+    monkeypatch.setenv("TETHER_FORGET", "1")
+    monkeypatch.setenv("TETHER_BOOT_INDEX_CAP", "7")
+    server._store = None
+    try:
+        s = server._get_store()
+        assert s._forget is True
+        assert s._boot_index_cap == 7
+    finally:
+        server._store = None

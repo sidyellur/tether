@@ -40,7 +40,12 @@ def _get_store() -> Store:
                       dedup_threshold=config.dedup_threshold(),
                       decay_half_life_days=config.decay_half_life_days(),
                       assoc=config.assoc_enabled(),
-                      recall_budget=config.recall_budget())
+                      recall_budget=config.recall_budget(),
+                      boot_index_cap=config.boot_index_cap(),
+                      forget=config.forget_enabled(),
+                      forget_age_days=config.forget_age_days(),
+                      forget_interval=config.forget_interval(),
+                      forget_max_per_sweep=config.forget_max_per_sweep())
         store.migrate()
         if embedder is not None:
             store.backfill_embeddings()

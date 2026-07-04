@@ -171,3 +171,32 @@ def test_touch_session_lays_hebbian_edges():
     w = g._conn.execute(
         "SELECT COUNT(*) FROM edges WHERE kind='hebbian'").fetchone()[0]
     assert w == 3                                   # pairs (1,2),(1,3),(2,3)
+
+
+def test_degree_map_behavioral_only_excludes_semantic():
+    g = make_graph()
+    for i in (1, 2, 3):
+        _mem(g._conn, i)
+    g._upsert_edge(1, 2, "semantic", 0.9, "t", mode="max")
+    g._upsert_edge(1, 3, "hebbian", 0.5, "t", mode="max")
+    g._upsert_edge(2, 3, "explicit", 1.0, "t", mode="max")
+    deg = g.degree_map()
+    assert deg[1] == 0.5          # only the hebbian edge (semantic ignored)
+    assert deg[2] == 1.0          # only the explicit edge
+    assert deg[3] == 1.5          # hebbian 0.5 + explicit 1.0
+
+
+def test_degree_map_emits_zero_for_semantic_only_node():
+    g = make_graph()
+    for i in (1, 2):
+        _mem(g._conn, i)
+    g._upsert_edge(1, 2, "semantic", 0.9, "t", mode="max")
+    assert g.degree_map() == {1: 0.0, 2: 0.0}    # present, but zero
+
+
+def test_degree_map_ignores_edges_to_noncurrent():
+    g = make_graph()
+    _mem(g._conn, 1)
+    _mem(g._conn, 2, valid=False)               # archived
+    g._upsert_edge(1, 2, "hebbian", 1.0, "t", mode="max")
+    assert g.degree_map() == {1: 0.0}           # node 2 not current; its edge doesn't count
