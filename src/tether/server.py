@@ -38,7 +38,9 @@ def _get_store() -> Store:
                       embedder=embedder, author=config.author(),
                       consolidate=config.consolidate_enabled(),
                       dedup_threshold=config.dedup_threshold(),
-                      decay_half_life_days=config.decay_half_life_days())
+                      decay_half_life_days=config.decay_half_life_days(),
+                      assoc=config.assoc_enabled(),
+                      recall_budget=config.recall_budget())
         store.migrate()
         if embedder is not None:
             store.backfill_embeddings()
@@ -70,21 +72,27 @@ def remember(type: str, title: str, body: str,
 
 
 @mcp.tool()
-def recall(query: str, type: str = None, limit: int = 20) -> dict:
-    """Search memories by keyword and (if enabled) semantic similarity, most
-    relevant first.
+def recall(query: str, type: str = None, limit: int = 20,
+           budget: int = None, session: str = None) -> dict:
+    """Search memories by keyword and semantic similarity, then follow the
+    usage graph to related memories, most relevant first.
 
-    Each hit carries {id, type, title, body, tags, updated_at} - use
-    `updated_at` to judge staleness (an old fact may no longer hold; verify
-    before relying on it) and `id` to cite what you update via remember/link.
+    Each hit carries {id, type, title, body, tags, updated_at} and a `via`
+    receipt explaining why it surfaced (a direct match, or the edge it was
+    reached through). Use `updated_at` to judge staleness (an old fact may no
+    longer hold; verify before relying on it) and `id` to cite what you update
+    via remember/link.
 
     Args:
         query: free text; punctuation is safe.
         type: optional filter ("user"/"feedback"/"project"/"reference").
         limit: max results (default 20).
+        budget: how far to follow associations (0 = direct matches only).
+        session: optional id grouping related recalls so they prime each other.
     """
     try:
-        return {"results": _get_store().recall(query, type=type, limit=limit)}
+        return {"results": _get_store().recall(
+            query, type=type, limit=limit, budget=budget, session=session)}
     except Exception as e:
         return {"error": str(e)}
 

@@ -85,3 +85,28 @@ def decay_half_life_days():
     except ValueError:
         return None
     return val if val > 0 else None
+
+
+_ASSOC_OFF = {"0", "false", "no", "off"}
+_DEFAULT_RECALL_BUDGET = 24
+
+
+def assoc_enabled() -> bool:
+    """Associative (spreading-activation) recall is on by default; any of
+    0/false/no/off forces plain v0.2 hybrid recall."""
+    val = os.environ.get("TETHER_ASSOC")
+    if val is None:
+        return True
+    return val.strip().lower() not in _ASSOC_OFF
+
+
+def recall_budget() -> int:
+    """Default spreading budget (max node-expansions). 0 = spreading off."""
+    raw = os.environ.get("TETHER_RECALL_BUDGET")
+    if not raw:
+        return _DEFAULT_RECALL_BUDGET
+    try:
+        val = int(raw)
+    except ValueError:
+        return _DEFAULT_RECALL_BUDGET
+    return val if val >= 0 else _DEFAULT_RECALL_BUDGET

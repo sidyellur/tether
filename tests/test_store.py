@@ -487,3 +487,76 @@ def test_recency_does_not_override_strong_match():
     s._conn.commit()
     hits = s.recall("car")
     assert [h["id"] for h in hits][0] == best
+
+
+def test_remember_writes_semantic_edges_when_assoc_on():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder())
+    s._graph.enabled = True                     # force association on (assoc arg lands in Task 6)
+    s.migrate()
+    s.remember("user", "Commute", "I drive my car to work")
+    s.remember("user", "Errand", "driving the automobile downtown")
+    n = conn.execute("SELECT COUNT(*) FROM edges WHERE kind='semantic'").fetchone()[0]
+    assert n >= 1
+
+
+def test_link_writes_explicit_edge():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+    a = s.remember("user", "A", "x")["id"]
+    b = s.remember("project", "B", "y")["id"]
+    s.link(a, b)
+    row = conn.execute("SELECT kind, weight FROM edges").fetchone()
+    assert row == ("explicit", 1.0)
+
+
+def make_assoc_store():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, recall_budget=16)
+    s.migrate()
+    return s
+
+
+def test_recall_disabled_matches_v2():
+    # assoc defaults False -> identical to the v0.2 recall path (no 'via' field).
+    s = make_store()  # helper from the existing suite; assoc off
+    s.remember("user", "A", "car and driving")
+    hits = s.recall("car")
+    assert hits and "via" not in hits[0]
+    assert set(hits[0]) == {"id", "type", "title", "body", "tags", "updated_at"}
+
+
+def test_recall_associative_finds_linked_neighbor():
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]
+    b = s.remember("project", "Why not sessions", "sessions were rejected for scaling")["id"]
+    s.link(a, b)                                  # explicit edge a<->b
+    # 'JWT' matches only A; B is reached across the explicit edge
+    ids = [h["id"] for h in s.recall("JWT tokens", budget=8)]
+    assert a in ids and b in ids
+
+
+def test_recall_via_receipts_present():
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]
+    b = s.remember("project", "Why", "the rationale doc")["id"]
+    s.link(a, b)
+    hits = {h["id"]: h for h in s.recall("JWT tokens", budget=8)}
+    assert hits[a]["via"] == {"seed": True}
+    assert "path" in hits[b]["via"] and hits[b]["via"]["path"][0]["from"] == a
+
+
+def test_recall_budget_zero_is_passthrough():
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]
+    b = s.remember("project", "Why", "the rationale doc")["id"]
+    s.link(a, b)
+    ids = [h["id"] for h in s.recall("JWT tokens", budget=0)]
+    assert ids == [a]                             # no spreading -> only the direct match

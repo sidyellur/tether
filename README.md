@@ -119,12 +119,36 @@ recent facts. Two opt-in behaviors go further:
 Consolidation never deletes — only `forget` does. All of this degrades to
 plain keyword recall when the semantic extra is absent.
 
+## Associative recall (optional)
+
+`recall` doesn't just return keyword/semantic matches — it follows a **usage
+graph** to related memories, so asking about one thing surfaces its connected
+context. The graph's edges come from three local, deterministic sources — no
+LLM, no network:
+
+- **semantic** — nearest neighbours by embedding (needs the `[semantic]` extra),
+- **explicit** — the `link()` verb,
+- **hebbian** — memories you recall *together* get wired together over time.
+
+Every hit carries a `via` receipt saying why it surfaced (a direct match, or the
+edge it came through), and two optional `recall` args tune it:
+
+| Arg / var | Default | Effect |
+|---|---|---|
+| `budget` (per call) | `TETHER_RECALL_BUDGET` | how far to follow associations; `0` = direct matches only |
+| `session` (per call) | time-bucketed | group related recalls so they prime each other |
+| `TETHER_ASSOC` | on | set `0`/`false`/`off` for plain keyword+semantic recall |
+| `TETHER_RECALL_BUDGET` | `24` | default association breadth |
+
+With `TETHER_ASSOC=0` (or `budget=0`, or an empty graph), `recall` behaves exactly
+as before — associative recall is purely additive and never breaks a lookup.
+
 ## Tools
 
 | Tool | What it does |
 |---|---|
 | `remember(type, title, body, tags?, links?)` | Save a memory; upserts on `type`+`title` so facts refine rather than duplicate |
-| `recall(query, type?, limit?)` | Hybrid keyword + semantic search; returns id/type/title/body/tags/updated_at |
+| `recall(query, type?, limit?, budget?, session?)` | Hybrid keyword + semantic search, then follows the usage graph to related memories; returns id/type/title/body/tags/updated_at + a `via` receipt |
 | `link(id_a, id_b)` | Bidirectional link between two memories |
 | `forget(id)` | Delete a memory |
 
