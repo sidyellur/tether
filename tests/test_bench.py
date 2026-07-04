@@ -132,3 +132,32 @@ def test_warm_creates_hebbian_edges():
     after = s._conn.execute(
         "SELECT COUNT(*) FROM edges WHERE kind='hebbian'").fetchone()[0]
     assert after >= 1  # bug <-> pref co-recalled in the "auth" task
+
+
+def test_build_conditions_edge_states():
+    import pytest
+    pytest.importorskip("numpy")
+    from bench import conditions, corpus as corpus_mod
+
+    def heb(store):
+        return store._conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE kind='hebbian'").fetchone()[0]
+
+    e = FakeEmbedder()
+    s_v2, _ = conditions.build(corpus_mod.MINI, "v2", e)
+    assert s_v2._graph.enabled is False
+
+    s_cold, _ = conditions.build(corpus_mod.MINI, "cold", e)
+    assert s_cold._graph.enabled is True
+    assert heb(s_cold) == 0                      # no usage yet
+
+    s_warm, _ = conditions.build(corpus_mod.MINI, "warmed", e)
+    assert heb(s_warm) >= 1                       # warm-up wired co-recalls
+
+    s_or, id_of = conditions.build(corpus_mod.MINI, "oracle", e)
+    # full clique of the 2-member "auth" task at max weight
+    row = s_or._conn.execute(
+        "SELECT weight FROM edges WHERE kind='hebbian' "
+        "AND src=? AND dst=?",
+        tuple(sorted((id_of["bug"], id_of["pref"])))).fetchone()
+    assert row is not None and row[0] == 5.0
