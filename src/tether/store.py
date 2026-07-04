@@ -264,7 +264,27 @@ class Store:
         return {"id": mid, "action": action}
 
     def _find_near_duplicate(self, type, emb):
-        return None  # implemented in Task 4
+        """Id of the most-similar CURRENT same-type memory whose cosine
+        similarity to `emb` meets the dedup threshold, or None. Degrades to
+        None (no consolidation) whenever semantic support is unavailable."""
+        if emb is None or self._embedder is None:
+            return None
+        try:
+            import numpy as np
+
+            q = np.frombuffer(emb, dtype="<f4")
+            rows = self._conn.execute(
+                "SELECT id, embedding FROM memories "
+                "WHERE type=? AND valid_to IS NULL AND embedding IS NOT NULL",
+                (type,)).fetchall()
+            best_id, best_sim = None, -1.0
+            for mid, blob in rows:
+                sim = float(np.frombuffer(blob, dtype="<f4") @ q)  # both unit-norm
+                if sim > best_sim:
+                    best_id, best_sim = mid, sim
+            return best_id if best_sim >= self._dedup_threshold else None
+        except Exception:
+            return None
 
     def _fts_ids(self, query, type=None, limit=200):
         match = _fts_query(query)

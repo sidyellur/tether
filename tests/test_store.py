@@ -371,3 +371,44 @@ def test_remember_action_unchanged_without_consolidate():
     s = make_authored_store()  # consolidate defaults False
     assert s.remember("user", "A", "x")["action"] == "created"
     assert s.remember("user", "A", "y")["action"] == "updated"  # exact-title refine
+
+
+def make_consolidating_store(threshold=0.92):
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, device_id="dev", sync_now=lambda *a, **k: None,
+              embedder=FakeEmbedder(), author="sid",
+              consolidate=True, dedup_threshold=threshold)
+    s.migrate()
+    return s
+
+
+def test_consolidate_supersedes_near_duplicate():
+    pytest.importorskip("numpy")
+    s = make_consolidating_store(threshold=0.9)
+    a = s.remember("user", "Commute A", "I drive my car to work")["id"]
+    # Different title, same meaning (vehicle axis) -> should consolidate.
+    r = s.remember("user", "Commute B", "driving the car every day")
+    assert r["action"] == "consolidated"
+    old = s._conn.execute(
+        "SELECT valid_to, superseded_by FROM memories WHERE id=?", (a,)).fetchone()
+    assert old[0] is not None and old[1] == r["id"]   # old row retained + linked
+    assert s._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 2  # not deleted
+
+
+def test_consolidate_keeps_distinct_facts_separate():
+    pytest.importorskip("numpy")
+    s = make_consolidating_store(threshold=0.9)
+    s.remember("user", "Car", "I drive my car")            # vehicle axis
+    r = s.remember("user", "Lunch", "pizza and food today")  # food axis, unrelated
+    assert r["action"] == "created"                        # NOT merged
+    assert s._conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL").fetchone()[0] == 2
+
+
+def test_consolidate_noop_without_embedder():
+    # consolidate=True but no embedder -> plain insert, never raises.
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "dev", lambda *a, **k: None, consolidate=True)
+    s.migrate()
+    s.remember("user", "A", "car")
+    assert s.remember("user", "B", "car")["action"] == "created"
