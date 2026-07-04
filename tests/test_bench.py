@@ -1,6 +1,30 @@
 import math
+import sqlite3
 from bench import metrics
 from bench import corpus as corpus_mod
+from tether.store import Store
+
+
+class FakeEmbedder:
+    """Deterministic bag-of-words-ish vector: one dim per known token."""
+    _VOCAB = ["login", "500", "load", "dave", "orm", "neovim", "car",
+              "office", "auth", "break", "distrusts", "drive"]
+
+    def encode(self, texts):
+        import numpy as np
+        out = []
+        for t in texts:
+            v = np.array([1.0 if w in t.lower() else 0.0 for w in self._VOCAB])
+            n = np.linalg.norm(v)
+            out.append(v / n if n else v)
+        return np.array(out)
+
+
+def _store(assoc=False, embedder=None):
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "dev", lambda *a, **k: None, embedder=embedder, assoc=assoc)
+    s.migrate()
+    return s
 
 
 def test_recall_at_k_hit_and_miss():
@@ -41,3 +65,16 @@ def test_mini_corpus_shape():
     # control gold is the target itself (pin: v0.2-findable target, assert-no-demote)
     ctrl = c.by_kind("control")[0]
     assert ctrl.gold_keys == [ctrl.target_key]
+
+
+def test_loader_maps_keys_to_ids_and_links():
+    import pytest
+    pytest.importorskip("numpy")
+    from bench import loader, corpus as corpus_mod
+    s = _store(assoc=True, embedder=FakeEmbedder())
+    id_of = loader.load(corpus_mod.MINI, s)
+    assert set(id_of) == {"bug", "pref", "editor", "car"}
+    assert all(isinstance(v, int) for v in id_of.values())
+    # a recall for the target returns it (sanity that memories landed)
+    hits = s.recall("login returns 500 under load", limit=5)
+    assert id_of["bug"] in [h["id"] for h in hits]

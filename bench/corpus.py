@@ -56,10 +56,10 @@ class Corpus:
 MINI = Corpus(
     name="mini",
     memories=[
-        Memory("bug", "note", "auth 500s", "login returns 500 under load"),
-        Memory("pref", "note", "dave orm stance", "dave distrusts the ORM layer"),
-        Memory("editor", "note", "editor choice", "team standardized on neovim"),
-        Memory("car", "note", "commute", "i drive my car to the office"),
+        Memory("bug", "project", "auth 500s", "login returns 500 under load"),
+        Memory("pref", "user", "dave orm stance", "dave distrusts the ORM layer"),
+        Memory("editor", "project", "editor choice", "team standardized on neovim"),
+        Memory("car", "user", "commute", "i drive my car to the office"),
     ],
     tasks=[Task("auth", ["bug", "pref"])],
     links=[],
