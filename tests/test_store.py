@@ -511,3 +511,52 @@ def test_link_writes_explicit_edge():
     s.link(a, b)
     row = conn.execute("SELECT kind, weight FROM edges").fetchone()
     assert row == ("explicit", 1.0)
+
+
+def make_assoc_store():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, recall_budget=16)
+    s.migrate()
+    return s
+
+
+def test_recall_disabled_matches_v2():
+    # assoc defaults False -> identical to the v0.2 recall path (no 'via' field).
+    s = make_store()  # helper from the existing suite; assoc off
+    s.remember("user", "A", "car and driving")
+    hits = s.recall("car")
+    assert hits and "via" not in hits[0]
+    assert set(hits[0]) == {"id", "type", "title", "body", "tags", "updated_at"}
+
+
+def test_recall_associative_finds_linked_neighbor():
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]
+    b = s.remember("project", "Why not sessions", "sessions were rejected for scaling")["id"]
+    s.link(a, b)                                  # explicit edge a<->b
+    # 'JWT' matches only A; B is reached across the explicit edge
+    ids = [h["id"] for h in s.recall("JWT tokens", budget=8)]
+    assert a in ids and b in ids
+
+
+def test_recall_via_receipts_present():
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]
+    b = s.remember("project", "Why", "the rationale doc")["id"]
+    s.link(a, b)
+    hits = {h["id"]: h for h in s.recall("JWT tokens", budget=8)}
+    assert hits[a]["via"] == {"seed": True}
+    assert "path" in hits[b]["via"] and hits[b]["via"]["path"][0]["from"] == a
+
+
+def test_recall_budget_zero_is_passthrough():
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]
+    b = s.remember("project", "Why", "the rationale doc")["id"]
+    s.link(a, b)
+    ids = [h["id"] for h in s.recall("JWT tokens", budget=0)]
+    assert ids == [a]                             # no spreading -> only the direct match

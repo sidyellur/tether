@@ -102,6 +102,7 @@ def _unpack(blob: bytes) -> tuple:
 
 
 _RECENCY_WEIGHT = 0.25
+_PRIMING_WEIGHT = 0.25
 
 
 def _rrf_scores(ranked_lists, k=60):
@@ -134,7 +135,7 @@ def _decay_factor(age_days: float, half_life_days: float) -> float:
 class Store:
     def __init__(self, conn, device_id: str, sync_now, embedder=None,
                  author="", consolidate=False, dedup_threshold=0.92,
-                 decay_half_life_days=None):
+                 decay_half_life_days=None, assoc=False, recall_budget=24):
         self._conn = conn
         self._device_id = device_id
         self._sync_now = sync_now
@@ -143,7 +144,8 @@ class Store:
         self._consolidate = consolidate
         self._dedup_threshold = dedup_threshold
         self._decay_half_life_days = decay_half_life_days
-        self._graph = Graph(conn, enabled=False)
+        self._recall_budget = recall_budget
+        self._graph = Graph(conn, enabled=assoc)
 
     def migrate(self) -> None:
         fts_existed = self._table_exists("memories_fts")
@@ -345,6 +347,11 @@ class Store:
             import numpy as np
 
             q = np.asarray(self._embedder.embed(query), dtype=np.float32)
+            # a zero-magnitude query vector carries no directional signal;
+            # ranking every row by it would just return the store in arbitrary
+            # order, so semantic search contributes nothing here.
+            if not np.any(q):
+                return []
             sql = ("SELECT id, embedding FROM memories "
                    "WHERE embedding IS NOT NULL AND valid_to IS NULL")
             params = []
@@ -376,15 +383,16 @@ class Store:
                  for r in rows}
         return [by_id[i] for i in ids if i in by_id]
 
-    def recall(self, query, type=None, limit=20) -> list:
-        if not query or not query.strip():
-            return []
+    def _seed_scores(self, query, type) -> dict:
+        """The v0.2 hybrid recall scoring (FTS5 + semantic RRF, gentle recency,
+        optional decay) as a {id: score} map - the seeds an associative walk
+        starts from."""
         fts_ids = self._fts_ids(query, type)
         vec_ids = self._vector_ids(query, type)
         lists = [fts_ids] + ([vec_ids] if vec_ids else [])
         scores = _rrf_scores(lists)
         if not scores:
-            return []
+            return {}
         # gentle recency signal: breaks ties, never overrides a strong match
         recency = _rrf_scores([self._recency_order(list(scores))])
         for mid, s in recency.items():
@@ -396,9 +404,40 @@ class Store:
             for mid in list(scores):
                 scores[mid] *= _decay_factor(
                     _age_days(updated[mid], now), self._decay_half_life_days)
+        return scores
+
+    def recall(self, query, type=None, limit=20, budget=None, session=None) -> list:
+        if not query or not query.strip():
+            return []
+        scores = self._seed_scores(query, type)
+        if not self._graph.enabled:
+            if not scores:
+                return []
+            order = [mid for mid, _ in sorted(
+                scores.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
+            return self._hydrate(order)          # v0.2 shape, no `via`
+        # associative path: seed -> prime -> spread -> rank -> learn -> receipts
+        if budget is None:
+            budget = self._recall_budget
+        sid = self._graph.resolve_session(session, self._meta_get, self._meta_set)
+        for mid, a in self._graph.session_activation(sid).items():
+            scores[mid] = scores.get(mid, 0.0) + _PRIMING_WEIGHT * a
+        if not scores:
+            return []
+        activation, receipts = self._graph.spread(scores, budget, type)
         order = [mid for mid, _ in sorted(
-            scores.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
-        return self._hydrate(order)
+            activation.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
+        self._graph.touch_session(sid, order)
+        self._conn.commit()
+        hits = self._hydrate(order)
+        for h in hits:
+            r = receipts.get(h["id"])
+            if r is not None and h["id"] not in scores:
+                h["via"] = {"path": [{"from": r["from"], "kind": r["kind"], "w": r["w"]}],
+                            "hops": r["hops"]}
+            else:
+                h["via"] = {"seed": True}
+        return hits
 
     def _recency_order(self, ids):
         if not ids:
