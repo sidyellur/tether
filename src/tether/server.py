@@ -7,8 +7,8 @@ so importing the module (and listing tools) never touches the filesystem.
 
 Run it as an MCP stdio server:
 
-    tether                     # installed entry point
-    python -m tether.server    # or as a module
+    tether-memory               # installed entry point
+    python -m tether.server     # or as a module
 """
 
 import json

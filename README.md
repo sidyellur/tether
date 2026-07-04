@@ -45,18 +45,20 @@ Requires Python ≥3.10 on a POSIX system (Linux/macOS).
 Register it with Claude Code — with [uv](https://docs.astral.sh/uv/):
 
 ```sh
-claude mcp add tether -- uvx --from tether-memory tether
+claude mcp add tether -- uvx tether-memory
 ```
 
 …or install it first:
 
 ```sh
 pip install tether-memory
-claude mcp add tether -- tether
+claude mcp add tether -- tether-memory
 ```
 
-(The PyPI package is named `tether-memory` — `tether` was already reserved on
-PyPI as a common brand name — but the installed command is still `tether`.)
+(The package is named `tether-memory` on PyPI — `tether` was already reserved
+as a common brand name. `tether` in `claude mcp add tether -- ...` is just the
+label Claude Code uses to refer to this server; it doesn't need to match the
+installed command.)
 
 By default memory lives in a local SQLite file at
 `~/.local/share/tether/memory.db` (override with `TETHER_DB`). No accounts, no
