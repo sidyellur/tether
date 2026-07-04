@@ -314,3 +314,23 @@ def test_recall_degrades_when_numpy_missing(monkeypatch):
     monkeypatch.setitem(sys.modules, "numpy", None)  # `import numpy` now raises
     assert len(s.recall("car")) == 1           # keyword still works, no crash
     assert s.recall("automobile") == []        # semantic unavailable -> empty, not an error
+
+
+def test_migrate_adds_consolidation_columns():
+    s = make_store()
+    cols = {r[1] for r in s._conn.execute("PRAGMA table_info(memories)").fetchall()}
+    assert {"author", "valid_from", "valid_to", "superseded_by"} <= cols
+
+
+def test_migrate_backfills_valid_from_for_existing_rows():
+    # A pre-consolidation row (has created_at, no valid_from) gets valid_from set.
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s.migrate()
+    s.remember("user", "A", "a note")
+    conn.execute("UPDATE memories SET valid_from=NULL")  # simulate a legacy row
+    conn.commit()
+    s.migrate()  # idempotent + heals valid_from
+    vf, ca = conn.execute(
+        "SELECT valid_from, created_at FROM memories").fetchone()
+    assert vf == ca and vf is not None

@@ -111,11 +111,17 @@ def _rrf_fuse(ranked_lists, k=60):
 
 
 class Store:
-    def __init__(self, conn, device_id: str, sync_now, embedder=None):
+    def __init__(self, conn, device_id: str, sync_now, embedder=None,
+                 author="", consolidate=False, dedup_threshold=0.92,
+                 decay_half_life_days=None):
         self._conn = conn
         self._device_id = device_id
         self._sync_now = sync_now
         self._embedder = embedder
+        self._author = author
+        self._consolidate = consolidate
+        self._dedup_threshold = dedup_threshold
+        self._decay_half_life_days = decay_half_life_days
 
     def migrate(self) -> None:
         fts_existed = self._table_exists("memories_fts")
@@ -126,7 +132,11 @@ class Store:
             # FTS5 external-content tables don't auto-index pre-existing rows
             # in the content table; rebuild so a DB that predates the FTS5
             # table (or embedding column) isn't left with a stale/empty index.
+            # Must happen before any UPDATE touches `memories` (e.g. the
+            # valid_from backfill below) - an UPDATE trigger firing against a
+            # not-yet-rebuilt FTS5 shadow index corrupts it.
             self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        self._ensure_consolidation_columns()
         self._conn.commit()
 
     def _table_exists(self, name) -> bool:
@@ -139,6 +149,22 @@ class Store:
             "PRAGMA table_info(memories)").fetchall()}
         if "embedding" not in cols:
             self._conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB")
+
+    def _ensure_consolidation_columns(self) -> None:
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(memories)").fetchall()}
+        adds = [
+            ("author", "ALTER TABLE memories ADD COLUMN author TEXT NOT NULL DEFAULT ''"),
+            ("valid_from", "ALTER TABLE memories ADD COLUMN valid_from TEXT"),
+            ("valid_to", "ALTER TABLE memories ADD COLUMN valid_to TEXT"),
+            ("superseded_by", "ALTER TABLE memories ADD COLUMN superseded_by INTEGER"),
+        ]
+        for name, ddl in adds:
+            if name not in cols:
+                self._conn.execute(ddl)
+        # heal any row missing valid_from (legacy or a NULL'd column)
+        self._conn.execute(
+            "UPDATE memories SET valid_from = created_at WHERE valid_from IS NULL")
 
     def _meta_get(self, key):
         row = self._conn.execute(
