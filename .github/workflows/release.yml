@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi          # configure this name in the PyPI trusted publisher
     permissions:
+      contents: read           # required for actions/checkout (private repo)
       id-token: write          # required for OIDC trusted publishing
     steps:
       - uses: actions/checkout@v4
