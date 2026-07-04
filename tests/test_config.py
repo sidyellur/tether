@@ -108,6 +108,19 @@ def test_recall_budget_default_and_parsing(monkeypatch):
     assert config.recall_budget() == 8
 
 
+def test_protect_head_default_and_parsing(monkeypatch):
+    monkeypatch.delenv("TETHER_PROTECT_HEAD", raising=False)
+    assert config.protect_head() == 8
+    monkeypatch.setenv("TETHER_PROTECT_HEAD", "3")
+    assert config.protect_head() == 3
+    monkeypatch.setenv("TETHER_PROTECT_HEAD", "0")
+    assert config.protect_head() == 0
+    monkeypatch.setenv("TETHER_PROTECT_HEAD", "-2")
+    assert config.protect_head() == 8
+    monkeypatch.setenv("TETHER_PROTECT_HEAD", "junk")
+    assert config.protect_head() == 8
+
+
 def test_boot_index_cap_default_and_parsing(monkeypatch):
     monkeypatch.delenv("TETHER_BOOT_INDEX_CAP", raising=False)
     assert config.boot_index_cap() == 50

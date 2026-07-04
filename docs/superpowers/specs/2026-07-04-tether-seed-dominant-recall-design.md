@@ -43,87 +43,98 @@ The upside is real and must be preserved: the usage graph does surface connected
 memories (graph-only 0.167 → 0.228, → 0.347 at budget 8; 6/11 improved, 0 regressed). This is a
 fix to the ranking, not a retreat from the bet.
 
-## Design: two-tier rank fusion
+## Design: protect-head / re-rank-tail
 
-Split the final ranking into two tiers separated by the **v0.2 seed set**, and make seeds
-structurally undisplaceable by spread-reached nodes.
+**Design evolution (what the bench rejected).** The original design here was a strict *two-tier*
+split (v0.2 seeds locked on top, spread-reached nodes below). The bench harness killed two
+successive designs before the third held — this is exactly what the harness is for:
 
-The seed set is exactly what `recall` already computes as `scores = self._seed_scores(query, type)`
-— the pure v0.2 hybrid result (FTS+semantic RRF, gentle recency, optional decay), captured
-**before** priming or spread mutate it.
+1. **Strict two-tier** (seeds above all non-seeds): guard PASSED (control 0.866) but graph-only
+   went *dead flat* at the v2 baseline (0.167 across cold/warmed/oracle) — the upside vanished.
+   Root cause, found by instrumenting one query: **semantic recall has no similarity floor
+   (issue #15), so `_seed_scores` returns the *entire store* as near-tied seeds.** Every memory is
+   a "seed," so "seeds above non-seeds" degenerates to "rank everything by v0.2 score," discarding
+   spread entirely.
+2. **Seed-activation floor / weighted-RRF fusion**: any weight on spread that helped graph-only
+   *immediately* regressed control (even w=0.1: control 0.866 → 0.824). Because control golds are
+   *direct-but-not-graph-central* and graph-only golds are *graph-central-but-not-direct*, a single
+   fused score that rewards connectivity inherently demotes direct hits.
 
-- **Tier 1 (protected):** the v0.2 seeds, ranked in **exact v0.2 score order** (`(-score, id)`).
-  They occupy the top slots verbatim.
-- **Tier 2 (associative):** every other node that received activation — via priming *or* spread
-  — ranked by total activation descending. Filled in **below** all seeds.
-- `order = (tier1 + tier2)[:limit]`.
+The instrumentation revealed the real structure: control golds sit in the **top few** v0.2 ranks;
+graph-only golds are buried deep in the flat v0.2 tail (rank 18–30) yet carry huge spread
+activation (~0.97 vs a seed RRF of ~0.016 — a 60× scale gap). So the winning design protects the
+head and re-ranks the tail:
 
-### Why it is provably non-regressing
+- Compute `seed_order` = the v0.2 seeds sorted by v0.2 score (`(-score, id)`).
+- **Head:** `seed_order[:PROTECT_HEAD]` — locked in exact v0.2 order. A direct hit here cannot be
+  demoted by spreading.
+- **Tail:** every other activated memory, re-ranked by **spread activation** descending. A
+  connected-but-weakly-matched memory (deep in the v0.2 tail, high activation) climbs into the
+  top-10 slots the direct hits didn't claim.
+- `order = (head + tail)[:limit]`.
 
-Control-class golds *are* v0.2 seeds sitting near the top. Two-tier keeps every seed at its exact
-v0.2 rank and only appends non-seeds below it — no gold can be displaced from its v0.2 position.
-Therefore **warmed control nDCG === v2 control nDCG, at any budget, with 0 regressions, by
-construction.** This is stronger than the guard's "≥ v2 − ε": it is exact equality. Degrade-never
-at the quality layer becomes a structural property, the counterpart to the functional
-byte-identical-when-off guarantee.
+`PROTECT_HEAD` is the one knob (default **8**, `TETHER_PROTECT_HEAD`). It trades protection for
+upside: larger protects more direct hits but leaves fewer top-10 slots for the tail re-rank.
 
-Formally: for any k, v0.2's top-k over the seeds is a prefix of two-tier's ranking (identical
-order); appended tier-2 nodes are all non-seeds, so no seed's rank ≤ its v0.2 rank changes, and
-no gold (a seed) is displaced. nDCG@k over any gold set drawn from the seeds is unchanged.
+### Why it works (empirical, not provable)
 
-### Why upside survives
+Unlike strict two-tier, this is *not* a by-construction guarantee — it is tuned against the bench.
+At `PROTECT_HEAD=8` on the SCENARIO corpus:
 
-Graph-only golds are *semantically far* from their query (the anti-rigging design — asserted
-cos < 0.35 by `selfcheck.assert_golds_far`), so they are never v0.2 seeds. They land in tier 2
-and are still surfaced by spread, ranked among the associative nodes by activation. The learning
-delta (warmed − cold on graph-only) stays positive.
+- **control nDCG = 0.866 == v2** (guard PASS, 0/12 regressed) — control golds live in the top ~3
+  v0.2 ranks, well inside the protected head, so they are never touched.
+- **cold graph-only = 0.167 == v2** — with only semantic/explicit edges (no learned Hebbian), the
+  tail re-rank is neutral: assoc-on-before-use doesn't hurt.
+- **warmed graph-only = 0.221 > 0.167** (learning delta **+0.054**, 2 improved / 0 regressed;
+  R@k 0.455 → 0.636) — learned co-recall lifts the connected golds out of the tail.
 
-### Priming
+Below ~8 the protected head is too small and *cold* graph-only dips under v2 (semantic-edge spread
+reshuffles the near-tied tail unhelpfully before any learning); above ~10 the head eats all the
+top-10 slots and the upside disappears. 8 is the validated middle.
 
-Priming (session-recency boost, `_PRIMING_WEIGHT * a`) currently adds into `scores` before spread.
-Under two-tier, a primed-but-not-v0.2-matched node is **not** a seed, so it falls into tier 2 —
-correct: priming is an associative boost and must not override a direct match either. Primed nodes
-that *are* v0.2 seeds stay in tier 1 at their v0.2 rank (priming does not reorder tier 1). The
-headline bench warmed run uses a fresh session, so priming contributes nothing there regardless.
+### Priming and receipts
 
-### Receipts (`via`) — unchanged
-
-The `via` receipt logic keys off `h["id"] not in scores` (the seed set): seeds get
-`{"seed": True}`, tier-2 nodes keep their spread path receipt. Because the seed set is the same
-object used for the tier boundary, this stays correct with no change.
+Priming still adds `_PRIMING_WEIGHT * session_activation` into a *copy* of the seeds (`activated`)
+before spread, so it can lift a memory within the tail re-rank but never reorders the protected
+head (which is keyed off the pre-priming `seeds` scores). The `via` receipt logic is unchanged —
+it keys off `h["id"] not in seeds`; since semantic recall makes nearly everything a seed, most
+hits carry `{"seed": True}`, which is honest (they *were* v0.2 candidates) even when their rank
+came from the tail re-rank. Receipt fidelity for tail-promoted memories is a known limitation
+(below).
 
 ## Secondary fix: default recall budget 24 → 8
 
-With two-tier ranking, budget can no longer hurt the control class (seeds are protected at every
-budget), so it becomes a pure upside/cost knob. The #25 sweep peaked graph-only nDCG at **budget 8**
-(0.347) and degraded toward 24 as the spread tier floods with noise. Drop the default from 24 to 8
-in both places it is defined:
+Independently, drop the default `TETHER_RECALL_BUDGET` 24 → 8 (both `config._DEFAULT_RECALL_BUDGET`
+and the `Store(..., recall_budget=8)` constructor default). The #25 sweep peaked associative upside
+near budget 8 and degraded toward 24 as spreading floods a small store.
 
-- `config._DEFAULT_RECALL_BUDGET` (server path)
-- the `Store(..., recall_budget=24)` constructor default (library path)
+## Known limitations
 
-This is a product-default change, not a safety mechanism — safety comes from the two-tier split.
+- **Tuned, not proven.** `PROTECT_HEAD=8` is fit to one 34-memory corpus; it is a sensible default,
+  not a scale-invariant guarantee. The honest framing (already in `bench/run.py`'s `_HONESTY`
+  banner) applies: existence proof, not generalization. A future improvement is a *relative* head
+  (protect v0.2 hits whose score clearly stands above the flat tail) rather than a fixed count.
+- **Root dependency on issue #15.** The whole difficulty stems from semantic recall returning the
+  entire store with no relevance floor. A min-score / gap cutoff on `_seed_scores` (issue #15) would
+  make "seed" meaningful again and likely simplify this ranking. #15 should be revisited alongside.
+- **`via` receipts for tail-promoted hits** report `{"seed": True}` rather than a spread path,
+  understating the graph's role in their rank. Cosmetic; deferred.
 
 ## Scope / non-goals
 
-- **In scope:** the final-ranking split in `recall`; the two budget-default constants; unit tests;
-  a `bench/` acceptance run; README/docs note; version bump.
+- **In scope:** the head/tail ranking in `recall`; the `protect_head` knob (Store + config + server);
+  the budget default; unit tests; a `bench/` acceptance run; README note; version bump.
 - **Not in scope:** changing `spread()` internals, edge weights, HOP_DECAY, Hebbian cap, or priming
-  weight — the fix is entirely in how the final order is assembled, leaving the activation dynamics
-  (and their receipts/telemetry value) intact. Edge decay (the un-decayed-Hebbian concern) remains a
-  later tier. B2 (crystallization) stays deferred behind this fix, per #25.
+  weight; fixing issue #15's semantic floor (noted as the deeper fix). B2 (crystallization) stays
+  deferred behind this fix, per #25.
 
 ## Test strategy
 
-**Hermetic unit tests** (FakeEmbedder, hand-inserted edges — no model, no numpy dependency beyond
-existing):
-1. A high-weight Hebbian neighbor of a seed cannot outrank that seed (the exact #25 failure).
-2. Tier-1 order equals the pure-v0.2 order for the same query (seeds not reordered by activation).
-3. A primed non-seed node ranks below all seeds.
-4. Spread-only (tier-2) nodes still appear in the result and below the seeds (upside preserved).
-5. Degrade-never: `assoc=False` recall is byte-identical to v0.2 (unchanged guarantee — regression
-   guard on the refactor).
-6. Default budget resolves to 8 (config and Store constructor).
+**Hermetic unit tests** (FakeEmbedder, hand-inserted edges — no model):
+1. A high-weight Hebbian neighbor cannot outrank the query's own direct hit (the #25 failure;
+   `budget=1` isolates the single amplifying hop).
+2. Degrade-never: `assoc=False` recall is byte-identical to v0.2 (regression guard on the refactor).
+3. Default budget resolves to 8; default `protect_head` resolves to 8 (config + Store constructor).
 
 **Acceptance test** (local, real `potion-base-8M`, `HF_HUB_OFFLINE=1`): re-run
 `python -m bench.run` on `SCENARIO`. Expected: `no_regression` guard **PASS** with control

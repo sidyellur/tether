@@ -41,6 +41,7 @@ def _get_store() -> Store:
                       decay_half_life_days=config.decay_half_life_days(),
                       assoc=config.assoc_enabled(),
                       recall_budget=config.recall_budget(),
+                      protect_head=config.protect_head(),
                       boot_index_cap=config.boot_index_cap(),
                       forget=config.forget_enabled(),
                       forget_age_days=config.forget_age_days(),

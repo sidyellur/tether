@@ -103,6 +103,16 @@ def _unpack(blob: bytes) -> tuple:
 
 _RECENCY_WEIGHT = 0.25
 _PRIMING_WEIGHT = 0.25
+# Associative ranking protects the head and re-ranks the tail. Semantic recall
+# returns the whole store as near-tied seeds, so a direct hit is distinguished
+# only by sitting in the top few by v0.2 score. _PROTECT_HEAD locks that many
+# top v0.2 hits in place (so a direct hit can't be buried by spreading - the #25
+# regression), and everything below is re-ranked by spread activation to surface
+# connected-but-weakly-matched memories. Larger == more protection, less upside.
+# 8 is the bench-validated default (see bench/): control nDCG stays == v0.2 while
+# warmed graph-only recall beats it; below ~8 unwarmed recall dips under v0.2, and
+# above ~10 the associative upside disappears.
+_PROTECT_HEAD = 8
 
 
 def _rrf_scores(ranked_lists, k=60):
@@ -136,6 +146,7 @@ class Store:
     def __init__(self, conn, device_id: str, sync_now, embedder=None,
                  author="", consolidate=False, dedup_threshold=0.92,
                  decay_half_life_days=None, assoc=False, recall_budget=8,
+                 protect_head=_PROTECT_HEAD,
                  boot_index_cap=50, forget=False, forget_age_days=90,
                  forget_interval=20, forget_max_per_sweep=10):
         self._conn = conn
@@ -147,6 +158,7 @@ class Store:
         self._dedup_threshold = dedup_threshold
         self._decay_half_life_days = decay_half_life_days
         self._recall_budget = recall_budget
+        self._protect_head = protect_head
         self._graph = Graph(conn, enabled=assoc)
         self._boot_index_cap = boot_index_cap
         self._forget = forget
@@ -487,15 +499,20 @@ class Store:
         if not activated:
             return []
         activation, receipts = self._graph.spread(activated, budget, type)
-        # two-tier ranking: v0.2 seeds keep their exact v0.2 order at the top;
-        # everything reached by priming/spread fills in below, by activation. A
-        # direct hit can never be outranked by a spread-only node (fixes #25).
-        tier1 = [mid for mid, _ in sorted(
+        # protect-head / re-rank-tail. Semantic recall returns the whole store as
+        # near-tied seeds, so a direct hit is distinguished only by sitting in the
+        # top few by v0.2 score. Lock that head in exact v0.2 order (a direct hit
+        # can't be demoted -> no #25 regression), then re-rank everything below it
+        # by spread activation, which surfaces connected-but-weakly-matched
+        # memories (huge activation, deep in the v0.2 tail) into the slots the
+        # direct hits didn't claim. HEAD is the protected-prefix size.
+        seed_order = [m for m, _ in sorted(
             seeds.items(), key=lambda kv: (-kv[1], kv[0]))]
-        tier2 = [mid for mid, _ in sorted(
-            ((m, a) for m, a in activation.items() if m not in seeds),
-            key=lambda kv: (-kv[1], kv[0]))]
-        order = (tier1 + tier2)[:limit]
+        head = seed_order[:self._protect_head]
+        head_set = set(head)
+        tail = sorted((m for m in activation if m not in head_set),
+                      key=lambda m: (-activation[m], m))
+        order = (head + tail)[:limit]
         self._graph.touch_session(sid, order)
         self._conn.commit()
         hits = self._hydrate(order)

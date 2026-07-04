@@ -89,6 +89,7 @@ def decay_half_life_days():
 
 _ASSOC_OFF = {"0", "false", "no", "off"}
 _DEFAULT_RECALL_BUDGET = 8
+_DEFAULT_PROTECT_HEAD = 8
 
 
 def assoc_enabled() -> bool:
@@ -110,6 +111,19 @@ def recall_budget() -> int:
     except ValueError:
         return _DEFAULT_RECALL_BUDGET
     return val if val >= 0 else _DEFAULT_RECALL_BUDGET
+
+
+def protect_head() -> int:
+    """Number of top v0.2 hits locked in place before spread re-ranks the tail
+    (seed-dominance guard; larger = more protection, less associative upside)."""
+    raw = os.environ.get("TETHER_PROTECT_HEAD")
+    if not raw:
+        return _DEFAULT_PROTECT_HEAD
+    try:
+        val = int(raw)
+    except ValueError:
+        return _DEFAULT_PROTECT_HEAD
+    return val if val >= 0 else _DEFAULT_PROTECT_HEAD
 
 
 _FORGET_ON = {"1", "true", "yes", "on"}
