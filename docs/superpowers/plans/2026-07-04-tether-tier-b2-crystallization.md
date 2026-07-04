@@ -575,12 +575,16 @@ DEDUP_OVERLAP = 0.6                        # basis-recovery fraction to suppress
 
 ```python
 # src/tether/crystallize.py — add helpers
-def _principle_bases(conn):
-    """{principle_id: frozenset(source_ids)} from directional crystallized edges."""
+def _principle_bases(conn, current):
+    """{principle_id: frozenset(source_ids)} from directional crystallized edges,
+    restricted to still-current memories. on_forget deletes a node's edges, but a
+    soft-forgotten (valid_to set, edges retained) principle or source must not
+    suppress a live candidate via stale basis-recovery overlap."""
     bases = {}
     for src, dst in conn.execute(
             "SELECT src, dst FROM edges WHERE kind='crystallized'").fetchall():
-        bases.setdefault(src, set()).add(dst)
+        if src in current and dst in current:
+            bases.setdefault(src, set()).add(dst)
     return {p: frozenset(s) for p, s in bases.items()}
 
 
@@ -602,7 +606,7 @@ def _dismissed(conn):
 
 ```python
 # src/tether/crystallize.py — in candidates(), before appending each cluster:
-        bases = _principle_bases(conn)
+        bases = _principle_bases(conn, current)
         dismissed = _dismissed(conn)
         out = []
         for root, seed in sorted(groups.items()):
@@ -666,18 +670,30 @@ git commit -m "feat(b2): basis-recovery dedup + peak-keyed dismissed-set"
 ```python
 # tests/test_crystallize.py — append
 def test_fallback_seeds_tight_neighborhood_only_when_enabled():
-    # No explicit/hebbian peaks; nodes 1,2,3 form an unusually tight semantic
-    # triangle (0.95) against a store baseline dominated by weak (0.4) edges.
+    # No explicit/hebbian peaks. Node 1 is a genuine semantic-density OUTLIER:
+    # strength 1.9 (two 0.95 edges) against a diffuse baseline of eight nodes at
+    # 0.4. Its neighbours 2,3 (strength 0.95) are NOT outliers themselves, so
+    # only node 1 seeds — then _expand pulls its tight neighbours in.
+    # NOTE: the seed must clear mean + FALLBACK_Z*std. A *balanced* bimodal split
+    # (equal-size tight vs loose groups) puts the tight nodes at only ~+1 std and
+    # can never satisfy Z=2.0 — the tight cluster must be a minority against a
+    # larger diffuse background for the threshold to mean anything.
     conn = _store_with_edges(
-        [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"), (6, "f")],
+        [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"),
+         (6, "f"), (7, "g"), (8, "h"), (9, "i"), (10, "j"), (11, "k")],
         [(1, 2, "semantic", 0.95), (1, 3, "semantic", 0.95),
-         (2, 3, "semantic", 0.95),
-         (4, 5, "semantic", 0.40), (5, 6, "semantic", 0.40),
-         (4, 6, "semantic", 0.40)])
+         (4, 5, "semantic", 0.40), (6, 7, "semantic", 0.40),
+         (8, 9, "semantic", 0.40), (10, 11, "semantic", 0.40)])
     assert crystallize.candidates(conn) == []                 # off by default
     cands = crystallize.candidates(conn, fallback=True)
     assert len(cands) == 1 and cands[0]["member_ids"] == [1, 2, 3]
 ```
+
+> **Fixture math (why Z=2.0 holds here):** node strengths are
+> `[1.9, 0.95, 0.95, 0.4×8]` → mean ≈ 0.636, std ≈ 0.451, threshold =
+> mean + 2·std ≈ **1.54**. Only node 1 (1.9) clears it; nodes 2,3 (0.95) do not.
+> Node 1's strong neighbours {2,3} satisfy `FALLBACK_MIN_DEG=2`, so the seed
+> expands to `{1,2,3}`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -794,11 +810,25 @@ def test_crystallization_candidates_memoized_until_write():
     first = s.crystallization_candidates()
     # same signature -> same object identity (cache hit, no recompute)
     assert s.crystallization_candidates() is first
+
+def test_dismiss_invalidates_candidate_memo():
+    # Regression: dismiss_cluster writes crystallize_dismissed (not edges), so an
+    # edges-only memo signature would NOT recompute and the dismissal would no-op.
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True)
+    s.migrate()
+    s.crystallization_candidates()                  # populate the memo signature
+    sig_before = s._cryst_sig
+    s.dismiss_cluster(1, 2)                          # writes crystallize_dismissed
+    s.crystallization_candidates()                  # must recompute
+    assert s._cryst_sig != sig_before               # signature reflects the dismissal
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/python -m pytest tests/test_store.py -k crystallization_candidates -q`
+Run: `.venv/bin/python -m pytest tests/test_store.py -k "crystallization_candidates or dismiss_invalidates" -q`
 Expected: FAIL (`AttributeError: crystallization_candidates`).
 
 - [ ] **Step 3: Implement**
@@ -814,13 +844,21 @@ Expected: FAIL (`AttributeError: crystallization_candidates`).
     def crystallization_candidates(self) -> list:
         """Read-time derived view of principle candidates. [] when disabled.
         Process-memoized on a cheap graph signature (adjustment C) so repeated
-        reads in one reflection pass don't recompute. Never raises."""
+        reads in one reflection pass don't recompute. Never raises.
+
+        The signature MUST include the dismissed-set count: dismiss_cluster writes
+        to crystallize_dismissed, NOT edges, so an edges-only signature would keep
+        serving a dismissed candidate from cache for the life of the process
+        (dismissal silently no-ops). Naming a principle self-invalidates because it
+        adds crystallized edges."""
         if not self._crystallize:
             return []
         try:
             from . import crystallize
             sig = self._conn.execute(
-                "SELECT COUNT(*), COALESCE(MAX(updated_at),'') FROM edges").fetchone()
+                "SELECT (SELECT COUNT(*) FROM edges), "
+                "(SELECT COALESCE(MAX(updated_at), '') FROM edges), "
+                "(SELECT COUNT(*) FROM crystallize_dismissed)").fetchone()
             if sig != self._cryst_sig:
                 self._cryst_cache = crystallize.candidates(self._conn, self._embedder)
                 self._cryst_sig = sig
@@ -845,8 +883,8 @@ def crystallization() -> str:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `.venv/bin/python -m pytest tests/test_store.py -k crystallization_candidates tests/test_mcp.py -q`
-Expected: PASS.
+Run: `.venv/bin/python -m pytest tests/test_store.py -k "crystallization_candidates or dismiss_invalidates" tests/test_mcp.py -q`
+Expected: PASS (3 tests: disabled-empty, memoized-hit, dismiss-invalidates + the resource test).
 
 - [ ] **Step 5: Commit**
 
@@ -903,7 +941,7 @@ def test_crystallized_hub_does_not_bury_direct_hit():
 - [ ] **Step 2: Run test to verify it fails or passes**
 
 Run: `.venv/bin/python -m pytest tests/test_store.py -k "crystallized_edge_surfaces or crystallized_hub" -q`
-Expected: the first test may FAIL if spreading doesn't reach the principle; the second must PASS (protect-head guard already locks the seed). If the second FAILS, lower `KIND_W["crystallized"]` (Task 1) until the seed dominates, then re-run.
+Expected: BOTH PASS. The first must pass — `KIND_W["crystallized"] = 1.2 > 0` guarantees spreading reaches the principle from its source across the (bidirectionally-read) crystallized edge; if it fails, the edge isn't being written or read on both endpoints (revisit Task 1). The second must pass because the #25 protect-head guard locks the top v0.2 seeds above any spread-reached hub. If the second FAILS, lower `KIND_W["crystallized"]` (Task 1) until the seed dominates, then re-run.
 
 - [ ] **Step 3: Implement / tune**
 
