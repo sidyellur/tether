@@ -780,3 +780,30 @@ def test_seed_floor_zero_keeps_all_vector_hits():
     drop = s.remember("user", "drop", "car pizza food")["id"]
     seeds = s._seed_scores("automobile", None)
     assert keep in seeds and drop in seeds
+
+
+def test_remember_crystallizes_links_sources_when_enabled():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True)
+    s.migrate()
+    a = s.remember("project", "auth outage", "login 500s under load")["id"]
+    b = s.remember("project", "pool fix", "raised the connection pool ceiling")["id"]
+    p = s.remember("reference", "principle: fail fast on saturation",
+                   "cap the pool and time out", crystallizes=[a, b])["id"]
+    rows = conn.execute(
+        "SELECT src, dst FROM edges WHERE kind='crystallized' ORDER BY dst").fetchall()
+    assert rows == [(p, a), (p, b)]
+
+
+def test_remember_crystallizes_ignored_when_disabled():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=False)          # feature off
+    s.migrate()
+    a = s.remember("project", "x", "y")["id"]
+    s.remember("reference", "p", "z", crystallizes=[a])
+    assert conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='crystallized'").fetchone()[0] == 0
