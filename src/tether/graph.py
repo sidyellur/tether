@@ -136,3 +136,66 @@ class Graph:
                 self._upsert_edge(a, b, "explicit", 1.0, now, mode="max")
         except Exception:
             return
+
+    def _neighbors(self, node, type=None):
+        rows = self._conn.execute(
+            "SELECT CASE WHEN src=? THEN dst ELSE src END, kind, weight "
+            "FROM edges WHERE src=? OR dst=?", (node, node, node)).fetchall()
+        if not rows:
+            return []
+        agg = {}
+        for nbr, kind, w in rows:
+            agg.setdefault(nbr, {})[kind] = w
+        ids = list(agg)
+        ph = ",".join("?" for _ in ids)
+        params = list(ids)
+        sql = f"SELECT id, type FROM memories WHERE id IN ({ph}) AND valid_to IS NULL"
+        if type is not None:
+            sql += " AND type = ?"
+            params.append(type)
+        valid = {r[0]: r[1] for r in self._conn.execute(sql, params).fetchall()}
+        out = []
+        for nbr in sorted(agg):
+            if nbr not in valid:
+                continue
+            kinds = agg[nbr]
+            blended = sum(KIND_W.get(k, 0.0) * w for k, w in kinds.items())
+            if blended <= 0:
+                continue
+            dominant = max(kinds, key=lambda k: KIND_W.get(k, 0.0) * kinds[k])
+            out.append((nbr, blended, dominant))
+        return out
+
+    def spread(self, seed_activation, budget, type=None):
+        activation = dict(seed_activation)
+        if not self.enabled or budget <= 0 or not activation:
+            return activation, {}
+        receipts = {}
+        depth = {mid: 0 for mid in seed_activation}
+        fired = set()
+        expansions = 0
+        while expansions < budget:
+            candidates = [(a, mid) for mid, a in activation.items()
+                          if mid not in fired and a >= EPSILON]
+            if not candidates:
+                break
+            candidates.sort(key=lambda x: (-x[0], x[1]))
+            a, node = candidates[0]
+            fired.add(node)
+            expansions += 1
+            for nbr, w, kind in self._neighbors(node, type):
+                transmit = a * w * HOP_DECAY
+                if transmit < EPSILON:
+                    continue
+                activation[nbr] = activation.get(nbr, 0.0) + transmit
+                d = depth.get(node, 0) + 1
+                if nbr not in depth or d < depth[nbr]:
+                    depth[nbr] = d
+                if nbr not in seed_activation:
+                    prev = receipts.get(nbr)
+                    if prev is None or transmit > prev["_t"]:
+                        receipts[nbr] = {"from": node, "kind": kind,
+                                         "w": round(w, 3), "hops": depth[nbr], "_t": transmit}
+        for r in receipts.values():
+            r.pop("_t", None)
+        return activation, receipts

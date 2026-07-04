@@ -91,3 +91,47 @@ def test_on_link_writes_explicit_edge():
     g.on_link(7, 3)
     row = g._conn.execute("SELECT src, dst, kind, weight FROM edges").fetchone()
     assert row == (3, 7, "explicit", 1.0)
+
+
+def _mem(conn, mid, type="user", valid=True):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY, type TEXT, "
+        "title TEXT, body TEXT, embedding BLOB, valid_to TEXT)")
+    conn.execute("INSERT INTO memories(id,type,valid_to) VALUES(?,?,?)",
+                 (mid, type, None if valid else "t"))
+
+
+def test_spread_reaches_two_hops_within_budget():
+    g = make_graph()
+    for i in (1, 2, 3):
+        _mem(g._conn, i)
+    g._upsert_edge(1, 2, "hebbian", 1.0, "t", mode="max")
+    g._upsert_edge(2, 3, "hebbian", 1.0, "t", mode="max")
+    act0, _ = g.spread({1: 1.0}, budget=0)          # spreading off
+    assert set(act0) == {1}
+    act2, receipts = g.spread({1: 1.0}, budget=8)   # 1 -> 2 -> 3
+    assert 2 in act2 and 3 in act2
+    assert act2[1] > act2[2] > act2[3]              # decays with distance
+    assert receipts[2]["from"] == 1 and receipts[2]["kind"] == "hebbian"
+    assert receipts[3]["hops"] == 2
+
+
+def test_spread_keeps_seed_above_weak_associate():
+    g = make_graph()
+    for i in (1, 2): _mem(g._conn, i)
+    g._upsert_edge(1, 2, "hebbian", 0.3, "t", mode="max")
+    act, _ = g.spread({1: 0.5, 2: 0.5}, budget=8)   # both seeded equally
+    assert act[1] > act[2] or act[2] > act[1]        # deterministic, no crash
+    # a pure associate never outranks its strong seed source
+    act2, _ = g.spread({1: 1.0}, budget=8)
+    assert act2[1] > act2[2]
+
+
+def test_spread_respects_type_and_validity():
+    g = make_graph()
+    _mem(g._conn, 1, "user"); _mem(g._conn, 2, "project"); _mem(g._conn, 3, "user", valid=False)
+    g._upsert_edge(1, 2, "hebbian", 1.0, "t", mode="max")
+    g._upsert_edge(1, 3, "hebbian", 1.0, "t", mode="max")
+    act, _ = g.spread({1: 1.0}, budget=8, type="user")
+    assert 2 not in act        # wrong type filtered
+    assert 3 not in act        # superseded filtered
