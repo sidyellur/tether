@@ -99,15 +99,34 @@ def _unpack(blob: bytes) -> tuple:
     return struct.unpack(f"<{len(blob) // 4}f", blob)
 
 
-def _rrf_fuse(ranked_lists, k=60):
-    """Reciprocal Rank Fusion: merge several ranked id-lists into one order
-    without needing comparable scores across lists. Deterministic - ties break
-    by ascending id."""
+_RECENCY_WEIGHT = 0.25
+
+
+def _rrf_scores(ranked_lists, k=60):
+    """Reciprocal Rank Fusion as a {id: score} map (deterministic)."""
     scores = {}
     for lst in ranked_lists:
         for rank, mid in enumerate(lst):
             scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank + 1)
-    return [mid for mid, _ in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))]
+    return scores
+
+
+def _rrf_fuse(ranked_lists, k=60):
+    """Reciprocal Rank Fusion: merge several ranked id-lists into one order
+    without needing comparable scores across lists. Deterministic - ties break
+    by ascending id."""
+    return [mid for mid, _ in sorted(
+        _rrf_scores(ranked_lists, k).items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def _age_days(iso: str, now_iso: str) -> float:
+    a = datetime.fromisoformat(iso)
+    b = datetime.fromisoformat(now_iso)
+    return max(0.0, (b - a).total_seconds() / 86400.0)
+
+
+def _decay_factor(age_days: float, half_life_days: float) -> float:
+    return 0.5 ** (age_days / half_life_days)
 
 
 class Store:
@@ -291,12 +310,15 @@ class Store:
         if match is None:
             return []
         sql = ("SELECT m.id FROM memories_fts f JOIN memories m ON m.id = f.rowid "
-               "WHERE memories_fts MATCH ?")
+               "WHERE memories_fts MATCH ? AND m.valid_to IS NULL")
         params = [match]
         if type is not None:
             sql += " AND m.type = ?"
             params.append(type)
-        sql += " ORDER BY rank LIMIT ?"
+        # secondary sort by recency: bm25 ties must not be broken by SQLite's
+        # arbitrary row-scan order (that artificial tiebreak is a full RRF
+        # rank apart, which swamps the gentle recency weight applied later)
+        sql += " ORDER BY rank, m.updated_at DESC LIMIT ?"
         params.append(limit)
         return [r[0] for r in self._conn.execute(sql, params).fetchall()]
 
@@ -310,7 +332,8 @@ class Store:
             import numpy as np
 
             q = np.asarray(self._embedder.embed(query), dtype=np.float32)
-            sql = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL"
+            sql = ("SELECT id, embedding FROM memories "
+                   "WHERE embedding IS NOT NULL AND valid_to IS NULL")
             params = []
             if type is not None:
                 sql += " AND type = ?"
@@ -345,11 +368,39 @@ class Store:
             return []
         fts_ids = self._fts_ids(query, type)
         vec_ids = self._vector_ids(query, type)
-        if vec_ids:
-            order = _rrf_fuse([fts_ids, vec_ids])[:limit]
-        else:
-            order = fts_ids[:limit]
+        lists = [fts_ids] + ([vec_ids] if vec_ids else [])
+        scores = _rrf_scores(lists)
+        if not scores:
+            return []
+        # gentle recency signal: breaks ties, never overrides a strong match
+        recency = _rrf_scores([self._recency_order(list(scores))])
+        for mid, s in recency.items():
+            scores[mid] += _RECENCY_WEIGHT * s
+        # optional exponential time-decay
+        if self._decay_half_life_days:
+            now = _now()
+            updated = self._updated_at_of(list(scores))
+            for mid in list(scores):
+                scores[mid] *= _decay_factor(
+                    _age_days(updated[mid], now), self._decay_half_life_days)
+        order = [mid for mid, _ in sorted(
+            scores.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
         return self._hydrate(order)
+
+    def _recency_order(self, ids):
+        if not ids:
+            return []
+        ph = ",".join("?" for _ in ids)
+        return [r[0] for r in self._conn.execute(
+            f"SELECT id FROM memories WHERE id IN ({ph}) "
+            f"ORDER BY updated_at DESC, id DESC", ids).fetchall()]
+
+    def _updated_at_of(self, ids):
+        if not ids:
+            return {}
+        ph = ",".join("?" for _ in ids)
+        return {r[0]: r[1] for r in self._conn.execute(
+            f"SELECT id, updated_at FROM memories WHERE id IN ({ph})", ids).fetchall()}
 
     def _links_of(self, mid) -> list:
         row = self._conn.execute("SELECT links FROM memories WHERE id=?", (mid,)).fetchone()
@@ -381,7 +432,8 @@ class Store:
 
     def boot_index(self) -> str:
         rows = self._conn.execute(
-            "SELECT id, type, title FROM memories ORDER BY updated_at DESC, id DESC"
+            "SELECT id, type, title FROM memories WHERE valid_to IS NULL "
+            "ORDER BY updated_at DESC, id DESC"
         ).fetchall()
         if not rows:
             return "(no memories yet)"
