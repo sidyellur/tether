@@ -99,6 +99,17 @@ def _unpack(blob: bytes) -> tuple:
     return struct.unpack(f"<{len(blob) // 4}f", blob)
 
 
+def _rrf_fuse(ranked_lists, k=60):
+    """Reciprocal Rank Fusion: merge several ranked id-lists into one order
+    without needing comparable scores across lists. Deterministic - ties break
+    by ascending id."""
+    scores = {}
+    for lst in ranked_lists:
+        for rank, mid in enumerate(lst):
+            scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank + 1)
+    return [mid for mid, _ in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
 class Store:
     def __init__(self, conn, device_id: str, sync_now, embedder=None):
         self._conn = conn
@@ -218,12 +229,11 @@ class Store:
         self._sync_now()
         return {"id": mid, "action": action}
 
-    def recall(self, query, type=None, limit=20) -> list:
+    def _fts_ids(self, query, type=None, limit=200):
         match = _fts_query(query)
         if match is None:
             return []
-        sql = ("SELECT m.id, m.type, m.title, m.body, m.tags, m.updated_at "
-               "FROM memories_fts f JOIN memories m ON m.id = f.rowid "
+        sql = ("SELECT m.id FROM memories_fts f JOIN memories m ON m.id = f.rowid "
                "WHERE memories_fts MATCH ?")
         params = [match]
         if type is not None:
@@ -231,12 +241,58 @@ class Store:
             params.append(type)
         sql += " ORDER BY rank LIMIT ?"
         params.append(limit)
-        rows = self._conn.execute(sql, params).fetchall()
-        return [
-            {"id": r[0], "type": r[1], "title": r[2],
-             "body": r[3], "tags": r[4], "updated_at": r[5]}
-            for r in rows
-        ]
+        return [r[0] for r in self._conn.execute(sql, params).fetchall()]
+
+    def _vector_ids(self, query, type=None, limit=200):
+        """Ids ranked by cosine similarity to the query, or [] when semantic
+        recall is unavailable (no embedder / no numpy / no stored vectors).
+        Never raises - any failure degrades to keyword-only recall."""
+        if self._embedder is None or not query.strip():
+            return []
+        try:
+            import numpy as np
+
+            q = np.asarray(self._embedder.embed(query), dtype=np.float32)
+            sql = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL"
+            params = []
+            if type is not None:
+                sql += " AND type = ?"
+                params.append(type)
+            rows = self._conn.execute(sql, params).fetchall()
+            if not rows:
+                return []
+            ids = [r[0] for r in rows]
+            mat = np.frombuffer(b"".join(r[1] for r in rows),
+                                dtype="<f4").reshape(len(ids), -1)
+            # stored vectors and q are unit-normalized, so dot == cosine
+            sims = mat @ q
+            order = np.argsort(-sims)[:limit]
+            return [ids[i] for i in order]
+        except Exception:
+            return []
+
+    def _hydrate(self, ids) -> list:
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"SELECT id, type, title, body, tags, updated_at FROM memories "
+            f"WHERE id IN ({placeholders})", ids).fetchall()
+        by_id = {r[0]: {"id": r[0], "type": r[1], "title": r[2],
+                        "body": r[3], "tags": r[4], "updated_at": r[5]}
+                 for r in rows}
+        return [by_id[i] for i in ids if i in by_id]
+
+    def recall(self, query, type=None, limit=20) -> list:
+        if not query or not query.strip():
+            return []
+        fts_ids = self._fts_ids(query, type)
+        vec_ids = self._vector_ids(query, type)
+        if vec_ids:
+            order = _rrf_fuse([fts_ids, vec_ids])[:limit]
+        else:
+            order = fts_ids[:limit]
+        return self._hydrate(order)
 
     def _links_of(self, mid) -> list:
         row = self._conn.execute("SELECT links FROM memories WHERE id=?", (mid,)).fetchone()

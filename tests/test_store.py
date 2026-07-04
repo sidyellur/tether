@@ -269,3 +269,48 @@ def test_remember_leaves_embedding_null_without_embedder():
     r = s.remember("user", "A", "car")
     assert s._conn.execute(
         "SELECT embedding FROM memories WHERE id=?", (r["id"],)).fetchone()[0] is None
+
+
+def test_rrf_fuse_prefers_items_ranked_high_in_both_lists():
+    from tether.store import _rrf_fuse
+    fused = _rrf_fuse([[1, 2, 3], [2, 5, 1]])
+    assert fused[0] == 2          # top-ish in both lists wins
+    assert set(fused) == {1, 2, 3, 5}
+
+
+def test_recall_finds_semantic_synonym_that_keyword_misses():
+    pytest.importorskip("numpy")
+    s = make_semantic_store()
+    car = s.remember("user", "Commute", "I love my car and driving to work")["id"]
+    s.remember("project", "Lunch", "pizza and food for the team")
+    assert s._fts_ids("automobile") == []      # 'automobile' never appears literally
+    hits = s.recall("automobile")
+    assert hits and hits[0]["id"] == car
+    assert set(hits[0]) == {"id", "type", "title", "body", "tags", "updated_at"}
+
+
+def test_recall_type_filter_applies_to_semantic_path():
+    pytest.importorskip("numpy")
+    s = make_semantic_store()
+    s.remember("user", "U", "car and driving")
+    p = s.remember("project", "P", "car and driving")["id"]
+    hits = s.recall("automobile", type="project")
+    assert [h["id"] for h in hits] == [p]
+
+
+def test_recall_degrades_to_keyword_without_embedder():
+    s = make_store()  # no embedder
+    s.remember("user", "A", "car and driving")
+    assert s.recall("automobile") == []        # no semantic -> keyword miss -> empty
+    assert len(s.recall("car")) == 1           # keyword still works
+
+
+def test_recall_degrades_when_numpy_missing(monkeypatch):
+    # Embedder present and vectors stored, but numpy is unavailable at query
+    # time: the vector path must silently yield to keyword-only recall.
+    import sys
+    s = make_semantic_store()
+    s.remember("user", "A", "car and driving")   # embedded on write (Task 4)
+    monkeypatch.setitem(sys.modules, "numpy", None)  # `import numpy` now raises
+    assert len(s.recall("car")) == 1           # keyword still works, no crash
+    assert s.recall("automobile") == []        # semantic unavailable -> empty, not an error
