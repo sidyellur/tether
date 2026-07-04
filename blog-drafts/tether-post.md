@@ -1,104 +1,91 @@
-# Tether v0.1: A Shared Memory Layer for Personal Agents
+# tether v0.2: finding the durable position, and the bugs the plan couldn't see
 
-We shipped [tether](https://github.com/sidyellur/tether) yesterday — an MCP server that turns a local SQLite file into a durable memory substrate for personal agents across devices. If you're building agents that span a laptop, desktop, and phone, this is the post for you.
+*A shared, local-first memory layer for personal agents — and what the second release taught me about strategy, degrade-never engineering, and why every plan needs a test strategy.*
 
-## The problem is amnesia at scale
+## What tether is
 
-Picture this: you're using Claude on your laptop, and it learns something important about your project — a decision you made, a constraint you mentioned, a preference you established. You close the tab. Three hours later, on your phone, you ask the same agent a question. It has no idea what you told it before. So you explain again. And again. Each device is a fresh start, and you're burning tokens re-establishing context that already exists.
+tether is an [MCP](https://modelcontextprotocol.io) server backed by a local SQLite file. Any MCP-compatible agent can `remember`, `recall`, `link`, and `forget` durable notes — facts about you, your projects, your preferences — so context follows you instead of dying with each session.
 
-This matters because personal agents are *mobile* by definition. If an agent is useful, you'll want to talk to it from wherever you are. But context doesn't follow you unless memory does — and not the kind locked in vector stores or fine-tuning checkpoints. You need a *durable, writable, cross-device memory substrate* that any agent can read and update from any device, any time.
+The bet behind it: the near future is personal agents living across many devices — laptop, desktop, phone. For that to feel like *one* assistant rather than several amnesiac ones, memory has to be a substrate that follows you, readable and writable from every device and any agent, not siloed inside a single tool. tether is deliberately a *convenience layer*: it makes an agent more useful when present, and it never breaks the agent's work when degraded.
 
-That's what tether solves.
+v0.1 established the shape. Four verbs and nothing more (I resisted list/get/raw-SQL — `remember`/`recall`/`link`/`forget` is the minimum usable surface). Upsert-on-write, so the store dedups as you go rather than rotting into near-duplicates: same `type` + normalized `title` refines in place, and agents never have to decide "new or existing?" before writing. A local SQLite file as the zero-config default, with opt-in libSQL/Turso sync sharing the exact same code path. And an auto-loaded boot index — a compact one-line-per-memory list surfaced each session, a kind of silent fifth verb — so memory helps even when the agent doesn't think to search.
 
-## The core insight: memory as shared ground
+v0.1 also taught me that "it builds and tests pass" ≠ "it ships." Two sharp edges surfaced in one afternoon: PyPI blocks distribution names that collide with well-known brands (Tether/USDT), so the distribution became `tether-memory` while import/CLI/repo stayed `tether`; and a GitHub Actions release workflow that set `permissions: id-token: write` and nothing else silently dropped `contents: read`, because specifying *any* permission flips the rest of the block to `none`. Neither showed up in local testing. Both were found only by reading the actual CI logs.
 
-The key design decision isn't technical — it's architectural. Instead of building a memory *system* (embeddings, entity graphs, reasoning layers), tether is a *substrate*. Think of it like a filesystem: not everyone needs to understand ext4 to use a laptop, but a common storage layer makes it possible for different tools to share files.
+That's the backdrop. This post is about v0.2 — where the interesting decisions were.
 
-In our case, different agents on different devices share the same SQLite database. Your Claude session on the laptop can call `remember()` to save a fact. Your Claude session on the phone calls `recall()` to find it. A third-party agent in the middle can link memories together or refine them. None of them need to coordinate — they're all reading and writing the same shared ground.
+## The pincer: why I stopped thinking of tether as a first mover
 
-This isn't about perfect consistency or strong guarantees. It's about being a *convenience layer* that helps when present and doesn't break the agent when degraded. An agent using tether should never feel worse off for having it than without it.
+Before writing any v0.2 code, I ran deep product research — three parallel agents on competitive landscape, technical direction, and go-to-market. It reframed the strategy hard.
 
-## Design choice: local-first, sync optional
+tether v0.1 is **not** sitting in an empty category. `ai-memory-mcp` already ships a near-identical pitch: SQLite FTS5, zero cloud dependencies, cross-MCP-client, sync. That's the clone risk from below. And from above, the platforms are commoditizing *personal* memory — Anthropic shipped standardized memory import under a "context should belong to the user" banner. So the position isn't "open field"; it's a **pincer**: OSS clones below, platform features above.
 
-Here's where we got the most pushback during design: why local-first at all? Why not just build against a cloud primary from day one?
+What survives that squeeze is the part neither side can own: **user- and team-owned, neutral, local-first memory.** The moat isn't the primitive (everyone has FTS5 over SQLite) — it's trust, data locality, and team-sharing. The business analogues here are Tailscale and Obsidian: individuals are the funnel, teams are the revenue, and sync is the one thing free local users actually pay for.
 
-The answer is deployment friction. A truly cross-device sync system requires a reliable backend, proper authentication, and careful handling of offline states. That's a lot of operational complexity for a v0.1. More importantly, many agents don't *need* cross-device sync — they're happy running on a single machine. Forcing them through that complexity would be a mistake.
+That reshaped the roadmap into prioritized bets rather than a feature list. Bet 1: semantic search. Bet 2: consolidation. Both are non-negotiable substrate whether the future is solo or team. Then, later, team shared-memory as the actual business. And an explicit *non*-goal: no full knowledge-graph engine — the field has converged on hybrid retrieval, and even Mem0 is retreating from external graphs. Naming what I'm *not* building was as important as naming what I am.
 
-So we inverted it: local SQLite is the default. Zero config. No accounts. No network. You install tether, point Claude Code at it, and memory just works. An agent that wants to stay local never thinks about sync.
+## Bet 1 — semantic search without the C extension
 
-For agents that do need to follow you across devices, you point tether at a Turso/libSQL primary and it becomes an embedded replica. The exact same code path handles both cases — the difference is a single environment variable. Write a memory on your laptop, and it propagates to your phone within seconds. Go offline, and the agent keeps working against the replica; changes converge when you reconnect.
+The obvious way to add vector search to SQLite is the `sqlite-vec` C extension. I didn't use it, and the reason is the whole ballgame for a tool whose contract is *degrade-never*.
 
-This design sidesteps vendor risk (you're not forced into a SaaS dependency) and keeps the surface simple. It also means we can iterate on sync without breaking single-machine deployments.
+**SQLite extension loading is disabled in many system Python builds** — notably macOS system Python. If tether's semantic search depended on loading a native extension, it would simply fail to import on a large fraction of the machines it's supposed to run on. That directly violates the promise that memory helps when present and never breaks the agent when degraded.
 
-## The hidden cost of `.sync()`: a real-world lesson
+So instead of a native index, semantic search is an `embedding BLOB` column plus **in-process numpy brute-force cosine**. This is the same brute force the research endorsed — under 10ms at anywhere from hundreds to ten thousand vectors, which is the entire realistic range for a personal memory store — but with none of the deployment fragility. It also keeps the test suite hermetic (no native build step) and it matches v0.1's own schema note, which had already reserved space for "an embedding BLOB column that backfills existing rows." The v0.1 schema was designed so this slotted in without a data migration, and it did.
 
-During implementation, we hit a snag that wouldn't have shown up in unit tests or design docs.
+The embeddings themselves come from a **local static model** (Model2Vec). Static is the key word: no neural forward pass, no network call on the hot path — embedding a query is a lookup-and-average, not an inference. FTS5 keyword search stays the always-available floor; semantic is purely additive, and the two are fused with **Reciprocal Rank Fusion** so a query finds relevant memories even when the exact words differ ("automobile" recalls a note about your "car"). Without the optional `[semantic]` extra, or with `TETHER_SEMANTIC=0`, tether is keyword-only FTS5 and nothing hangs.
 
-The plan was straightforward: when tether starts up and a backend is configured, call `conn.sync()` on libsql-experimental to probe connectivity. If the handshake fails, log it and move on. This was meant to be cheap and fast — a way to know whether the server is online before we commit to any behavior.
+Bet 1 shipped as PR #13 (merged `5950eaf`), essentially verbatim from the plan: `embed.py` with a Model2Vec `Embedder` producing unit-normalized vectors, the `embedding` BLOB column plus a `meta` table, `backfill_embeddings()` with a model-change reset, hybrid `recall` via RRF, and degrade-never behavior on missing numpy, a broken embedder, or no embedder at all. Vectors are stored as little-endian float32 via `struct`, and because they're unit-normalized, similarity is just a numpy dot product (which equals cosine).
 
-What we actually found: `conn.sync()` doesn't fail fast. When the backend is unreachable, libSQL retries the handshake internally and retries again every ~2-3 seconds. This is good for resilience in the common case, but it means calling `sync()` inline will hang your startup if the backend is down.
+One detail I'm keeping as a lesson: the plan carried complete code, and it flagged exactly one unverified external API — `self._model.encode([text])[0]`, the Model2Vec call it couldn't test without the dependency present. It shipped exactly like that, no correction needed. A detailed plan turns the remote build into a near-transcription, and the *pre-identified* risk cost nothing precisely because it was named up front. Hold that thought — bet 2 is the counterexample.
 
-So we redesigned: the initial sync now runs in a background thread with a timeout. It's the same pattern we already use for periodic syncs later in the server lifecycle, just moved to startup. The change is subtle — three lines of code — but critical. Without it, tether's startup blocks indefinitely on a dead network, which defeats the purpose of having local-first defaults.
+## Staggering the two bets (they collide in store.py)
 
-This is the kind of thing that unit tests don't catch because the tests run on localhost. It's worth noting because it illustrates a principle: *be careful about libraries that abstract away I/O and timeouts*. They're usually trying to be helpful, but they can surprise you when your assumptions about control flow don't match the implementation.
+Both bets ran as separate remote sessions, but they couldn't run fully in parallel. They both touch `store.py`'s `migrate`, `remember`, and `recall` — the busiest functions in the codebase. Run them concurrently and you get two divergent rewrites of the same three functions to reconcile by hand.
 
-## Four verbs: deliberate minimalism
+So I staggered them: bet 1 lands on `main` first, then bet 2 branches off the *updated* `main`, and bet 2's plan opens with a hard "Depends on Bet 1" gate. Consolidation actually *wants* bet 1's embeddings anyway (near-duplicate detection reuses them), so the dependency was real, not just a merge-conflict dodge.
 
-The tether API is four functions.
+## Dogfooding, and the remote-session memory gap
 
-- `remember(type, title, body, tags?, links?)` — save a memory, upserting on type+title
-- `recall(query, type?, limit?)` — keyword search
-- `link(id_a, id_b)` — bidirectional link
-- `forget(id)` — delete a memory
+Somewhere in here I noticed that the thing I was doing to *write this post* was tether's exact use case. The blog journal — decisions, bugs, the first-publish gotchas, the v0.2 brainstorming — is durable, cross-session project knowledge. So it shouldn't live in a repo-committed `NOTES-FOR-BLOG.md`. I moved it into tether itself: one upserted memory per project, recalled-appended-remembered as new work lands (`44e41de` retired the file). The blog is now a *byproduct* of good memory hygiene, not a separate system. And the boot-index noise that accumulates as the journal grows is exactly what bet 2's recency-weighting and consolidation are for — a satisfying closed loop.
 
-That's it. No `get()`, no `list()`, no raw SQL. No builder patterns or state machines. Just four verbs that do one thing each.
+But dogfooding immediately exposed a real hole: **remote/cloud sessions can't journal into tether.** Two reasons. First, the "journal into tether" instruction lives in my user-level `~/.claude/CLAUDE.md`, which doesn't travel to a remote environment. Second, the tether MCP and its local SQLite DB are laptop-local, and sync isn't configured — so a remote session has nothing to read or write. And I'd just retired `NOTES-FOR-BLOG.md`, which had been the *one* channel a remote session could use.
 
-This restraint is intentional. We resisted adding a read-first `get()` method because agents shouldn't need to know "is this fact new or existing?" before calling remember. In tether, re-remembering a fact refines it in place. We deduplicate on write, not on read — the store is indexed on (type, title_norm), and a new fact with the same normalized title updates the existing row.
+The stopgap is a **local-harvest** pattern: remote sessions write rich PR descriptions and commit messages, and a local session — where tether is reachable — harvests merged PRs into the journal. (The bet-1 journal entry was itself backfilled from PR #13 this way.) The *proper* fix is Turso sync plus tether registered in the remote environment, which would make remote sessions first-class memory participants. In other words, the gap is itself a concrete argument for prioritizing the sync feature that the GTM research already said is the thing people pay for.
 
-The upsert-on-write model is more powerful than it looks. It means agents can be optimistic: just remember the fact, and the system handles deduplication. Over time, a given memory might be updated a hundred times as an agent learns more about it, but the store stays clean instead of rotting into a heap of near-duplicates.
+## Bet 2 — consolidate by marking invalid, never overwriting
 
-We also ship an auto-loaded resource, `tether://memory-index`, that surfaces a compact one-line-per-memory index at the start of each session. Agents don't need to think about searching — the index is already there, ready to jog their memory or seed a conversation.
+The design principle for consolidation is: **never destroy history.** Supersession is temporal — `valid_from` / `valid_to` / `superseded_by` — and superseded rows are *retained* as an audit trail, excluded from recall and the boot index. Only `forget` actually deletes. On top of that: gentle recency-weighting on recall (deliberately small — enough to break ties, not enough to override a strong semantic match), opt-in near-duplicate consolidation using bet 1's embeddings, and opt-in time-decay. Safe defaults, powerful opt-ins; everything off by default.
 
-## What we deferred (and why we did it right)
+I also added an `author` column *now*, before there was any multi-writer feature to use it. That's deliberate: when the team tier arrives, I want it to be an ACL wrapper over existing data, not a schema migration on everybody's store. Build the groundwork while the table is small.
 
-The design spec called out three things we didn't build for v0.1:
+Bet 2 shipped as PR #14 (merged `dee864b`): 59 tests passing, 2 intentionally skipped (the opt-in real-model tests). The recency-vs-RRF composition I'd fretted about in the plan landed exactly as written (`_rrf_scores` plus a `_RECENCY_WEIGHT * s` term).
 
-- Semantic search (embeddings)
-- Entity/edge graph model (for richer relationships)
-- Automatic corrupt-database recovery
+And then TDD found two bugs the plan's literal code did not predict — both living in seams a plan structurally cannot see.
 
-All three are useful, and all three would have added weeks to the timeline. So we made a deliberate choice: design the schema so they slot in without data migration. The `memories` table has room for embedding vectors. The schema supports rich relationships even if we're only using simple bidirectional links right now. The durability story is clear about what we don't handle.
+### Bug 1: FTS5 shadow-index corruption from migration ordering
 
-The important part: we called this out explicitly in the docs, not silently dropped it. v0.1 works and is useful today. v0.2's roadmap is visible. Anyone deploying tether knows what they're getting and what's coming.
+The new `valid_from` healing `UPDATE` in `migrate()` fired *before* the FTS5 rebuild, on a table that had just been created over pre-existing rows. That `UPDATE` touched `memories` while its FTS5 shadow index was in an inconsistent state, and corrupted it.
 
-## Why this matters for multi-agent systems
+The fix was to reorder `migrate()` so the FTS rebuild always runs before any `UPDATE` touches `memories`. The lesson generalizes: in a migration that mixes DDL, healing `UPDATE`s, and FTS triggers, order-of-operations is load-bearing. (It's the same class of bug as a v0.1 lesson about FTS internals — the shadow index does not tolerate being written through in the wrong sequence.)
 
-If you're building a system where multiple agents (or multiple instantiations of the same agent) need to collaborate on behalf of the same person, tether gives you a common language. One agent can `remember()` a decision. Another can `recall()` it and build on it. A third can `link()` it to a related fact. None of them need to implement their own memory system — they just read and write to shared ground.
+### Bug 2: the recency tie-break that got swamped by SQLite's scan order
 
-This becomes crucial as AI tooling matures. Right now, most agents are single-threaded: you ask, it thinks, you get an answer. But future agents will be long-lived, collaborative, and distributed across devices. They'll need to accumulate knowledge over time, share context across sessions, and let you bounce between tools without losing continuity. That's only possible if memory is a substrate, not a silo.
+I *had* flagged recency as delicate around fusion — I worried it wouldn't compose cleanly with RRF. My instinct pointed at the right area, but the actual bug lived a layer below where I'd put it.
 
-tether is a small piece of that puzzle. It's deliberately boring — four verbs, SQLite, no magic. That boringness is the point. In a few years, when agents are everywhere, boring shared infrastructure will be more valuable than novel but isolated systems.
+`_fts_ids` ordered results purely by bm25 `rank`. When two rows are *identically* relevant, bm25 gives them the same rank, and SQLite then breaks the tie by its own arbitrary scan order. That arbitrary order translated into a full RRF rank-step — roughly 1/61 — separating the two rows. And that step *swamped* the intended 0.25 gentle-recency weight. The recency weight was never the problem; the tie order was decided at the SQL layer, before recency could ever apply.
 
-## Shipping it surfaced two problems the code never would have
+The fix was one line in the right place: add `updated_at DESC` as a secondary `ORDER BY` in `_fts_ids`, so genuine bm25 ties resolve by recency at the SQL layer instead of by scan order. (I also caught a stale `remember` docstring that still claimed `action` was only `created`/`updated`, never `consolidated`.)
 
-The code was done, tested, and merged. Publishing it turned out to be its own adventure.
+## The takeaway: a plan buys transcription; TDD buys the seams
 
-We'd already confirmed `tether` was available on PyPI — a plain `curl` to the JSON API came back 404. Weeks later, when we actually tried to register a Trusted Publisher under that name, PyPI rejected it outright: "This project name isn't allowed." The JSON API's 404 doesn't distinguish "never registered" from "registered but blocked" — we had to check the actual Simple Index API (the one `pip` itself queries) to confirm nobody had claimed it. That left one explanation: PyPI almost certainly blocks names colliding with major non-Python brands to prevent dependency-confusion attacks, and `tether` collides with Tether/USDT, one of the largest cryptocurrencies by market cap. We renamed the *published distribution* to `tether-memory` and left the Python import, CLI command, and repo name as `tether`. Those names never have to match — treating them as independent knobs cost us nothing.
+Put bet 1 and bet 2 side by side and you get a clean statement of what detailed planning does and doesn't do.
 
-Then the release workflow itself failed, in a genuinely confusing way. We'd scoped `permissions: id-token: write` for PyPI's OIDC trusted publishing — the minimal grant, we thought. But specifying *any* permission switches GitHub Actions from "inherit the repo's default permissions" to "everything unspecified is `none`." `contents: read`, which `actions/checkout` needs to clone the repo, silently disappeared. The error GitHub gave us was "repository not found" — not a permissions error, not "forbidden." On a private repo, an under-scoped token gets told the repo doesn't exist at all, as a deliberate security choice to avoid leaking whether private repos exist. The fix was one line. Finding it meant reading the actual failed-step logs instead of trusting the summary.
+A detailed plan with complete code buys you a *faithful transcription* — bet 1 shipped verbatim, and even its single flagged external-API risk cost nothing because it was named in advance. But the bugs that actually matter live in the **seams** a plan can't see: migration order-of-operations, an SQL-layer tie-break interacting with a scoring weight two layers up. No amount of per-task detail predicts those, because they only exist at the integration boundaries *between* the tasks. TDD is what surfaces them.
 
-Neither of these showed up in local testing — the build succeeded, all 21 tests passed, the package built cleanly. Both only surfaced the moment we tried to actually publish. "It builds and tests pass" and "it ships" are different bars, and only one of them is exercised by CI running on a laptop.
+That's why the standing rule out of this cycle is: **every implementation plan must include an explicit Test Strategy section** — levels, hermeticity controls, a coverage matrix, and deliberate non-goals. Per-task TDD hides cross-cutting gaps (integration seams, real-data migration, partial-degrade coverage). Bet 2 is the concrete vindication: the plan was right about the code and wrong about the seams, and the test strategy is what caught the difference.
 
-## Try it
+## Where this leaves tether
 
-Install with Claude Code:
+v0.2 gave tether hybrid keyword-plus-semantic recall that degrades to keyword-only on any machine, temporal consolidation that never loses history, and the schema groundwork (`author`) for the team tier that the product research says is the actual business. The remaining gap — remote sessions can't reach local memory — isn't a loose end so much as a signpost: it points straight at sync, which is both the missing dogfooding channel and the one feature free local users are willing to pay for.
 
-```sh
-claude mcp add tether -- uvx --from tether-memory tether
-```
-
-The PyPI package is `tether-memory` (see above for why); the command you actually run is still `tether`.
-
-Local memory is free. If you want cross-device sync, set `TETHER_SYNC_URL` and `TETHER_SYNC_TOKEN` pointing to a Turso database and you're done.
-
-Feedback and issues are welcome. We're building this in public, and v0.2 will be shaped by what agents actually need.
+The primitive was never the moat. User- and team-owned, local-first, degrade-never memory is.
