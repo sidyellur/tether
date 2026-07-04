@@ -133,3 +133,38 @@ def test_mcp_roundtrip_with_real_semantic(tmp_path):
                 assert any(h["title"] == "Commute" for h in hits)
 
     asyncio.run(run())
+
+
+def test_server_recall_budget_session(monkeypatch, tmp_path):
+    pytest.importorskip("numpy")
+    from tether import server
+
+    class Fake:
+        name = "fake-3d"
+        dims = 3
+        _AXES = [("car", "automobile", "drive"), ("pizza", "food"), ("python", "test")]
+
+        def embed(self, text):
+            import math
+            t = text.lower()
+            v = [float(sum(w in t for w in ax)) for ax in self._AXES]
+            n = math.sqrt(sum(x * x for x in v))
+            return [x / n for x in v] if n else v
+
+    monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
+    monkeypatch.delenv("TETHER_ASSOC", raising=False)
+    monkeypatch.delenv("TETHER_SEMANTIC", raising=False)
+    monkeypatch.delenv("TETHER_SYNC_URL", raising=False)
+    monkeypatch.delenv("TETHER_SYNC_TOKEN", raising=False)
+    monkeypatch.setattr("tether.embed.get_embedder", lambda *a, **k: Fake())
+    server._store = None
+    try:
+        s = server._get_store()
+        assert s._graph.enabled is True
+        a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]
+        b = s.remember("project", "Why", "rationale")["id"]
+        s.link(a, b)
+        hits = s.recall("JWT tokens", budget=8, session="sess-1")
+        assert any(h["id"] == b for h in hits)     # reached via the explicit edge
+    finally:
+        server._store = None
