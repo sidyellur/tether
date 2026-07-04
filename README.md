@@ -45,15 +45,18 @@ Requires Python ≥3.10 on a POSIX system (Linux/macOS).
 Register it with Claude Code — with [uv](https://docs.astral.sh/uv/):
 
 ```sh
-claude mcp add tether -- uvx tether
+claude mcp add tether -- uvx --from tether-memory tether
 ```
 
 …or install it first:
 
 ```sh
-pip install tether
+pip install tether-memory
 claude mcp add tether -- tether
 ```
+
+(The PyPI package is named `tether-memory` — `tether` was already reserved on
+PyPI as a common brand name — but the installed command is still `tether`.)
 
 By default memory lives in a local SQLite file at
 `~/.local/share/tether/memory.db` (override with `TETHER_DB`). No accounts, no
@@ -66,7 +69,7 @@ file becomes an embedded replica — local-speed reads, writes that propagate to
 your other devices. Install the extra and set two env vars:
 
 ```sh
-pip install 'tether[sync]'
+pip install 'tether-memory[sync]'
 export TETHER_SYNC_URL='libsql://<your-db>.turso.io'
 export TETHER_SYNC_TOKEN='<your-auth-token>'
 ```

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "tether"
+name = "tether-memory"
 version = "0.1.0"
 description = "A shared memory layer for personal agents, across devices: an MCP server over local SQLite with opt-in libSQL/Turso sync."
 readme = "README.md"
