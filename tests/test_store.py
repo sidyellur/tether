@@ -334,3 +334,40 @@ def test_migrate_backfills_valid_from_for_existing_rows():
     vf, ca = conn.execute(
         "SELECT valid_from, created_at FROM memories").fetchone()
     assert vf == ca and vf is not None
+
+
+def make_authored_store(author="sid", **kw):
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, device_id="dev", sync_now=lambda *a, **k: None,
+              author=author, **kw)
+    s.migrate()
+    return s
+
+
+def test_remember_records_author_and_valid_from():
+    s = make_authored_store("sid")
+    r = s.remember("user", "A", "a note")
+    row = s._conn.execute(
+        "SELECT author, valid_from, valid_to, created_at FROM memories WHERE id=?",
+        (r["id"],)).fetchone()
+    author, valid_from, valid_to, created_at = row
+    assert author == "sid"
+    assert valid_from == created_at
+    assert valid_to is None  # brand-new fact is current
+
+
+def test_remember_upsert_skips_superseded():
+    s = make_authored_store()
+    a = s.remember("user", "A", "first")["id"]
+    # Manually supersede it (as Task 4 would): mark it not-current.
+    s._conn.execute("UPDATE memories SET valid_to='t', superseded_by=999 WHERE id=?", (a,))
+    s._conn.commit()
+    again = s.remember("user", "A", "second")  # same title, but old one is superseded
+    assert again["action"] == "created"        # a fresh current row, not an update
+    assert again["id"] != a
+
+
+def test_remember_action_unchanged_without_consolidate():
+    s = make_authored_store()  # consolidate defaults False
+    assert s.remember("user", "A", "x")["action"] == "created"
+    assert s.remember("user", "A", "y")["action"] == "updated"  # exact-title refine

@@ -233,27 +233,38 @@ class Store:
         links_s = json.dumps(links or [])
         emb = self._embed_or_none(title, body)
         existing = self._conn.execute(
-            "SELECT id FROM memories WHERE type=? AND title_norm=?", (type, norm)
+            "SELECT id FROM memories "
+            "WHERE type=? AND title_norm=? AND valid_to IS NULL", (type, norm)
         ).fetchone()
         if existing:
             mid = existing[0]
             self._conn.execute(
-                "UPDATE memories SET title=?, body=?, tags=?, links=?, "
-                "updated_at=?, device_id=?, embedding=? WHERE id=?",
-                (title, body, tags_s, links_s, now, self._device_id, emb, mid))
+                "UPDATE memories SET title=?, body=?, tags=?, links=?, updated_at=?, "
+                "device_id=?, author=?, embedding=? WHERE id=?",
+                (title, body, tags_s, links_s, now, self._device_id,
+                 self._author, emb, mid))
             action = "updated"
         else:
+            superseded = self._find_near_duplicate(type, emb) if self._consolidate else None
             cur = self._conn.execute(
                 "INSERT INTO memories(type, title, title_norm, body, tags, links, "
-                "created_at, updated_at, device_id, embedding) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "created_at, updated_at, device_id, embedding, author, valid_from) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (type, title, norm, body, tags_s, links_s, now, now,
-                 self._device_id, emb))
+                 self._device_id, emb, self._author, now))
             mid = cur.lastrowid
             action = "created"
+            if superseded is not None:
+                self._conn.execute(
+                    "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
+                    (now, mid, superseded))
+                action = "consolidated"
         self._conn.commit()
         self._sync_now()
         return {"id": mid, "action": action}
+
+    def _find_near_duplicate(self, type, emb):
+        return None  # implemented in Task 4
 
     def _fts_ids(self, query, type=None, limit=200):
         match = _fts_query(query)
