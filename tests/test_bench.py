@@ -199,15 +199,22 @@ def test_evaluate_freeze_leaves_graph_unchanged():
 
 def test_evaluate_without_freeze_mutates_graph():
     # The contamination the freeze exists to remove: an ordinary eval pass calls
-    # touch_session on each recall, so the graph changes as it is measured.
+    # touch_session on each recall, so the learned state (hebbian edges and/or
+    # the session working set that primes later queries) changes as it is
+    # measured. B1 narrowed learning to the direct-hit head, so a single-seed
+    # query may add no NEW edge pair — but it always writes session state,
+    # which is equally contaminating (priming) and equally freeze-restored.
     import pytest
     pytest.importorskip("numpy")
     from bench import run, conditions, corpus as corpus_mod
     s, id_of = conditions.build(corpus_mod.MINI, "warmed", FakeEmbedder())
-    q = "SELECT src,dst,kind,weight FROM edges ORDER BY 1,2,3,4"
-    before = s._conn.execute(q).fetchall()
+    qe = "SELECT src,dst,kind,weight FROM edges ORDER BY 1,2,3,4"
+    qs = ("SELECT session_id,memory_id,activation FROM session_members "
+          "ORDER BY 1,2,3")
+    before = (s._conn.execute(qe).fetchall(), s._conn.execute(qs).fetchall())
     run.evaluate(s, id_of, corpus_mod.MINI, "graph_only", k=5, freeze=False)
-    assert s._conn.execute(q).fetchall() != before        # learned during eval
+    after = (s._conn.execute(qe).fetchall(), s._conn.execute(qs).fetchall())
+    assert after != before                                # learned during eval
 
 
 def test_assert_warmup_disjoint_passes_and_flags():

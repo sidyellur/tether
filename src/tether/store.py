@@ -531,7 +531,14 @@ class Store:
         tail = sorted((m for m in activation if m not in head_set),
                       key=lambda m: (-activation[m], m))
         order = (head + tail)[:limit]
-        self._graph.touch_session(sid, order)
+        # B1: learn from what the query was ABOUT (the direct-hit head), not
+        # from everything the recall returned. Spread- and priming-surfaced
+        # tail members consume session activation but never produce it —
+        # otherwise any member that once enters the session is re-surfaced by
+        # priming into the next result list, re-bumped, and re-wired: a
+        # feedback loop that wires spurious cross-task cliques at cap weight
+        # (measured on the bench corpus: 80 spurious vs 36 true edges).
+        self._graph.touch_session(sid, head)
         self._conn.commit()
         hits = self._hydrate(order)
         for h in hits:

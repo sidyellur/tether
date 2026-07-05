@@ -135,9 +135,10 @@ def run(corpus, embedder, k=10, eps=0.02):
                                      warm_fz["per_query"], eps=eps),
     }
     # The PROVEN claim: the associative graph (semantic + explicit structure)
-    # reaches connected golds that keyword+semantic search alone cannot. Measured
-    # frozen so it's contamination-free. This is the headline, not the learning
-    # delta (which the held-out measurement shows is ~0 on this corpus).
+    # reaches connected golds that keyword+semantic search alone cannot.
+    # Measured frozen so it's contamination-free. (Pre-B1 the held-out learning
+    # delta was ~0, so this structural delta was the sole headline; B1's
+    # rank-weighted head-only learning rule made the learning delta real.)
     report["structural_delta_ndcg"] = (
         cold_fz["mean"]["ndcg"]
         - go["v2"]["graph_only"]["mean"]["ndcg"])
@@ -195,7 +196,7 @@ def _print(report):
           f"{ho['learning_delta_ndcg']:+.3f}  "
           f"(cold {ho['cold_frozen_ndcg']:.3f} -> warmed "
           f"{ho['warmed_frozen_ndcg']:.3f})  dist={ho['distribution']}  "
-          f"<- usage-learning: ~0, not yet proven")
+          f"<- usage-learning, contamination-free")
     print(f"learning delta (NON-frozen, warmed-cold): "
           f"{report['learning_delta_ndcg']:+.3f}  "
           f"dist={report['learning_distribution']}  "
