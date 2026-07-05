@@ -161,10 +161,16 @@ deliberately not done.
 - Small N (11 graph_only queries, 1 hand-authored corpus): this is an
   existence proof that the learning rule was the blocker, not a
   generalization claim. Corpora B/C remain the real test.
-- Warm-up replays title-queries; real sessions query by content. The fix's
-  premise (top-1/2 direct hits ≈ what the interaction was about) is more
-  plausible for real usage than the old premise (everything returned was
-  used), but it is untested on organic usage.
+- Warm-up replays title-queries; real sessions query by content. The signal
+  the fix learns from is temporally-adjacent direct recalls within roughly
+  the 2-recall decay window (decay 0.5, floor 0.25) — not semantic
+  relatedness. In a long, topic-interleaved organic session, this will wire
+  unrelated but time-adjacent subjects together. The mitigation is that such
+  edges are weak (w≈0.5 vs cap 5.0), weight-scaled in traversal, and bounded
+  by protect-head, so this is graceful degradation rather than avoidance —
+  a documented risk, not a solved one. An organic-usage corpus with
+  interleaved topics and content (non-title) queries is exactly what
+  corpora B/C must stress to test this premise.
 - 2 of 11 queries regressed vs cold; the mean gain is not uniform.
 - The remaining 0.016 to oracle is mostly the two regressed queries plus
   edge-weight differences (2–4.5 vs cap 5.0); the rank-7–9 oracle ceiling

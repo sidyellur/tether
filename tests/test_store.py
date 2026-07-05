@@ -582,6 +582,40 @@ def test_recall_seed_not_buried_by_high_weight_hebbian_neighbor():
     assert ids.index(a) < ids.index(b)          # seed dominates the spread-reached node
 
 
+def test_learn_from_head_is_a_knob(monkeypatch):
+    # HEBBIAN_LEARN_FROM_HEAD must be reversible like the other B1 knobs: by
+    # default (True) only the protected direct-hit head can gain co-recall
+    # edges from a recall() call; flipped to False, tail members (reached only
+    # via spread/link, never a query match) can gain edges too.
+    pytest.importorskip("numpy")
+    import tether.graph as graph_mod
+
+    def hebbian_pairs(s):
+        return {tuple(sorted((r[0], r[1]))) for r in s._conn.execute(
+            "SELECT src, dst FROM edges WHERE kind='hebbian'").fetchall()}
+
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]
+    b = s.remember("project", "Auth rationale", "JWT tokens were chosen for scaling")["id"]
+    c = s.remember("project", "Picnic", "quarterly pizza budget review")["id"]
+    s.link(a, c)                                   # c never matches the query
+    s.recall("JWT tokens", budget=8)
+    edges_on = hebbian_pairs(s)
+    assert tuple(sorted((a, b))) in edges_on        # both direct hits (head) wired
+    assert tuple(sorted((a, c))) not in edges_on    # tail-only neighbor NOT wired
+    assert tuple(sorted((b, c))) not in edges_on
+
+    monkeypatch.setattr(graph_mod, "HEBBIAN_LEARN_FROM_HEAD", False)
+    s2 = make_assoc_store()
+    a2 = s2.remember("user", "Auth", "we switched to JWT tokens")["id"]
+    b2 = s2.remember("project", "Auth rationale", "JWT tokens were chosen for scaling")["id"]
+    c2 = s2.remember("project", "Picnic", "quarterly pizza budget review")["id"]
+    s2.link(a2, c2)
+    s2.recall("JWT tokens", budget=8)
+    edges_off = hebbian_pairs(s2)
+    assert tuple(sorted((a2, c2))) in edges_off     # now the tail neighbor gets wired too
+
+
 def make_b1_store(assoc=True, **kw):
     conn = sqlite3.connect(":memory:")
     s = Store(conn, "d", lambda *a, **k: None, assoc=assoc, **kw)

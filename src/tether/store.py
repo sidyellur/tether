@@ -10,6 +10,7 @@ import re
 import struct
 from datetime import datetime, timezone
 
+from . import graph
 from .graph import Graph
 
 VALID_TYPES = ("user", "feedback", "project", "reference")
@@ -538,7 +539,12 @@ class Store:
         # priming into the next result list, re-bumped, and re-wired: a
         # feedback loop that wires spurious cross-task cliques at cap weight
         # (measured on the bench corpus: 80 spurious vs 36 true edges).
-        self._graph.touch_session(sid, head)
+        # HEBBIAN_LEARN_FROM_HEAD is a knob (default True == the above): False
+        # reverts to learning from the full returned order (pre-B1 behavior).
+        # Read as a module attribute (not imported by value) so a test can
+        # flip it at runtime via monkeypatch.
+        learn_ids = head if graph.HEBBIAN_LEARN_FROM_HEAD else order
+        self._graph.touch_session(sid, learn_ids)
         self._conn.commit()
         hits = self._hydrate(order)
         for h in hits:

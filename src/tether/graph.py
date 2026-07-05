@@ -30,10 +30,13 @@ HEBBIAN_TOP_M = 8
 # squat the Hebbian top-M) and (b) wires dense spurious cliques at cap.
 # HEBBIAN_BUMP_DECAY=1.0 with HEBBIAN_WIRE_FLOOR=0.0 restores the old rule
 # exactly. HEBBIAN_WIRE_FLOOR gates pair-wiring to members that are genuinely
-# active (recently a top-2 subject), so straggler noise in a sparse session
+# active (recently a top-3 subject), so straggler noise in a sparse session
 # does not get wired merely for surviving the TTL.
 HEBBIAN_BUMP_DECAY = 0.5
 HEBBIAN_WIRE_FLOOR = 0.25
+# True = learn from the protected direct-hit head (B1 default); False = learn
+# from the full returned order (pre-B1 behavior).
+HEBBIAN_LEARN_FROM_HEAD = True
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS edges (
