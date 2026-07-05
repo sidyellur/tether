@@ -159,18 +159,58 @@ def test_touch_session_primes_and_decays():
     g = make_graph()
     g.touch_session("s", [1, 2])
     a1 = g.session_activation("s")
-    assert a1[1] == 1.0 and a1[2] == 1.0
-    g.touch_session("s", [2])                       # decays 1&2, bumps 2
+    # rank-weighted bump: rank0 -> 1.0, rank1 -> 0.5 (B1)
+    assert a1[1] == 1.0 and a1[2] == 0.5
+    g.touch_session("s", [2])                       # decays 1&2, bumps 2 (rank0)
     a2 = g.session_activation("s")
-    assert a2[1] == 0.5 and a2[2] == 1.5
+    assert a2[1] == 0.5 and a2[2] == 1.25
 
 
 def test_touch_session_lays_hebbian_edges():
     g = make_graph()
-    g.touch_session("s", [1, 2, 3])                 # all co-active
+    g.touch_session("s", [1, 2, 3])                 # ranks 0,1,2 -> 1.0/0.5/0.25
     w = g._conn.execute(
         "SELECT COUNT(*) FROM edges WHERE kind='hebbian'").fetchone()[0]
     assert w == 3                                   # pairs (1,2),(1,3),(2,3)
+
+
+def test_touch_session_bump_is_rank_weighted_not_uniform():
+    # B1 root cause: a uniform bump over the whole returned list makes
+    # activation carry no information (mass ties -> memory_id tie-break decides
+    # the Hebbian top-M). The bump must decay geometrically with result rank so
+    # the recall's SUBJECT dominates its working-set contribution.
+    g = make_graph()
+    g.touch_session("s", list(range(1, 21)))        # a full returned list
+    a = g.session_activation("s")
+    assert a[1] == 1.0 and a[2] == 0.5 and a[3] == 0.25
+    # deep-tail padding never enters the working set at all
+    assert 10 not in a and 20 not in a
+    assert len(set(a.values())) == len(a)           # no ties -> no id squatting
+
+
+def test_touch_session_wire_floor_excludes_weak_members():
+    # members below HEBBIAN_WIRE_FLOOR stay in the session (priming) but are
+    # not Hebbian-wired: co-return is not co-use.
+    g = make_graph()
+    g.touch_session("s", [1, 2, 3, 4])              # rank3 bump 0.125 < floor
+    pairs = {(r[0], r[1]) for r in g._conn.execute(
+        "SELECT src, dst FROM edges WHERE kind='hebbian'").fetchall()}
+    assert pairs == {(1, 2), (1, 3), (2, 3)}        # nothing wired to 4
+    assert 4 in g.session_activation("s")           # but 4 still primes
+
+
+def test_touch_session_old_uniform_rule_is_a_knob_setting(monkeypatch):
+    # degrade path: BUMP_DECAY=1.0 + WIRE_FLOOR=0.0 IS the pre-B1 rule.
+    import tether.graph as graph_mod
+    monkeypatch.setattr(graph_mod, "HEBBIAN_BUMP_DECAY", 1.0)
+    monkeypatch.setattr(graph_mod, "HEBBIAN_WIRE_FLOOR", 0.0)
+    g = make_graph()
+    g.touch_session("s", [1, 2])
+    a1 = g.session_activation("s")
+    assert a1[1] == 1.0 and a1[2] == 1.0
+    g.touch_session("s", [2])
+    a2 = g.session_activation("s")
+    assert a2[1] == 0.5 and a2[2] == 1.5
 
 
 def test_degree_map_behavioral_only_excludes_semantic():

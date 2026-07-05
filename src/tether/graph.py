@@ -21,6 +21,22 @@ SESSION_TTL_ACTIVATION = 0.05
 HEBBIAN_INCREMENT = 0.5
 HEBBIAN_CAP = 5.0
 HEBBIAN_TOP_M = 8
+# Rank-weighted session bump (B1): the id at rank r of a recall's result list
+# is bumped by HEBBIAN_BUMP_DECAY**r instead of a uniform +1.0. A recall's
+# working-set contribution then reflects what the recall was ABOUT (its top
+# hits), not everything it happened to return — a returned list is mostly
+# padding, and bumping all of it uniformly (a) makes activation carry no
+# information (mass ties, broken by memory_id, so low-id memories permanently
+# squat the Hebbian top-M) and (b) wires dense spurious cliques at cap.
+# HEBBIAN_BUMP_DECAY=1.0 with HEBBIAN_WIRE_FLOOR=0.0 restores the old rule
+# exactly. HEBBIAN_WIRE_FLOOR gates pair-wiring to members that are genuinely
+# active (recently a top-3 subject), so straggler noise in a sparse session
+# does not get wired merely for surviving the TTL.
+HEBBIAN_BUMP_DECAY = 0.5
+HEBBIAN_WIRE_FLOOR = 0.25
+# True = learn from the protected direct-hit head (B1 default); False = learn
+# from the full returned order (pre-B1 behavior).
+HEBBIAN_LEARN_FROM_HEAD = True
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS edges (
@@ -301,16 +317,19 @@ class Graph:
             self._conn.execute(
                 "UPDATE session_members SET activation = activation * ?, updated_at=? "
                 "WHERE session_id=?", (SESSION_DECAY, now, session_id))
-            for mid in ordered_ids:
+            for rank, mid in enumerate(ordered_ids):
+                bump = HEBBIAN_BUMP_DECAY ** rank
+                if bump < SESSION_TTL_ACTIVATION:
+                    break  # geometric: every later rank is smaller still
                 self._conn.execute(
                     "INSERT INTO session_members(session_id, memory_id, activation, updated_at) "
                     "VALUES (?,?,?,?) ON CONFLICT(session_id, memory_id) "
-                    "DO UPDATE SET activation = session_members.activation + 1.0, updated_at=?",
-                    (session_id, mid, 1.0, now, now))
+                    "DO UPDATE SET activation = session_members.activation + ?, updated_at=?",
+                    (session_id, mid, bump, now, bump, now))
             active = [r[0] for r in self._conn.execute(
                 "SELECT memory_id FROM session_members WHERE session_id=? "
-                "ORDER BY activation DESC, memory_id LIMIT ?",
-                (session_id, HEBBIAN_TOP_M)).fetchall()]
+                "AND activation >= ? ORDER BY activation DESC, memory_id LIMIT ?",
+                (session_id, HEBBIAN_WIRE_FLOOR, HEBBIAN_TOP_M)).fetchall()]
             for i in range(len(active)):
                 for j in range(i + 1, len(active)):
                     self._upsert_edge(active[i], active[j], "hebbian",
