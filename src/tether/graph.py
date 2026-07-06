@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS session_members (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (session_id, memory_id)
 );
+CREATE INDEX IF NOT EXISTS idx_session_members_updated ON session_members(updated_at);
 CREATE TABLE IF NOT EXISTS crystallize_dismissed (
     src INTEGER NOT NULL,
     dst INTEGER NOT NULL,
