@@ -42,7 +42,7 @@ _INITIAL_SYNC_TIMEOUT = 5.0
 _BUSY_TIMEOUT_MS = 5000
 
 
-def _local(db_path):
+def _local(db_path, mode="local"):
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     # WAL lets readers (e.g. recall) proceed alongside a writer instead of
     # blocking; busy_timeout makes a contended write retry instead of an
@@ -50,7 +50,7 @@ def _local(db_path):
     # associative graph is enabled, so concurrent recalls can contend).
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-    return conn, (lambda timeout=2.0: None)
+    return conn, (lambda timeout=2.0: None), mode
 
 
 def _safe_sync(conn):
@@ -94,14 +94,19 @@ def _open_replica(db_path, sync_cfg):
         t.start()
         t.join(timeout)  # bounded: a hung sync never blocks a read
 
-    return conn, sync_now
+    return conn, sync_now, "replica"
 
 
 def open_connection(db_path, sync_cfg):
+    """Returns (conn, sync_now, mode). mode is "local" (no sync configured),
+    "replica" (embedded libSQL replica live), or "degraded" (sync was
+    configured but the replica path failed, so it fell back to the local
+    file) - the status resource (#51) surfaces this to tell "sync isn't
+    configured" apart from "sync is configured but broken"."""
     if sync_cfg is None:
         return _local(db_path)
     try:
         return _open_replica(db_path, sync_cfg)
     except Exception as e:  # import missing, connect failed, initial sync failed
         sys.stderr.write(f"tether: sync offline ({e}); using local file\n")
-        return _local(db_path)
+        return _local(db_path, mode="degraded")

@@ -117,14 +117,85 @@ def test_link_missing_id_raises():
         s.link(a, 9999)
 
 
-def test_forget_deletes_and_reports_existence():
+def test_forget_soft_deletes_and_reports_existence():
     s = make_store()
     a = s.remember("user", "A", "a")["id"]
     assert s.forget(a) == {"forgotten": a, "existed": True}
     assert s.forget(a) == {"forgotten": a, "existed": False}
+    # soft-delete: row retained, just marked no-longer-current
+    assert s._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+    valid_to = s._conn.execute(
+        "SELECT valid_to FROM memories WHERE id=?", (a,)).fetchone()[0]
+    assert valid_to is not None
+    assert s.recall("A") == []
+
+
+def test_forget_is_reversible():
+    s = make_store()
+    a = s.remember("user", "A", "a")["id"]
+    s.forget(a)
+    s._conn.execute("UPDATE memories SET valid_to=NULL WHERE id=?", (a,))
+    s._conn.commit()
+    assert a in [h["id"] for h in s.recall("A")]
+
+
+def test_forget_keeps_edges_for_reversibility():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+    a = s.remember("user", "A", "x")["id"]
+    b = s.remember("project", "B", "y")["id"]
+    s.link(a, b)
+    s.forget(a)
+    assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] >= 1
+
+
+def test_forget_nonexistent_id_reports_false():
+    s = make_store()
+    assert s.forget(9999) == {"forgotten": 9999, "existed": False}
+
+
+def test_purge_hard_deletes():
+    s = make_store()
+    a = s.remember("user", "A", "a")["id"]
+    assert s.purge(a) == {"purged": a, "existed": True}
+    assert s.purge(a) == {"purged": a, "existed": False}
     assert s._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
     # deleted rows leave no FTS ghost
     assert s.recall("A") == []
+
+
+def test_purge_removes_edges():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+    a = s.remember("user", "A", "x")["id"]
+    b = s.remember("project", "B", "y")["id"]
+    s.link(a, b)
+    s.purge(a)
+    assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+
+
+def test_export_all_returns_current_memories_as_json_ready_dicts():
+    s = make_store()
+    a = s.remember("user", "A", "body a", tags="x,y")["id"]
+    b = s.remember("project", "B", "body b")["id"]
+    s.link(a, b)
+    s.forget(b)
+    out = s.export_all()
+    assert len(out) == 1
+    assert out[0]["id"] == a
+    assert out[0]["title"] == "A"
+    assert out[0]["tags"] == "x,y"
+    assert out[0]["links"] == [b]
+    _json.dumps(out)  # must be JSON-serializable as-is
+
+
+def test_export_all_empty_store():
+    s = make_store()
+    assert s.export_all() == []
 
 
 def test_boot_index_lists_newest_first():
@@ -198,10 +269,52 @@ def test_backfill_resets_when_model_changes():
     s.remember("user", "A", "car")          # embedding still NULL (embed-on-write is Task 4)
     assert s.backfill_embeddings() == 1     # embeds it; records model=fake-3d
     assert s.backfill_embeddings() == 0     # nothing left to embed
-    s._meta_set("embedding_model", "a-different-model")
+    key = s._embedding_meta_key("embedding_model")
+    s._meta_set(key, "a-different-model")
     s._conn.commit()
     assert s.backfill_embeddings() == 1     # model changed -> cleared + re-embedded
-    assert s._meta_get("embedding_model") == "fake-3d"
+    assert s._meta_get(key) == "fake-3d"
+
+
+def test_backfill_embedding_model_key_is_per_device_scoped():
+    # #45: two "devices" sharing one DB/meta table, each configured with a
+    # different embedding model, must each converge after their own first
+    # backfill instead of re-wiping and re-embedding forever on every boot.
+    class ModelA:
+        name, dims = "model-a", 3
+
+        def embed(self, text):
+            return [1.0, 0.0, 0.0]
+
+    class ModelB:
+        name, dims = "model-b", 3
+
+        def embed(self, text):
+            return [0.0, 1.0, 0.0]
+
+    conn = sqlite3.connect(":memory:")
+    dev_a = Store(conn, device_id="dev-a", sync_now=lambda *a, **k: None,
+                  embedder=ModelA(), author="dev-a")
+    dev_a.migrate()
+    dev_a.remember("user", "T", "b")
+    assert dev_a.backfill_embeddings() == 1    # first run ever: embeds under model-a
+    assert dev_a.backfill_embeddings() == 0    # stable: no re-wipe on a second call
+
+    dev_b = Store(conn, device_id="dev-b", sync_now=lambda *a, **k: None,
+                  embedder=ModelB(), author="dev-b")
+    dev_b.migrate()
+    assert dev_b.backfill_embeddings() == 1    # dev-b's own first run: wipes + re-embeds
+
+    # dev-a "reboots" (fresh process, same synced meta table). Its own scoped
+    # key still says model-a == its current model, so it must NOT re-wipe -
+    # the pre-fix global key would see dev-b's write and re-trigger here.
+    dev_a2 = Store(conn, device_id="dev-a", sync_now=lambda *a, **k: None,
+                   embedder=ModelA(), author="dev-a")
+    assert dev_a2.backfill_embeddings() == 0
+
+    keys = {k: v for k, v in conn.execute("SELECT key, value FROM meta").fetchall()}
+    assert keys["embedding_model:dev-a"] == "model-a"
+    assert keys["embedding_model:dev-b"] == "model-b"
 
 
 def test_migrate_upgrades_a_populated_pre_embedding_db():
@@ -664,11 +777,16 @@ def test_boot_index_recent_only_when_no_behavioral_hubs():
     assert len(idx.splitlines()) == 4             # bounded to cap
 
 
-def test_boot_index_unbounded_when_graph_disabled():
+def test_boot_index_still_capped_when_graph_disabled():
+    # #52: the size cap must apply regardless of graph state - only the
+    # curation strategy (hub vs. plain-recency) depends on having a graph.
     s = make_b1_store(assoc=False, boot_index_cap=4)   # graph OFF
-    for i in range(8):
-        s.remember("user", f"T{i}", "b")
-    assert len(s.boot_index().splitlines()) == 8       # no curation without a graph
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(8)]
+    lines = s.boot_index().splitlines()
+    assert len(lines) == 4                             # still capped
+    assert "# Load-bearing" not in lines[0]             # no hub curation, just recency
+    newest_four = list(reversed(ids))[:4]
+    assert [f"#{mid}" in ln for mid, ln in zip(newest_four, lines)] == [True] * 4
 
 
 _OLD = "2020-01-01T00:00:00+00:00"
@@ -938,7 +1056,7 @@ def _make_degradable_store(tmp_path):
     to that same file, matching what server.py wires up for a replica.
     Swap in a _DeadReplica AFTER seeding any rows a test needs."""
     db_path = tmp_path / "m.db"
-    conn, sync_now = sync._local(db_path)
+    conn, sync_now, _mode = sync._local(db_path)
     s = Store(conn, "d", sync_now, db_path=db_path)
     s.migrate()
     return s, db_path
