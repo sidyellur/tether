@@ -496,11 +496,20 @@ class Store:
                               incoming_links, now, emb, existing) -> tuple:
         """Atomic upsert via a partial-unique-index ON CONFLICT target (#41).
         Safe even if `existing` is stale (raced by a concurrent writer since
-        the probe SELECT): the DB resolves the real conflict, not us."""
-        if existing is not None:
-            links_s = self._merge_links(existing[1], incoming_links)
-        else:
-            links_s = json.dumps(incoming_links)
+        the probe SELECT): the DB resolves the real conflict, not us.
+
+        The links merge itself must happen inside this same statement rather
+        than in Python from `existing` - `existing` can be stale under a
+        genuine race (two connections both probe a brand-new title, both see
+        no row, both pass different `links`). Merging from that stale
+        snapshot would make the losing side's DO UPDATE branch *replace*
+        rather than merge the winner's links, reintroducing #47's clobber
+        inside the exact race #41 exists to close. SQLite evaluates
+        `memories.links` in the SET clause against the row's true current
+        value at conflict time, so unioning it with `excluded.links` here is
+        correct regardless of who actually won the race.
+        """
+        links_s = json.dumps(incoming_links)
         superseded = (self._find_near_duplicate(type, emb)
                       if (existing is None and self._consolidate) else None)
         self._conn.execute(
@@ -509,11 +518,13 @@ class Store:
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(type, title_norm) WHERE valid_to IS NULL DO UPDATE SET "
             "title=excluded.title, body=excluded.body, tags=excluded.tags, "
-            "links=?, updated_at=excluded.updated_at, "
-            "device_id=excluded.device_id, author=excluded.author, "
-            "embedding=excluded.embedding",
+            "links=(SELECT json_group_array(value) FROM ("
+            "    SELECT value FROM json_each(memories.links) "
+            "    UNION SELECT value FROM json_each(excluded.links))), "
+            "updated_at=excluded.updated_at, device_id=excluded.device_id, "
+            "author=excluded.author, embedding=excluded.embedding",
             (type, title, norm, body, tags_s, links_s, now, now,
-             self._device_id, emb, self._author, now, links_s))
+             self._device_id, emb, self._author, now))
         # lastrowid isn't reliable across the ON CONFLICT DO UPDATE branch (it
         # only advances on an actual insert), so re-resolve the current row
         # to get both its id and whether this call created it.
