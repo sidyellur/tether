@@ -22,11 +22,24 @@ agent more useful when present, and never breaks the agent's work when degraded.
 
 ## Status
 
-v0.1 is implemented. Design and rationale: [`docs/superpowers/specs/2026-07-03-tether-design.md`](docs/superpowers/specs/2026-07-03-tether-design.md). Implementation plan: [`docs/superpowers/plans/2026-07-03-tether-v0.1-implementation.md`](docs/superpowers/plans/2026-07-03-tether-v0.1-implementation.md).
+**v0.5.1.** The core (four memory verbs + boot index + FTS5) shipped in v0.1;
+since then recall has grown a semantic arm, consolidation, an associative usage
+graph, a self-organizing store, and opt-in crystallization — each additive and
+each degrading cleanly to plain keyword recall. Every feature below is
+implemented.
+
+Design and rationale start at
+[`docs/superpowers/specs/2026-07-03-tether-design.md`](docs/superpowers/specs/2026-07-03-tether-design.md);
+the associative core, seed-dominant recall, self-organizing store (Tier B1), and
+crystallization (Tier B2) each have their own design doc under
+[`docs/superpowers/specs/`](docs/superpowers/specs/), with matching plans in
+[`docs/superpowers/plans/`](docs/superpowers/plans/).
 
 ## Design at a glance
 
-- **Four verbs**, nothing more: `remember` · `recall` · `link` · `forget`.
+- **Four memory verbs**: `remember` · `recall` · `link` · `forget`. (Enabling
+  crystallization adds one reflection-control tool, `dismiss_cluster` — not a
+  memory operation.)
 - **Upsert on write** so the store doesn't rot into near-duplicates.
 - **Rich recall** (id, type, title, body, tags, `updated_at`) so an agent can
   judge staleness and cite what it updates.
@@ -201,12 +214,15 @@ principle-worthy is a strong signal.
 
 | Tool | What it does |
 |---|---|
-| `remember(type, title, body, tags?, links?)` | Save a memory; upserts on `type`+`title` so facts refine rather than duplicate |
+| `remember(type, title, body, tags?, links?, crystallizes?)` | Save a memory; upserts on `type`+`title` so facts refine rather than duplicate. `crystallizes=[ids]` writes it as a principle over those sources (needs `TETHER_CRYSTALLIZE`) |
 | `recall(query, type?, limit?, budget?, session?)` | Hybrid keyword + semantic search, then follows the usage graph to related memories; returns id/type/title/body/tags/updated_at + a `via` receipt |
 | `link(id_a, id_b)` | Bidirectional link between two memories |
-| `forget(id)` | Delete a memory |
+| `forget(id)` | Permanently delete a memory |
+| `dismiss_cluster(id_a, id_b)` | Reflection control (crystallization): drop the candidate cluster nucleated by peak edge `(id_a, id_b)` so it isn't re-surfaced. Not a memory operation; only relevant with `TETHER_CRYSTALLIZE` |
 
-Plus an auto-loaded resource `tether://memory-index` — a compact one-line-per-memory index surfaced each session.
+Plus two resources: the auto-loaded `tether://memory-index` (a compact
+one-line-per-memory index surfaced each session) and, with `TETHER_CRYSTALLIZE`,
+the pull-only `tether://crystallization` (candidate clusters for a reflection pass).
 
 ## License
 
