@@ -78,6 +78,28 @@ def _tags_to_str(tags) -> str:
     return ",".join(t.strip() for t in parts if t and t.strip())
 
 
+def _parse_tags(tags) -> list:
+    """Split a tag filter (comma-separated string or iterable) into normalized
+    tokens. [] when there is nothing to filter on."""
+    if not tags:
+        return []
+    if isinstance(tags, str):
+        parts = tags.split(",")
+    else:
+        parts = list(tags)
+    return [t.strip() for t in parts if t and t.strip()]
+
+
+def _tags_match(stored_tags: str, required: list) -> bool:
+    """Exact membership check: every tag in `required` must be one of the
+    stored tags, split on commas - never a substring/LIKE match, so
+    "proj:tether" never matches "proj:tether2"."""
+    if not required:
+        return True
+    stored = {t.strip() for t in stored_tags.split(",") if t.strip()}
+    return all(t in stored for t in required)
+
+
 def _dedupe_links(links) -> list:
     """Order-preserving de-dupe of a links list, tolerant of None (#47)."""
     seen = set()
@@ -452,6 +474,7 @@ class Store:
             self._conn.execute(
                 "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
                 (now, mid, superseded))
+            self._graph.unprime(superseded)
             action = "consolidated"
         return mid, action
 
@@ -483,6 +506,7 @@ class Store:
             self._conn.execute(
                 "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
                 (now, mid, superseded))
+            self._graph.unprime(superseded)
             action = "consolidated"
         return mid, action
 
@@ -550,6 +574,7 @@ class Store:
                     continue                        # behaviorally connected -> keep
                 self._conn.execute(
                     "UPDATE memories SET valid_to=? WHERE id=?", (now, mid))
+                self._graph.unprime(mid)
                 archived += 1
             if archived:
                 self._conn.commit()
@@ -641,7 +666,7 @@ class Store:
         placeholders = ",".join("?" for _ in ids)
         rows = self._conn.execute(
             f"SELECT id, type, title, body, tags, updated_at FROM memories "
-            f"WHERE id IN ({placeholders})", ids).fetchall()
+            f"WHERE id IN ({placeholders}) AND valid_to IS NULL", ids).fetchall()
         by_id = {r[0]: {"id": r[0], "type": r[1], "title": r[2],
                         "body": r[3], "tags": r[4], "updated_at": r[5]}
                  for r in rows}
@@ -670,10 +695,40 @@ class Store:
                     _age_days(updated[mid], now), self._decay_half_life_days)
         return scores
 
-    def recall(self, query, type=None, limit=20, budget=None, session=None) -> list:
+    def _tags_of_many(self, ids) -> dict:
+        if not ids:
+            return {}
+        ph = ",".join("?" for _ in ids)
+        return {r[0]: r[1] for r in self._conn.execute(
+            f"SELECT id, tags FROM memories WHERE id IN ({ph})", ids).fetchall()}
+
+    def _recall_by_tags(self, type, tag_list, limit) -> list:
+        """Exact-match tag retrieval, bypassing ranked search and the
+        associative graph entirely: every current memory whose tags are a
+        superset of `tag_list`, newest first within `limit` - deterministic,
+        not subject to FTS/semantic ranking dropping a real match (#50)."""
+        sql = "SELECT id, tags FROM memories WHERE valid_to IS NULL"
+        params = []
+        if type is not None:
+            sql += " AND type = ?"
+            params.append(type)
+        sql += " ORDER BY updated_at DESC, id DESC"
+        rows = self._conn.execute(sql, params).fetchall()
+        ids = [mid for mid, tags_s in rows if _tags_match(tags_s, tag_list)]
+        return self._hydrate(ids[:limit])
+
+    def recall(self, query, type=None, limit=20, budget=None, session=None,
+               tags=None) -> list:
+        tag_list = _parse_tags(tags)
         if not query or not query.strip():
-            return []
+            if not tag_list:
+                return []
+            return self._recall_by_tags(type, tag_list, limit)
         seeds = self._seed_scores(query, type)
+        if tag_list:
+            tags_by_id = self._tags_of_many(list(seeds))
+            seeds = {mid: s for mid, s in seeds.items()
+                     if _tags_match(tags_by_id.get(mid, ""), tag_list)}
         if not self._graph.enabled:
             if not seeds:
                 return []
@@ -689,7 +744,9 @@ class Store:
         activated = dict(seeds)
         for mid, a in self._graph.session_activation(sid).items():
             activated[mid] = activated.get(mid, 0.0) + _PRIMING_WEIGHT * a
-        if not activated:
+        # gate on `seeds`, not the union with primed `activated` - a query with
+        # no real hits must not surface a session's primed context (#46).
+        if not seeds:
             return []
         activation, receipts = self._graph.spread(activated, budget, type)
         # protect-head / re-rank-tail. The #15 seed floor bounds `seeds` to
@@ -705,6 +762,12 @@ class Store:
         head_set = set(head)
         tail = sorted((m for m in activation if m not in head_set),
                       key=lambda m: (-activation[m], m))
+        if tag_list:
+            # a tag filter must hold for the whole result, not just the seed
+            # tier - otherwise associative spread could hand back a hit the
+            # filter was supposed to exclude.
+            tail_tags = self._tags_of_many(tail)
+            tail = [m for m in tail if _tags_match(tail_tags.get(m, ""), tag_list)]
         order = (head + tail)[:limit]
         # B1: learn from what the query was ABOUT (the direct-hit head), not
         # from everything the recall returned. Spread- and priming-surfaced
@@ -784,6 +847,8 @@ class Store:
         cur = self._conn.execute(
             "UPDATE memories SET valid_to=? WHERE id=? AND valid_to IS NULL",
             (now, id))
+        if cur.rowcount > 0:
+            self._graph.unprime(id)          # #42: don't let it linger as primed context
         self._conn.commit()
         self._sync_now()
         return {"forgotten": id, "existed": cur.rowcount > 0}

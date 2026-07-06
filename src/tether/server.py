@@ -87,8 +87,8 @@ def remember(type: str, title: str, body: str,
 
 
 @mcp.tool()
-def recall(query: str, type: str = None, limit: int = 20,
-           budget: int = None, session: str = None) -> dict:
+def recall(query: str = "", type: str = None, limit: int = 20,
+           budget: int = None, session: str = None, tags: str = None) -> dict:
     """Search memories by keyword and semantic similarity, then follow the
     usage graph to related memories, most relevant first.
 
@@ -99,15 +99,21 @@ def recall(query: str, type: str = None, limit: int = 20,
     via remember/link.
 
     Args:
-        query: free text; punctuation is safe.
+        query: free text; punctuation is safe. May be omitted if `tags` is given.
         type: optional filter ("user"/"feedback"/"project"/"reference").
         limit: max results (default 20).
         budget: how far to follow associations (0 = direct matches only).
         session: optional id grouping related recalls so they prime each other.
+        tags: optional comma-separated tags; exact-match filter (a memory must
+            carry every listed tag). Combine with `query` to filter its ranked
+            hits, or use alone (query omitted) to list every current memory
+            with those tags, newest first, deterministic rather than
+            ranked - raise `limit` to fetch beyond the default page size.
     """
     try:
         return {"results": _get_store().recall(
-            query, type=type, limit=limit, budget=budget, session=session)}
+            query, type=type, limit=limit, budget=budget, session=session,
+            tags=tags)}
     except Exception as e:
         return {"error": str(e)}
 
