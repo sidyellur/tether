@@ -155,6 +155,21 @@ def test_forget_nonexistent_id_reports_false():
     assert s.forget(9999) == {"forgotten": 9999, "existed": False}
 
 
+def test_forget_unprimes_session_members():
+    # #42: forget() is a third valid_to-setting transition (alongside
+    # consolidation and the forgetting sweep) - it must scrub session_members
+    # too, or a soft-forgotten memory keeps inflating a session's priming.
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+    a = s.remember("user", "A", "x")["id"]
+    s._graph.touch_session("sess1", [a])
+    assert a in s._graph.session_activation("sess1")
+    s.forget(a)
+    assert a not in s._graph.session_activation("sess1")
+
+
 def test_purge_hard_deletes():
     s = make_store()
     a = s.remember("user", "A", "a")["id"]

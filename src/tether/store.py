@@ -824,6 +824,8 @@ class Store:
         cur = self._conn.execute(
             "UPDATE memories SET valid_to=? WHERE id=? AND valid_to IS NULL",
             (now, id))
+        if cur.rowcount > 0:
+            self._graph.unprime(id)          # #42: don't let it linger as primed context
         self._conn.commit()
         self._sync_now()
         return {"forgotten": id, "existed": cur.rowcount > 0}
