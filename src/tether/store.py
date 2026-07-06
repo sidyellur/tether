@@ -9,6 +9,7 @@ import json
 import re
 import struct
 import sys
+import warnings
 from datetime import datetime, timezone
 
 from . import graph, sync
@@ -29,7 +30,10 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at TEXT NOT NULL,
     device_id  TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_memories_dedup ON memories(type, title_norm);
+-- idx_memories_dedup is created/upgraded in _ensure_dedup_unique_index(), not
+-- here: it needs to become a partial UNIQUE index (#41) but must degrade
+-- gracefully on a live DB that already has duplicate current rows, which
+-- plain executescript() can't express.
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
     USING fts5(title, body, tags, content='memories', content_rowid='id');
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
@@ -73,6 +77,17 @@ def _tags_to_str(tags) -> str:
     else:
         parts = list(tags)
     return ",".join(t.strip() for t in parts if t and t.strip())
+
+
+def _dedupe_links(links) -> list:
+    """Order-preserving de-dupe of a links list, tolerant of None (#47)."""
+    seen = set()
+    out = []
+    for x in (links or []):
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 
 def _fts_query(raw: str):
@@ -180,6 +195,9 @@ class Store:
         self._cryst_sig = None
         self._cryst_cache = []
         self._graph = Graph(conn, enabled=assoc)
+        # Set for real by migrate()'s _ensure_dedup_unique_index(); defaults
+        # to the conservative (locking) path if migrate() is somehow skipped.
+        self._has_unique_dedup_index = False
         self._boot_index_cap = boot_index_cap
         self._forget = forget
         self._forget_age_days = forget_age_days
@@ -230,6 +248,7 @@ class Store:
             # not-yet-rebuilt FTS5 shadow index corrupts it.
             self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
         self._ensure_consolidation_columns()
+        self._ensure_dedup_unique_index()
         self._graph.migrate()
         if self._graph.enabled:
             pairs = []
@@ -266,6 +285,50 @@ class Store:
         # heal any row missing valid_from (legacy or a NULL'd column)
         self._conn.execute(
             "UPDATE memories SET valid_from = created_at WHERE valid_from IS NULL")
+
+    def _ensure_dedup_unique_index(self) -> None:
+        """Make idx_memories_dedup a partial UNIQUE index on
+        (type, title_norm) WHERE valid_to IS NULL, so remember()'s upsert can
+        rely on `INSERT ... ON CONFLICT` for true cross-connection atomicity
+        (#41) instead of a racy probe-SELECT-then-INSERT.
+
+        Sets self._has_unique_dedup_index so remember() knows which upsert
+        strategy is safe to use. Must run after _ensure_consolidation_columns
+        (needs the valid_to column) and requires only executescript-level DDL,
+        so it can't live in _SCHEMA: it degrades instead of crashing when a
+        live DB already has duplicate CURRENT rows for some (type,
+        title_norm) - only reachable via the very race this fix closes - by
+        warning and keeping the plain index, so remember() falls back to a
+        BEGIN IMMEDIATE-guarded probe instead of the DB constraint.
+        """
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' "
+            "AND name='idx_memories_dedup'").fetchone()
+        if row is not None and row[0] and "UNIQUE" not in row[0].upper():
+            # Upgrading from a pre-#41 plain index: drop it so the CREATE
+            # UNIQUE INDEX below (which is IF NOT EXISTS, so a same-named
+            # index would otherwise be left alone) actually takes effect.
+            self._conn.execute("DROP INDEX idx_memories_dedup")
+            row = None
+        if row is not None:
+            self._has_unique_dedup_index = True
+            return
+        try:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedup "
+                "ON memories(type, title_norm) WHERE valid_to IS NULL")
+            self._has_unique_dedup_index = True
+        except Exception:
+            warnings.warn(
+                "tether: duplicate current memories already exist for some "
+                "(type, title) - could not create the unique dedup index "
+                "(#41). remember() will fall back to a locking upsert until "
+                "the duplicates are resolved by hand.",
+                RuntimeWarning, stacklevel=2)
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_dedup "
+                "ON memories(type, title_norm)")
+            self._has_unique_dedup_index = False
 
     def _meta_get(self, key):
         row = self._conn.execute(
@@ -337,35 +400,36 @@ class Store:
         now = _now()
         norm = _norm(title)
         tags_s = _tags_to_str(tags)
-        links_s = json.dumps(links or [])
+        incoming_links = _dedupe_links(links)
         emb = self._embed_or_none(title, body)
-        existing = self._conn.execute(
-            "SELECT id FROM memories "
-            "WHERE type=? AND title_norm=? AND valid_to IS NULL", (type, norm)
-        ).fetchone()
-        if existing:
-            mid = existing[0]
-            self._conn.execute(
-                "UPDATE memories SET title=?, body=?, tags=?, links=?, updated_at=?, "
-                "device_id=?, author=?, embedding=? WHERE id=?",
-                (title, body, tags_s, links_s, now, self._device_id,
-                 self._author, emb, mid))
-            action = "updated"
+
+        if self._has_unique_dedup_index:
+            # The partial unique index (#41) makes the upsert itself the
+            # source of truth: a probe SELECT here is only an optimization
+            # (to decide "created" vs "updated" and whether to run the
+            # consolidate check), never a correctness requirement, because
+            # the INSERT below uses ON CONFLICT to resolve atomically even
+            # if another connection created/removed the row in between.
+            existing = self._conn.execute(
+                "SELECT id, links FROM memories "
+                "WHERE type=? AND title_norm=? AND valid_to IS NULL",
+                (type, norm)).fetchone()
+            mid, action = self._upsert_via_conflict(
+                type, title, norm, body, tags_s, incoming_links, now, emb, existing)
         else:
-            superseded = self._find_near_duplicate(type, emb) if self._consolidate else None
-            cur = self._conn.execute(
-                "INSERT INTO memories(type, title, title_norm, body, tags, links, "
-                "created_at, updated_at, device_id, embedding, author, valid_from) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (type, title, norm, body, tags_s, links_s, now, now,
-                 self._device_id, emb, self._author, now))
-            mid = cur.lastrowid
-            action = "created"
-            if superseded is not None:
-                self._conn.execute(
-                    "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
-                    (now, mid, superseded))
-                action = "consolidated"
+            # No DB-level guarantee available - a live DB already had
+            # duplicate current rows and blocked the unique index at
+            # migrate() time (#41). Fall back to bracketing the probe SELECT
+            # and the INSERT/UPDATE in a single BEGIN IMMEDIATE transaction
+            # so no other writer can interleave between them.
+            self._conn.execute("BEGIN IMMEDIATE")
+            existing = self._conn.execute(
+                "SELECT id, links FROM memories "
+                "WHERE type=? AND title_norm=? AND valid_to IS NULL",
+                (type, norm)).fetchone()
+            mid, action = self._upsert_locked(
+                type, title, norm, body, tags_s, incoming_links, now, emb, existing)
+
         self._graph.on_remember(mid, emb)
         if self._crystallize and crystallizes:
             self._graph.on_crystallize(mid, crystallizes)
@@ -373,6 +437,81 @@ class Store:
         self._sync_now()
         self._maybe_forget()
         return {"id": mid, "action": action}
+
+    def _merge_links(self, existing_links_json, incoming_links) -> str:
+        """#47: union the incoming links with the row's current links rather
+        than replacing - re-remembering a memory without re-passing `links`
+        must never wipe links recorded by an earlier call (or by link())."""
+        existing_links = json.loads(existing_links_json or "[]")
+        return json.dumps(_dedupe_links(existing_links + incoming_links))
+
+    def _upsert_via_conflict(self, type, title, norm, body, tags_s,
+                              incoming_links, now, emb, existing) -> tuple:
+        """Atomic upsert via a partial-unique-index ON CONFLICT target (#41).
+        Safe even if `existing` is stale (raced by a concurrent writer since
+        the probe SELECT): the DB resolves the real conflict, not us."""
+        if existing is not None:
+            links_s = self._merge_links(existing[1], incoming_links)
+        else:
+            links_s = json.dumps(incoming_links)
+        superseded = (self._find_near_duplicate(type, emb)
+                      if (existing is None and self._consolidate) else None)
+        self._conn.execute(
+            "INSERT INTO memories(type, title, title_norm, body, tags, links, "
+            "created_at, updated_at, device_id, embedding, author, valid_from) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(type, title_norm) WHERE valid_to IS NULL DO UPDATE SET "
+            "title=excluded.title, body=excluded.body, tags=excluded.tags, "
+            "links=?, updated_at=excluded.updated_at, "
+            "device_id=excluded.device_id, author=excluded.author, "
+            "embedding=excluded.embedding",
+            (type, title, norm, body, tags_s, links_s, now, now,
+             self._device_id, emb, self._author, now, links_s))
+        # lastrowid isn't reliable across the ON CONFLICT DO UPDATE branch (it
+        # only advances on an actual insert), so re-resolve the current row
+        # to get both its id and whether this call created it.
+        mid, created_at = self._conn.execute(
+            "SELECT id, created_at FROM memories "
+            "WHERE type=? AND title_norm=? AND valid_to IS NULL",
+            (type, norm)).fetchone()
+        action = "created" if created_at == now else "updated"
+        if action == "created" and superseded is not None:
+            self._conn.execute(
+                "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
+                (now, mid, superseded))
+            action = "consolidated"
+        return mid, action
+
+    def _upsert_locked(self, type, title, norm, body, tags_s,
+                        incoming_links, now, emb, existing) -> tuple:
+        """Upsert under an already-open BEGIN IMMEDIATE transaction: `existing`
+        was probed inside that same transaction, so no other writer could
+        have interleaved since - a plain branch on it is safe here."""
+        if existing is not None:
+            mid, existing_links_json = existing
+            links_s = self._merge_links(existing_links_json, incoming_links)
+            self._conn.execute(
+                "UPDATE memories SET title=?, body=?, tags=?, links=?, updated_at=?, "
+                "device_id=?, author=?, embedding=? WHERE id=?",
+                (title, body, tags_s, links_s, now, self._device_id,
+                 self._author, emb, mid))
+            return mid, "updated"
+        links_s = json.dumps(incoming_links)
+        superseded = self._find_near_duplicate(type, emb) if self._consolidate else None
+        cur = self._conn.execute(
+            "INSERT INTO memories(type, title, title_norm, body, tags, links, "
+            "created_at, updated_at, device_id, embedding, author, valid_from) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (type, title, norm, body, tags_s, links_s, now, now,
+             self._device_id, emb, self._author, now))
+        mid = cur.lastrowid
+        action = "created"
+        if superseded is not None:
+            self._conn.execute(
+                "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
+                (now, mid, superseded))
+            action = "consolidated"
+        return mid, action
 
     def _maybe_forget(self) -> None:
         """Amortized trigger: every forget_interval writes, run one bounded

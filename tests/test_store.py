@@ -1,5 +1,7 @@
 import json as _json
 import sqlite3
+import tempfile
+import threading
 
 import pytest
 
@@ -1000,3 +1002,136 @@ def test_no_db_path_means_failures_still_raise():
     with pytest.raises(RuntimeError):
         s.remember("user", "A", "a note")
     assert s._degraded is False
+
+
+# ---------------------------------------------------------------------------
+# #41: concurrent remember() with the same (type, title) must not duplicate
+# #47: remember() must not clobber `links` when links isn't re-passed
+# ---------------------------------------------------------------------------
+
+def _file_store(path, **kwargs):
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    s = Store(conn, device_id="test-device", sync_now=lambda *a, **k: None, **kwargs)
+    s.migrate()
+    return s
+
+
+def test_migrate_creates_a_unique_partial_dedup_index():
+    s = make_store()
+    assert s._has_unique_dedup_index is True
+    row = s._conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_memories_dedup'").fetchone()
+    assert "UNIQUE" in row[0].upper()
+
+
+def test_migrate_upgrades_a_preexisting_plain_dedup_index():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        "CREATE TABLE memories ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " type TEXT NOT NULL CHECK (type IN ('user','feedback','project','reference')),"
+        " title TEXT NOT NULL, title_norm TEXT NOT NULL, body TEXT NOT NULL,"
+        " tags TEXT NOT NULL DEFAULT '', links TEXT NOT NULL DEFAULT '[]',"
+        " created_at TEXT NOT NULL, updated_at TEXT NOT NULL,"
+        " device_id TEXT NOT NULL DEFAULT '');"
+        "CREATE INDEX idx_memories_dedup ON memories(type, title_norm);")
+    conn.commit()
+    s = Store(conn, "d", lambda *a, **k: None)
+    s.migrate()
+    assert s._has_unique_dedup_index is True
+    row = s._conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_memories_dedup'").fetchone()
+    assert "UNIQUE" in row[0].upper()
+
+
+def test_migrate_degrades_gracefully_with_preexisting_duplicate_rows():
+    # Simulate a live DB that already has two "current" rows for the same
+    # (type, title_norm) from before this fix - creating the unique index
+    # must not crash migrate(); it should warn and fall back instead.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        "CREATE TABLE memories ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " type TEXT NOT NULL CHECK (type IN ('user','feedback','project','reference')),"
+        " title TEXT NOT NULL, title_norm TEXT NOT NULL, body TEXT NOT NULL,"
+        " tags TEXT NOT NULL DEFAULT '', links TEXT NOT NULL DEFAULT '[]',"
+        " created_at TEXT NOT NULL, updated_at TEXT NOT NULL,"
+        " device_id TEXT NOT NULL DEFAULT '');"
+        "CREATE INDEX idx_memories_dedup ON memories(type, title_norm);")
+    conn.execute(
+        "INSERT INTO memories(type,title,title_norm,body,created_at,updated_at)"
+        " VALUES('user','Dup','dup','one','t1','t1')")
+    conn.execute(
+        "INSERT INTO memories(type,title,title_norm,body,created_at,updated_at)"
+        " VALUES('user','Dup','dup','two','t2','t2')")
+    conn.commit()
+    s = Store(conn, "d", lambda *a, **k: None)
+    with pytest.warns(RuntimeWarning):
+        s.migrate()                                  # must not raise
+    assert s._has_unique_dedup_index is False
+    # remember() must still work via the locking fallback, not crash.
+    r = s.remember("user", "Dup", "three")
+    assert r["action"] == "updated"
+
+
+def test_remember_concurrent_same_title_yields_one_current_row(tmp_path):
+    db_path = tmp_path / "memory.db"
+    s1 = _file_store(db_path)
+    s2 = _file_store(db_path)
+
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def call(store, key, body):
+        barrier.wait(timeout=5)
+        results[key] = store.remember("user", "Race Title", body)
+
+    t1 = threading.Thread(target=call, args=(s1, "a", "from thread A"))
+    t2 = threading.Thread(target=call, args=(s2, "b", "from thread B"))
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert "a" in results and "b" in results          # neither call raised/hung
+    check = sqlite3.connect(str(db_path))
+    total = check.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    current = check.execute(
+        "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL "
+        "AND type='user' AND title_norm='race title'").fetchone()[0]
+    assert total == 1                                 # no duplicate row was created
+    assert current == 1
+
+
+def test_remember_without_links_preserves_previous_links():
+    s = make_store()
+    a = s.remember("user", "A", "first body")["id"]
+    b = s.remember("user", "B", "other")["id"]
+    s.link(a, b)
+    before = _json.loads(s._conn.execute(
+        "SELECT links FROM memories WHERE id=?", (a,)).fetchone()[0])
+    assert b in before
+
+    again = s.remember("user", "A", "refined body")   # no links= passed
+    assert again["id"] == a
+    after = _json.loads(s._conn.execute(
+        "SELECT links FROM memories WHERE id=?", (a,)).fetchone()[0])
+    assert b in after                                 # link survives the re-remember
+
+
+def test_remember_with_links_unions_rather_than_replaces():
+    s = make_store()
+    a = s.remember("user", "A", "x")["id"]
+    b = s.remember("user", "B", "y")["id"]
+    c = s.remember("user", "C", "z")["id"]
+
+    s.remember("user", "A", "x2", links=[b])
+    s.remember("user", "A", "x3", links=[c])          # must union with b, not replace it
+
+    links = _json.loads(s._conn.execute(
+        "SELECT links FROM memories WHERE id=?", (a,)).fetchone()[0])
+    assert set(links) == {b, c}
