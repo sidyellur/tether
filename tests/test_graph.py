@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from tether.graph import Graph
+from tether.graph import Graph, _now
 
 
 def make_graph(enabled=True):
@@ -165,9 +165,64 @@ def test_resolve_session_uses_param_then_time_buckets():
     sid2 = g.resolve_session(None, get, set_)      # immediately after -> same bucket
     assert sid1 == sid2
     # simulate a long gap by rewinding last-activity far into the past
-    set_("assoc_last_activity", "2000-01-01T00:00:00+00:00")
+    # (meta keys are namespaced per-process, see #53)
+    set_(f"assoc_last_activity:{g._process_id}", "2000-01-01T00:00:00+00:00")
     sid3 = g.resolve_session(None, get, set_)
     assert sid3 != sid1
+
+
+def test_resolve_session_scopes_implicit_bucket_per_process():
+    # #53: two "processes" (two Graph instances, e.g. two server startups)
+    # sharing the same underlying meta store must NOT resolve to the same
+    # implicit session id merely for recalling in the same time window.
+    conn = sqlite3.connect(":memory:")
+    g1 = Graph(conn, enabled=True)
+    g1.migrate()
+    g2 = Graph(conn, enabled=True)
+    assert g1._process_id != g2._process_id
+    store = {}
+    get = lambda k: store.get(k)
+    set_ = lambda k, v: store.__setitem__(k, str(v))
+    sid_a = g1.resolve_session(None, get, set_)
+    sid_b = g2.resolve_session(None, get, set_)      # same instant, shared meta store
+    assert sid_a != sid_b
+    # each process still continues its own bucket on a follow-up call
+    assert g1.resolve_session(None, get, set_) == sid_a
+    assert g2.resolve_session(None, get, set_) == sid_b
+
+
+def test_resolve_session_explicit_session_unchanged_across_processes():
+    conn = sqlite3.connect(":memory:")
+    g1 = Graph(conn, enabled=True)
+    g1.migrate()
+    g2 = Graph(conn, enabled=True)
+    store = {}
+    get = lambda k: store.get(k)
+    set_ = lambda k, v: store.__setitem__(k, str(v))
+    assert g1.resolve_session("shared", get, set_) == "shared"
+    assert g2.resolve_session("shared", get, set_) == "shared"
+
+
+def test_sweep_stale_session_members_removes_only_idle_sessions():
+    # #48: abandoned sessions are never touched again, so decay/cleanup keyed
+    # on a specific session_id never runs for them. The periodic sweep must
+    # find and remove them by idle time, independent of any active session.
+    g = make_graph()
+    g._conn.execute(
+        "INSERT INTO session_members VALUES('abandoned', 1, 0.9, '2000-01-01T00:00:00+00:00')")
+    g._conn.execute(
+        "INSERT INTO session_members VALUES('fresh', 2, 0.9, ?)", (_now(),))
+    removed = g.sweep_stale_session_members(horizon_seconds=3600)
+    assert removed == 1
+    remaining = {r[0] for r in g._conn.execute(
+        "SELECT session_id FROM session_members").fetchall()}
+    assert remaining == {"fresh"}
+
+
+def test_sweep_stale_session_members_never_raises_on_bad_table():
+    g = make_graph()
+    g._conn.execute("DROP TABLE session_members")
+    assert g.sweep_stale_session_members() == 0
 
 
 def test_touch_session_primes_and_decays():
