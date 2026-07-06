@@ -1158,3 +1158,52 @@ def test_remember_with_links_unions_rather_than_replaces():
     links = _json.loads(s._conn.execute(
         "SELECT links FROM memories WHERE id=?", (a,)).fetchone()[0])
     assert set(links) == {b, c}
+
+
+def test_session_sweep_trigger_cleans_abandoned_session_members():
+    # #48: a session that's never touched again leaves its session_members
+    # rows behind forever (decay/cleanup are keyed on that specific session
+    # id, which never runs again). The periodic sweep must reap it anyway.
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, assoc=True, session_sweep_interval=3)
+    s.migrate()
+    m = s.remember("user", "T0", "body")["id"]
+    conn.execute(
+        "INSERT INTO session_members VALUES('abandoned', ?, 0.9, '2000-01-01T00:00:00+00:00')",
+        (m,))
+    conn.commit()
+    for i in range(3):                              # 3 recalls -> counter hits interval
+        s.recall("T0")
+    remaining = {r[0] for r in conn.execute(
+        "SELECT session_id FROM session_members").fetchall()}
+    assert "abandoned" not in remaining
+
+
+def test_session_sweep_noop_when_graph_disabled():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, assoc=False, session_sweep_interval=1)
+    s.migrate()
+    s.remember("user", "T0", "body")
+    s.recall("T0")
+    assert conn.execute(
+        "SELECT value FROM meta WHERE key='session_sweep_counter'").fetchone() is None
+
+
+def test_recall_concurrent_processes_do_not_hebbian_wire_unrelated_topics():
+    # #53: two "processes" (e.g. two parallel subagents sharing one DB) each
+    # recalling their own unrelated topic, with no explicit session, in the
+    # same instant must not get spuriously Hebbian-wired via a shared
+    # implicit time-bucket session.
+    conn = sqlite3.connect(":memory:")
+    s1 = Store(conn, "d", lambda *a, **k: None, assoc=True, recall_budget=16)
+    s1.migrate()
+    s2 = Store(conn, "d", lambda *a, **k: None, assoc=True, recall_budget=16)
+    a = s1.remember("user", "cars", "I drive my car to work")["id"]
+    b = s1.remember("user", "pizza", "pizza night with friends")["id"]
+    s1.recall("cars")            # process 1, implicit session
+    s2.recall("pizza")           # process 2, implicit session, same instant
+    count = conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='hebbian'").fetchone()[0]
+    assert count == 0
+    ids = {r[0] for r in conn.execute("SELECT DISTINCT session_id FROM session_members")}
+    assert len(ids) == 2                             # kept in separate session buckets
