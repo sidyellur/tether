@@ -69,7 +69,9 @@ def remember(type: str, title: str, body: str,
         title: a short label; also the dedup key within a type.
         body: the fact. For feedback/project, a "Why:" / "How to apply:" line helps.
         tags: optional comma-separated tags.
-        links: optional list of related memory ids.
+        links: optional list of related memory ids. Merged (union) into any
+            links already on the memory, never replaces them - omitting this
+            on a refine call preserves links set earlier.
         crystallizes: optional list of source memory ids this memory abstracts;
             links it over them as a crystallized principle (needs TETHER_CRYSTALLIZE).
 
