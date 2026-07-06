@@ -31,12 +31,25 @@ def _get_store() -> Store:
         path = config.db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         conn, sync_now, _sync_mode = open_connection(path, config.sync_config())
+        # Only an actual replica connection has somewhere to degrade to on a
+        # write failure (#44 - a mid-session network drop should degrade
+        # gracefully instead of raising out of remember/link/forget); local
+        # and already-degraded connections have nothing further to fall back
+        # to. on_degrade updates the status resource's sync_mode (#51) so a
+        # later mid-session degrade doesn't leave it reporting stale "replica".
+        degrade_db_path = path if _sync_mode == "replica" else None
+
+        def _mark_degraded():
+            global _sync_mode
+            _sync_mode = "degraded"
+
         embedder = None
         if config.semantic_enabled():
             from . import embed
             embedder = embed.get_embedder(config.embedding_model())
         store = Store(conn, device_id=config.device_id(), sync_now=sync_now,
                       embedder=embedder, author=config.author(),
+                      db_path=degrade_db_path, on_degrade=_mark_degraded,
                       consolidate=config.consolidate_enabled(),
                       dedup_threshold=config.dedup_threshold(),
                       decay_half_life_days=config.decay_half_life_days(),
