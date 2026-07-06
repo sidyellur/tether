@@ -37,13 +37,25 @@ def test_mcp_stdio_roundtrip(tmp_path):
                 created = json.loads(_text(await session.call_tool(
                     "remember",
                     {"type": "user", "title": "Prefers TDD",
-                     "body": "Tests first, evidence before done."})))
+                     "body": "Tests first, evidence before done.",
+                     "tags": "blog-journal,proj:tether"})))
                 assert created["action"] == "created"
 
                 recall_result = json.loads(_text(await session.call_tool(
                     "recall", {"query": "tests"})))
                 hits = recall_result.get("results", [])
                 assert any(h["title"] == "Prefers TDD" for h in hits)
+
+                # #50: exact tag filter, standalone (no query)
+                tag_result = json.loads(_text(await session.call_tool(
+                    "recall", {"tags": "blog-journal,proj:tether"})))
+                tag_hits = tag_result.get("results", [])
+                assert any(h["title"] == "Prefers TDD" for h in tag_hits)
+
+                # a superstring tag must not match ("proj:tether" != "proj:tether2")
+                no_match = json.loads(_text(await session.call_tool(
+                    "recall", {"tags": "proj:tether2"})))
+                assert no_match.get("results", []) == []
 
                 # boot index resource reflects the write
                 res = await session.read_resource("tether://memory-index")

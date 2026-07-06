@@ -100,6 +100,16 @@ class Graph:
         except Exception:
             pass
 
+    def unprime(self, mid) -> None:
+        """Drop `mid` from every session's primed working set. Edges are left
+        alone (a soft-archived node just stops matching valid_to IS NULL in
+        the reads that matter); only the primed-session-context path needs
+        scrubbing, mirroring what on_forget does for hard deletes."""
+        try:
+            self._conn.execute("DELETE FROM session_members WHERE memory_id=?", (mid,))
+        except Exception:
+            pass
+
     def on_remember(self, mid, emb_blob) -> None:
         if not self.enabled or emb_blob is None:
             return

@@ -43,6 +43,21 @@ def test_on_forget_deletes_edges_and_session_rows():
     assert g._conn.execute("SELECT COUNT(*) FROM session_members").fetchone()[0] == 0
 
 
+def test_unprime_removes_session_rows_but_keeps_edges():
+    # #42: a soft-archive (supersede/forget-sweep) must scrub session_members
+    # so the memory can't be primed back into recall, but it's a soft delete -
+    # unlike on_forget, edges stay (valid_to filtering already hides the node).
+    g = make_graph()
+    g._upsert_edge(1, 2, "semantic", 0.5, "t", mode="max")
+    g._conn.execute("INSERT INTO session_members VALUES('s', 1, 1.0, 't')")
+    g._conn.execute("INSERT INTO session_members VALUES('s', 2, 1.0, 't')")
+    g.unprime(1)
+    rows = {r[0] for r in g._conn.execute(
+        "SELECT memory_id FROM session_members").fetchall()}
+    assert rows == {2}
+    assert g._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 1
+
+
 class FakeEmbedder:
     name = "fake-3d"
     dims = 3

@@ -891,6 +891,148 @@ def test_crystallized_edge_surfaces_principle_from_source():
     assert a in ids and p in ids                    # principle reached from its source
 
 
+def make_assoc_consolidating_store(threshold=0.9):
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, device_id="dev", sync_now=lambda *a, **k: None,
+              embedder=FakeEmbedder(), author="sid",
+              consolidate=True, dedup_threshold=threshold,
+              assoc=True, recall_budget=16)
+    s.migrate()
+    return s
+
+
+def test_hydrate_filters_out_valid_to_rows():
+    # #42 blanket safety net: _hydrate must never return a non-current row,
+    # even if asked for it by id directly.
+    s = make_store()
+    a = s.remember("user", "A", "a")["id"]
+    s._conn.execute("UPDATE memories SET valid_to='t' WHERE id=?", (a,))
+    s._conn.commit()
+    assert s._hydrate([a]) == []
+
+
+def test_consolidate_unprimes_superseded_memory():
+    # #42: once `a` is primed into a session, superseding it via consolidation
+    # must scrub the session_members row so a later unrelated recall in the
+    # same session can't resurface it (mislabeled via={"seed": True}).
+    pytest.importorskip("numpy")
+    s = make_assoc_consolidating_store()
+    a = s.remember("user", "Commute A", "I drive my car to work")["id"]
+    s.recall("car", session="sess1")            # primes `a` into session_members
+    assert a in s._graph.session_activation("sess1")
+    r = s.remember("user", "Commute B", "driving the car every day")
+    assert r["action"] == "consolidated"         # supersedes `a`
+    assert a not in s._graph.session_activation("sess1")
+    other = s.remember("project", "Lunch", "pizza and food for the team")["id"]
+    hits = s.recall("pizza", session="sess1")
+    ids = [h["id"] for h in hits]
+    assert other in ids
+    assert a not in ids                          # superseded memory never resurfaces
+
+
+def test_forgetting_sweep_unprimes_archived_memory():
+    # #42: the forgetting sweep must scrub session_members too, mirroring
+    # what consolidation and on_forget already do.
+    s = make_forget_store()
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(6)]
+    _add_edge(s, ids[4], ids[5], "hebbian")      # live behavioral graph elsewhere
+    _age(s, ids[0])                               # old + isolated -> archived
+    s._graph.touch_session("sess1", [ids[0]])
+    assert ids[0] in s._graph.session_activation("sess1")
+    assert s._run_forgetting_sweep() == 1
+    assert ids[0] not in s._graph.session_activation("sess1")
+
+
+def test_recall_empty_seeds_does_not_return_primed_context():
+    # #46: a query that matches nothing must return [] even when the session
+    # has previously-primed members - it must NOT fall back to returning
+    # those primed members mislabeled via={"seed": True}.
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens")["id"]
+    s.recall("JWT tokens", session="sess1")       # primes `a`
+    assert a in s._graph.session_activation("sess1")
+    hits = s.recall("nothing here matches anything at all", session="sess1")
+    assert hits == []
+
+
+def test_tags_match_is_exact_not_substring():
+    from tether.store import _tags_match
+    assert _tags_match("proj:tether,other", ["proj:tether"])
+    assert not _tags_match("proj:tether2", ["proj:tether"])   # #50: no LIKE-style match
+    assert _tags_match("a,b,c", ["a", "c"])
+    assert not _tags_match("a,b", ["a", "c"])
+
+
+def test_parse_tags_handles_str_list_and_none():
+    from tether.store import _parse_tags
+    assert _parse_tags("a, b ,c") == ["a", "b", "c"]
+    assert _parse_tags(["a", " b "]) == ["a", "b"]
+    assert _parse_tags(None) == []
+    assert _parse_tags("") == []
+
+
+def test_recall_tags_filter_is_exact_not_substring():
+    s = make_store()
+    a = s.remember("user", "A", "note", tags="proj:tether")["id"]
+    b = s.remember("user", "B", "note", tags="proj:tether2")["id"]
+    hits = s.recall("note", tags="proj:tether")
+    ids = [h["id"] for h in hits]
+    assert a in ids and b not in ids
+
+
+def test_recall_tags_standalone_without_query():
+    # #50: tags alone (no query) is a guaranteed-complete, exact-match lookup.
+    s = make_store()
+    a = s.remember("user", "A", "x", tags="blog-journal,proj:tether")["id"]
+    s.remember("user", "B", "y", tags="proj:tether")["id"]     # missing blog-journal
+    c = s.remember("project", "C", "z", tags="blog-journal,proj:tether")["id"]
+    hits = s.recall("", tags="blog-journal,proj:tether")
+    assert {h["id"] for h in hits} == {a, c}
+
+
+def test_recall_no_query_no_tags_returns_empty():
+    s = make_store()
+    s.remember("user", "x", "y")
+    assert s.recall("") == []
+    assert s.recall(None) == []
+
+
+def test_recall_tags_combined_with_query_narrows_ranked_hits():
+    s = make_store()
+    a = s.remember("user", "Apple note", "apple pie recipe", tags="cooking")["id"]
+    s.remember("user", "Apple gadget", "apple watch review", tags="tech")["id"]
+    hits = s.recall("apple", tags="cooking")
+    assert [h["id"] for h in hits] == [a]
+
+
+def test_recall_tags_filters_associative_seeds_too():
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens", tags="infra")["id"]
+    s.remember("project", "Auth rationale", "JWT tokens were chosen", tags="other")["id"]
+    hits = s.recall("JWT tokens", tags="infra", budget=8)
+    ids = [h["id"] for h in hits]
+    assert ids == [a]
+
+
+def test_recall_tags_filters_spread_reached_tail_too():
+    # The tag filter must hold for the WHOLE result, not just the seed tier -
+    # `b` is reached only via the explicit link (never matches the query
+    # itself), so it lands in the associative tail, not `seeds`. It must still
+    # be excluded when its tags don't satisfy the filter.
+    pytest.importorskip("numpy")
+    s = make_assoc_store()
+    a = s.remember("user", "Auth", "we switched to JWT tokens", tags="infra")["id"]
+    b = s.remember("project", "Picnic", "quarterly pizza budget review",
+                   tags="other")["id"]
+    s.link(a, b)
+    unfiltered_ids = [h["id"] for h in s.recall("JWT tokens", budget=8)]
+    assert b in unfiltered_ids                    # sanity: b is reachable at all
+    filtered_ids = [h["id"] for h in s.recall("JWT tokens", tags="infra", budget=8)]
+    assert a in filtered_ids and b not in filtered_ids
+
+
 def test_crystallized_hub_does_not_bury_direct_hit():
     # #25 back-door: a max-fan-out principle must not outrank a query's own hit.
     pytest.importorskip("numpy")

@@ -215,7 +215,7 @@ principle-worthy is a strong signal.
 | Tool | What it does |
 |---|---|
 | `remember(type, title, body, tags?, links?, crystallizes?)` | Save a memory; upserts on `type`+`title` so facts refine rather than duplicate. `crystallizes=[ids]` writes it as a principle over those sources (needs `TETHER_CRYSTALLIZE`) |
-| `recall(query, type?, limit?, budget?, session?)` | Hybrid keyword + semantic search, then follows the usage graph to related memories; returns id/type/title/body/tags/updated_at + a `via` receipt |
+| `recall(query?, type?, limit?, budget?, session?, tags?)` | Hybrid keyword + semantic search, then follows the usage graph to related memories; returns id/type/title/body/tags/updated_at + a `via` receipt. `tags` is an exact-match filter (a memory must carry every listed tag); combine it with `query`, or omit `query` for a guaranteed-complete tag lookup |
 | `link(id_a, id_b)` | Bidirectional link between two memories |
 | `forget(id)` | Permanently delete a memory |
 | `dismiss_cluster(id_a, id_b)` | Reflection control (crystallization): drop the candidate cluster nucleated by peak edge `(id_a, id_b)` so it isn't re-surfaced. Not a memory operation; only relevant with `TETHER_CRYSTALLIZE` |
