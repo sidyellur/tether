@@ -12,6 +12,7 @@ Run it as an MCP stdio server:
 """
 
 import json
+import sqlite3
 
 from mcp.server.fastmcp import FastMCP
 
@@ -30,12 +31,18 @@ def _get_store() -> Store:
         path = config.db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         conn, sync_now = open_connection(path, config.sync_config())
+        # A plain sqlite3.Connection is already local-only; only a sync
+        # replica connection needs a db_path to degrade to on write failure
+        # (#44 - a mid-session network drop should degrade gracefully
+        # instead of raising out of remember/link/forget).
+        degrade_db_path = None if isinstance(conn, sqlite3.Connection) else path
         embedder = None
         if config.semantic_enabled():
             from . import embed
             embedder = embed.get_embedder(config.embedding_model())
         store = Store(conn, device_id=config.device_id(), sync_now=sync_now,
                       embedder=embedder, author=config.author(),
+                      db_path=degrade_db_path,
                       consolidate=config.consolidate_enabled(),
                       dedup_threshold=config.dedup_threshold(),
                       decay_half_life_days=config.decay_half_life_days(),

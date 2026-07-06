@@ -8,9 +8,10 @@ nothing outside this module speaks SQL.
 import json
 import re
 import struct
+import sys
 from datetime import datetime, timezone
 
-from . import graph
+from . import graph, sync
 from .graph import Graph
 
 VALID_TYPES = ("user", "feedback", "project", "reference")
@@ -156,11 +157,18 @@ class Store:
                  protect_head=_PROTECT_HEAD, seed_floor=_SEED_FLOOR,
                  crystallize=False,
                  boot_index_cap=50, forget=False, forget_age_days=90,
-                 forget_interval=20, forget_max_per_sweep=10):
+                 forget_interval=20, forget_max_per_sweep=10,
+                 db_path=None):
         self._conn = conn
         self._device_id = device_id
         self._sync_now = sync_now
         self._embedder = embedder
+        # Set only when `conn` is a sync replica (server.py); lets a failed
+        # replica write degrade to a fresh local-only connection instead of
+        # raising (#44). None (the local-only default) means there is
+        # nothing to degrade to, so failures propagate as before.
+        self._db_path = db_path
+        self._degraded = False
         self._author = author
         self._consolidate = consolidate
         self._dedup_threshold = dedup_threshold
@@ -177,6 +185,36 @@ class Store:
         self._forget_age_days = forget_age_days
         self._forget_interval = forget_interval
         self._forget_max_per_sweep = forget_max_per_sweep
+
+    def _degrade_to_local(self) -> bool:
+        """A replica write just failed (e.g. the network dropped mid-session).
+        Swap to a fresh local-only connection for the remainder of the
+        process so the caller's write can be retried instead of raised.
+        Returns False (nothing to degrade to, or already degraded) when the
+        original error should propagate instead."""
+        if self._degraded or self._db_path is None:
+            return False
+        try:
+            conn, sync_now = sync._local(self._db_path)
+        except Exception:
+            return False
+        self._conn = conn
+        self._graph._conn = conn
+        self._sync_now = sync_now
+        self._degraded = True
+        sys.stderr.write(
+            "tether: replica write failed; degrading to local-only for the "
+            "remainder of the process\n")
+        return True
+
+    def _write_with_replica_fallback(self, fn):
+        """Run a write; on failure, degrade to local once and retry."""
+        try:
+            return fn()
+        except Exception:
+            if not self._degrade_to_local():
+                raise
+            return fn()
 
     def migrate(self) -> None:
         fts_existed = self._table_exists("memories_fts")
@@ -292,6 +330,10 @@ class Store:
                  crystallizes=None) -> dict:
         if type not in VALID_TYPES:
             raise ValueError(f"type must be one of {VALID_TYPES}, got {type!r}")
+        return self._write_with_replica_fallback(
+            lambda: self._remember_impl(type, title, body, tags, links, crystallizes))
+
+    def _remember_impl(self, type, title, body, tags, links, crystallizes) -> dict:
         now = _now()
         norm = _norm(title)
         tags_s = _tags_to_str(tags)
@@ -578,12 +620,19 @@ class Store:
         return json.loads(row[0])
 
     def link(self, id_a, id_b) -> dict:
+        # Resolve + validate ids outside the retry wrapper: a bad id raises
+        # ValueError here, which must surface as-is rather than be mistaken
+        # for a replica write failure and trigger a needless degrade.
         a = self._links_of(id_a)
         b = self._links_of(id_b)
         if id_b not in a:
             a.append(id_b)
         if id_a not in b:
             b.append(id_a)
+        return self._write_with_replica_fallback(
+            lambda: self._link_impl(id_a, id_b, a, b))
+
+    def _link_impl(self, id_a, id_b, a, b) -> dict:
         now = _now()
         self._conn.execute("UPDATE memories SET links=?, updated_at=? WHERE id=?",
                            (json.dumps(a), now, id_a))
@@ -599,6 +648,9 @@ class Store:
         return {"dismissed": [id_a, id_b]}
 
     def forget(self, id) -> dict:
+        return self._write_with_replica_fallback(lambda: self._forget_impl(id))
+
+    def _forget_impl(self, id) -> dict:
         cur = self._conn.execute("DELETE FROM memories WHERE id=?", (id,))
         self._graph.on_forget(id)
         self._conn.commit()

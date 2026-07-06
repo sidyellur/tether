@@ -39,10 +39,17 @@ import sys
 import threading
 
 _INITIAL_SYNC_TIMEOUT = 5.0
+_BUSY_TIMEOUT_MS = 5000
 
 
 def _local(db_path):
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    # WAL lets readers (e.g. recall) proceed alongside a writer instead of
+    # blocking; busy_timeout makes a contended write retry instead of an
+    # immediate "database is locked" (#43 - recall itself writes when the
+    # associative graph is enabled, so concurrent recalls can contend).
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
     return conn, (lambda timeout=2.0: None)
 
 

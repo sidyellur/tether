@@ -3,6 +3,7 @@ import sqlite3
 
 import pytest
 
+from tether import sync
 from tether.store import Store
 
 
@@ -905,3 +906,97 @@ def test_crystallized_hub_does_not_bury_direct_hit():
                    crystallizes=hits + [a])["id"]   # hub over everything incl. a
     ids = [h["id"] for h in s.recall("JWT tokens", budget=8)]
     assert ids[0] == a                              # seed still dominates the hub
+
+
+class _DeadReplica:
+    """Stands in for a sync replica connection whose WRITES fail (#44 - e.g.
+    a mid-session network drop) while reads keep working -- an embedded
+    replica serves reads from the local file, so a dropped connection to the
+    remote primary plausibly still lets a caller like link() read current
+    state before its write fails."""
+
+    def __init__(self, real_conn):
+        self._real = real_conn
+
+    def execute(self, sql, *a, **k):
+        if sql.strip().split(None, 1)[0].upper() in ("SELECT", "PRAGMA"):
+            return self._real.execute(sql, *a, **k)
+        raise RuntimeError("replica unreachable")
+
+    def executescript(self, *a, **k):
+        raise RuntimeError("replica unreachable")
+
+    def commit(self):
+        raise RuntimeError("replica unreachable")
+
+
+def _make_degradable_store(tmp_path):
+    """A store with a real local file (schema migrated, ready to seed rows
+    against the working connection) and db_path wired up so it can degrade
+    to that same file, matching what server.py wires up for a replica.
+    Swap in a _DeadReplica AFTER seeding any rows a test needs."""
+    db_path = tmp_path / "m.db"
+    conn, sync_now = sync._local(db_path)
+    s = Store(conn, "d", sync_now, db_path=db_path)
+    s.migrate()
+    return s, db_path
+
+
+def _kill_replica(s):
+    dead = _DeadReplica(s._conn)
+    s._conn = dead
+    s._graph._conn = dead
+
+
+def test_remember_degrades_to_local_on_replica_write_failure(tmp_path, capsys):
+    s, db_path = _make_degradable_store(tmp_path)
+    _kill_replica(s)
+    result = s.remember("user", "A", "a note")
+    assert result["action"] == "created"
+    assert s._degraded is True
+    assert isinstance(s._conn, sqlite3.Connection)
+    assert "degrading to local-only" in capsys.readouterr().err
+
+    # the write actually landed on the local file, not lost
+    conn2 = sqlite3.connect(db_path)
+    assert conn2.execute("SELECT title FROM memories WHERE title='A'").fetchone()
+
+    # subsequent writes go straight to the (already-local) connection
+    result2 = s.remember("user", "B", "another note")
+    assert result2["action"] == "created"
+
+
+def test_link_degrades_to_local_on_replica_write_failure(tmp_path):
+    s, _ = _make_degradable_store(tmp_path)
+    # seed both memories on the working connection first, then take it down
+    a = s.remember("user", "A", "a note")["id"]
+    b = s.remember("user", "B", "b note")["id"]
+    _kill_replica(s)
+
+    result = s.link(a, b)
+    assert result == {"linked": [a, b]}
+    assert s._degraded is True
+    assert isinstance(s._conn, sqlite3.Connection)
+
+
+def test_forget_degrades_to_local_on_replica_write_failure(tmp_path):
+    s, _ = _make_degradable_store(tmp_path)
+    mid = s.remember("user", "A", "a note")["id"]
+    _kill_replica(s)
+
+    result = s.forget(mid)
+    assert result == {"forgotten": mid, "existed": True}
+    assert s._degraded is True
+    assert isinstance(s._conn, sqlite3.Connection)
+
+
+def test_no_db_path_means_failures_still_raise():
+    # A plain local-only store (db_path=None, the default) has nothing to
+    # degrade to -- a write failure must surface, not be silently swallowed.
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s.migrate()
+    s._conn = _DeadReplica(conn)
+    with pytest.raises(RuntimeError):
+        s.remember("user", "A", "a note")
+    assert s._degraded is False
