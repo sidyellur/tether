@@ -1207,3 +1207,51 @@ def test_recall_concurrent_processes_do_not_hebbian_wire_unrelated_topics():
     assert count == 0
     ids = {r[0] for r in conn.execute("SELECT DISTINCT session_id FROM session_members")}
     assert len(ids) == 2                             # kept in separate session buckets
+
+
+def test_remember_concurrent_new_title_unions_links_not_last_writer_wins(
+        monkeypatch, tmp_path):
+    # Regression test for a gap in the #41/#47 fix: `_upsert_via_conflict`'s
+    # probe SELECT ("does a current row already exist?") can itself be raced.
+    # Two connections both remembering a genuinely brand-new (type, title)
+    # at the same instant both legitimately see `existing=None`; only one
+    # actually performs the INSERT; the other's statement resolves via the
+    # ON CONFLICT DO UPDATE branch instead. The links merge must still union
+    # with whatever the winner just wrote, not silently replace it with only
+    # the loser's own `links` - that would reintroduce #47's clobber inside
+    # the very race #41 closes. Forces the interleaving deterministically
+    # (rather than relying on OS thread-scheduling luck) by gating both
+    # threads on a barrier right after their probe SELECT.
+    db_path = tmp_path / "memory.db"
+    s1 = _file_store(db_path)
+    s2 = _file_store(db_path)
+
+    barrier = threading.Barrier(2)
+    orig = Store._upsert_via_conflict
+
+    def gated(self, *a, **kw):
+        barrier.wait(timeout=5)
+        return orig(self, *a, **kw)
+
+    monkeypatch.setattr(Store, "_upsert_via_conflict", gated)
+
+    results = {}
+
+    def call(store, key, links):
+        results[key] = store.remember("user", "Race Title", f"body {key}", links=links)
+
+    t1 = threading.Thread(target=call, args=(s1, "a", [1]))
+    t2 = threading.Thread(target=call, args=(s2, "b", [2]))
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert "a" in results and "b" in results
+    check = sqlite3.connect(str(db_path))
+    row = check.execute(
+        "SELECT id, links FROM memories WHERE valid_to IS NULL "
+        "AND type='user' AND title_norm='race title'").fetchone()
+    assert row is not None
+    links = set(_json.loads(row[1]))
+    assert links == {1, 2}  # both racers' links survive - neither got dropped
