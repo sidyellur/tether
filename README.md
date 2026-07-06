@@ -129,8 +129,9 @@ recent facts. Two opt-in behaviors go further:
 | `TETHER_DECAY_HALF_LIFE_DAYS` | off | set a positive number to exponentially down-rank older facts in recall |
 | `TETHER_AUTHOR` | device id | attribution recorded on each memory |
 
-Consolidation never deletes — only `forget` does. All of this degrades to
-plain keyword recall when the semantic extra is absent.
+Consolidation never deletes — `forget` soft-deletes (see [Tools](#tools)), and
+only the admin CLI's `purge` is permanent. All of this degrades to plain
+keyword recall when the semantic extra is absent.
 
 ## Associative recall (optional)
 
@@ -166,12 +167,14 @@ as before — associative recall is purely additive and never breaks a lookup.
 As a store grows, tether keeps it legible using the same usage graph:
 
 - **Hub-curated boot-index.** The auto-loaded memory index is capped once it
-  passes `TETHER_BOOT_INDEX_CAP` (default 50) and a graph exists. Above the cap
-  it shows two labeled slices — **load-bearing** memories (highest *behavioral*
+  passes `TETHER_BOOT_INDEX_CAP` (default 50) — the cap always applies, so a
+  large store never gets an unbounded index. With a graph, above the cap it
+  shows two labeled slices — **load-bearing** memories (highest *behavioral*
   degree: `explicit` links + learned co-recall, never mere similarity) and the
   most **recent** ones — so the index stays small and shows what actually
-  matters. Below the cap, or without a graph, it's the full newest-first list as
-  before.
+  matters. Without a graph (`TETHER_ASSOC=0`), it falls back to a plain
+  most-recent-N list instead of the hub/recency split. Below the cap it's the
+  full newest-first list either way.
 - **Forgetting-by-disconnection** (opt-in, `TETHER_FORGET`). A bounded sweep
   runs every `TETHER_FORGET_INTERVAL` writes and *soft-archives* memories that
   are both **old** (`TETHER_FORGET_AGE_DAYS`, default 90) and **behaviorally
@@ -217,12 +220,30 @@ principle-worthy is a strong signal.
 | `remember(type, title, body, tags?, links?, crystallizes?)` | Save a memory; upserts on `type`+`title` so facts refine rather than duplicate. `crystallizes=[ids]` writes it as a principle over those sources (needs `TETHER_CRYSTALLIZE`) |
 | `recall(query?, type?, limit?, budget?, session?, tags?)` | Hybrid keyword + semantic search, then follows the usage graph to related memories; returns id/type/title/body/tags/updated_at + a `via` receipt. `tags` is an exact-match filter (a memory must carry every listed tag); combine it with `query`, or omit `query` for a guaranteed-complete tag lookup |
 | `link(id_a, id_b)` | Bidirectional link between two memories |
-| `forget(id)` | Permanently delete a memory |
+| `forget(id)` | Soft-delete a memory: marks it no longer current (excluded from recall/the boot index) via the same reversible `valid_to` machinery as consolidation, rather than deleting the row. See [Export and permanent deletion](#export-and-permanent-deletion) for a real, permanent delete |
 | `dismiss_cluster(id_a, id_b)` | Reflection control (crystallization): drop the candidate cluster nucleated by peak edge `(id_a, id_b)` so it isn't re-surfaced. Not a memory operation; only relevant with `TETHER_CRYSTALLIZE` |
 
-Plus two resources: the auto-loaded `tether://memory-index` (a compact
-one-line-per-memory index surfaced each session) and, with `TETHER_CRYSTALLIZE`,
-the pull-only `tether://crystallization` (candidate clusters for a reflection pass).
+Plus three resources: the auto-loaded `tether://memory-index` (a compact
+one-line-per-memory index surfaced each session), the pull-only
+`tether://status` (runtime config: semantic/sync state, memory and edge
+counts, DB path — for debugging what's actually active), and, with
+`TETHER_CRYSTALLIZE`, the pull-only `tether://crystallization` (candidate
+clusters for a reflection pass).
+
+## Export and permanent deletion
+
+`forget` never deletes data — it soft-deletes, like consolidation. Two admin
+operations, deliberately kept off the MCP tool surface so an agent can't
+trigger them, live in a small CLI instead:
+
+```sh
+tether export                    # dump all current memories to JSON (stdout)
+tether export -o backup.json     # ...or to a file
+tether purge <id> --yes          # permanently delete a memory (bypasses forget)
+```
+
+`purge` refuses to run without `--yes`. Both commands honor the same
+`TETHER_DB`/`TETHER_SYNC_*` env vars as the server.
 
 ## License
 
