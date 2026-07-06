@@ -11,8 +11,19 @@ Semantic recall is an ADDITIVE boost, never a hard dependency.
 """
 
 import math
+import os
 
 _DEFAULT_MODEL = "minishlab/potion-base-8M"
+
+
+def _is_cached(model_name: str) -> bool:
+    """Best-effort check for the HF hub's on-disk cache layout. Used only to
+    decide whether skipping the hub's connectivity check is safe (#28) - a
+    miss here just means we fall through to the normal online load."""
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    cache_dir = os.environ.get("HF_HUB_CACHE", os.path.join(hf_home, "hub"))
+    repo_dir = "models--" + model_name.replace("/", "--")
+    return os.path.isdir(os.path.join(cache_dir, repo_dir))
 
 
 class Embedder:
@@ -43,6 +54,15 @@ def get_embedder(model_name: str = _DEFAULT_MODEL):
     error degrades to None (the caller falls back to keyword-only recall).
     """
     try:
+        if _is_cached(model_name):
+            # Already have it locally - skip the hub's connectivity/metadata
+            # round-trip on every process start (#28: it can stall for
+            # seconds on a slow/unreachable network and buys nothing once
+            # the model is cached). setdefault so an explicit user setting
+            # always wins.
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
         from model2vec import StaticModel
 
         model = StaticModel.from_pretrained(model_name)
