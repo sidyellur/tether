@@ -9,7 +9,8 @@ working set. Owns the `edges` and `session_members` SQL. Spreading activation
 a no-op rather than raising, so the memory layer never breaks the agent.
 """
 
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 
 KNN_K = 8
 HOP_DECAY = 0.4
@@ -18,6 +19,11 @@ KIND_W = {"semantic": 1.0, "explicit": 1.2, "hebbian": 1.0, "crystallized": 1.2}
 SESSION_DECAY = 0.5
 SESSION_GAP_SECONDS = 1800
 SESSION_TTL_ACTIVATION = 0.05
+# Horizon for the periodic session_members sweep (#48): well above
+# SESSION_GAP_SECONDS so an infrequently-touched but still-live explicit
+# session isn't swept out from under its caller, while still bounding
+# long-term growth from sessions that are genuinely never touched again.
+SESSION_SWEEP_HORIZON_SECONDS = 24 * 60 * 60
 HEBBIAN_INCREMENT = 0.5
 HEBBIAN_CAP = 5.0
 HEBBIAN_TOP_M = 8
@@ -56,6 +62,7 @@ CREATE TABLE IF NOT EXISTS session_members (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (session_id, memory_id)
 );
+CREATE INDEX IF NOT EXISTS idx_session_members_updated ON session_members(updated_at);
 CREATE TABLE IF NOT EXISTS crystallize_dismissed (
     src INTEGER NOT NULL,
     dst INTEGER NOT NULL,
@@ -72,6 +79,11 @@ class Graph:
     def __init__(self, conn, enabled=True):
         self._conn = conn
         self.enabled = enabled
+        # Established once per Graph (i.e. once per server process/startup, see
+        # server.py's lazily-built singleton store); scopes the implicit
+        # session bucket per-process so concurrent unrelated callers sharing
+        # the same underlying DB don't get bucketed into one session (#53).
+        self._process_id = uuid.uuid4().hex[:12]
 
     def migrate(self) -> None:
         self._conn.executescript(_SCHEMA)
@@ -283,11 +295,16 @@ class Graph:
 
     def resolve_session(self, session, meta_get, meta_set) -> str:
         now_iso = _now()
+        # Per-process meta keys: two Graph instances (e.g. two server
+        # processes sharing one DB) each track their own gap/continuation
+        # state instead of racing over one shared global bucket (#53).
+        session_key = f"assoc_session:{self._process_id}"
+        activity_key = f"assoc_last_activity:{self._process_id}"
         if session:
             sid = str(session)
         else:
-            last = meta_get("assoc_last_activity")
-            cur = meta_get("assoc_session")
+            last = meta_get(activity_key)
+            cur = meta_get(session_key)
             gap = None
             if last is not None:
                 try:
@@ -298,9 +315,9 @@ class Graph:
             if cur and gap is not None and gap <= SESSION_GAP_SECONDS:
                 sid = cur
             else:
-                sid = now_iso
-        meta_set("assoc_session", sid)
-        meta_set("assoc_last_activity", now_iso)
+                sid = f"{now_iso}:{self._process_id}"
+        meta_set(session_key, sid)
+        meta_set(activity_key, now_iso)
         return sid
 
     def session_activation(self, session_id) -> dict:
@@ -339,3 +356,21 @@ class Graph:
                 (SESSION_TTL_ACTIVATION,))
         except Exception:
             return
+
+    def sweep_stale_session_members(self, horizon_seconds=SESSION_SWEEP_HORIZON_SECONDS) -> int:
+        """Periodic maintenance sweep, independent of any specific session
+        being touched. touch_session's decay UPDATE refreshes updated_at for
+        every row of the session id it's given, so a row's updated_at is that
+        session's last-activity time; a session that's simply never touched
+        again (abandoned) leaves its rows' updated_at frozen in the past.
+        Removes rows whose session has been idle longer than horizon_seconds,
+        regardless of their current activation (#48). Returns rows removed;
+        never raises."""
+        try:
+            cutoff = (datetime.now(timezone.utc)
+                      - timedelta(seconds=horizon_seconds)).isoformat()
+            cur = self._conn.execute(
+                "DELETE FROM session_members WHERE updated_at < ?", (cutoff,))
+            return cur.rowcount
+        except Exception:
+            return 0

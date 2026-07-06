@@ -173,6 +173,7 @@ class Store:
                  crystallize=False,
                  boot_index_cap=50, forget=False, forget_age_days=90,
                  forget_interval=20, forget_max_per_sweep=10,
+                 session_sweep_interval=50,
                  db_path=None, on_degrade=None):
         self._conn = conn
         self._device_id = device_id
@@ -208,6 +209,7 @@ class Store:
         self._forget_age_days = forget_age_days
         self._forget_interval = forget_interval
         self._forget_max_per_sweep = forget_max_per_sweep
+        self._session_sweep_interval = session_sweep_interval
 
     def _degrade_to_local(self) -> bool:
         """A replica write just failed (e.g. the network dropped mid-session).
@@ -553,6 +555,26 @@ class Store:
         except Exception:
             return
 
+    def _maybe_sweep_sessions(self) -> None:
+        """Amortized trigger: every session_sweep_interval recalls, sweep
+        session_members for sessions abandoned longer than the sweep horizon
+        (#48). Independent of any specific session being active. No-op when
+        the graph is disabled."""
+        if not self._graph.enabled:
+            return
+        try:
+            n = int(self._meta_get("session_sweep_counter") or 0) + 1
+            if n >= self._session_sweep_interval:
+                self._meta_set("session_sweep_counter", 0)
+                self._conn.commit()
+                self._graph.sweep_stale_session_members()
+                self._conn.commit()
+            else:
+                self._meta_set("session_sweep_counter", n)
+                self._conn.commit()
+        except Exception:
+            return
+
     def _run_forgetting_sweep(self) -> int:
         """Soft-archive old + behaviorally-isolated memories (opt-in, bounded,
         reversible). Returns the number archived. Never raises."""
@@ -750,6 +772,7 @@ class Store:
         learn_ids = head if graph.HEBBIAN_LEARN_FROM_HEAD else order
         self._graph.touch_session(sid, learn_ids)
         self._conn.commit()
+        self._maybe_sweep_sessions()
         hits = self._hydrate(order)
         for h in hits:
             r = receipts.get(h["id"])
