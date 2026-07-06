@@ -22,14 +22,15 @@ from .sync import open_connection
 mcp = FastMCP("tether")
 
 _store = None
+_sync_mode = None
 
 
 def _get_store() -> Store:
-    global _store
+    global _store, _sync_mode
     if _store is None:
         path = config.db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        conn, sync_now = open_connection(path, config.sync_config())
+        conn, sync_now, _sync_mode = open_connection(path, config.sync_config())
         embedder = None
         if config.semantic_enabled():
             from . import embed
@@ -132,7 +133,11 @@ def dismiss_cluster(id_a: int, id_b: int) -> dict:
 
 @mcp.tool()
 def forget(id: int) -> dict:
-    """Permanently delete a memory by id. Returns {"forgotten", "existed"}."""
+    """Soft-delete a memory by id: marks it no longer current (excluded from
+    recall/the boot index) but keeps the row, reversibly, like consolidation
+    and the forgetting sweep already do. Returns {"forgotten", "existed"}.
+    (Permanent purge is an admin-only CLI operation, not available here.)
+    """
     try:
         return _get_store().forget(id)
     except Exception as e:
@@ -149,6 +154,30 @@ def memory_index() -> str:
         return _get_store().boot_index()
     except Exception as e:
         return f"(memory index unavailable: {e})"
+
+
+@mcp.resource("tether://status")
+def status() -> str:
+    """Read-only runtime status (#51): what's actually active right now, since
+    several features (semantic recall, sync) degrade silently by design.
+    Pull-only like tether://crystallization - not auto-loaded.
+    """
+    try:
+        store = _get_store()
+        conn = store._conn
+        memory_count = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL").fetchone()[0]
+        edge_count = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        return json.dumps({
+            "semantic_enabled": store._embedder is not None,
+            "embedding_model": getattr(store._embedder, "name", None),
+            "sync_mode": _sync_mode,
+            "memory_count": memory_count,
+            "edge_count": edge_count,
+            "db_path": str(config.db_path()),
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 @mcp.resource("tether://crystallization")

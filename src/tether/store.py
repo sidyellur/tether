@@ -313,21 +313,34 @@ class Store:
         except Exception:
             return None
 
+    def _embedding_meta_key(self, name: str) -> str:
+        """Per-device meta key for embedding-model tracking (#45). `meta` rows
+        sync like any other data, so a global key made two devices running
+        different TETHER_EMBEDDING_MODEL values fight over it forever - each
+        boot/sync seeing the other's model name as a "mismatch" and re-wiping.
+        Scoping by author/device id means a device only ever compares against
+        the value IT wrote, so it converges after its own first backfill."""
+        scope = self._author or self._device_id
+        return f"{name}:{scope}" if scope else name
+
     def backfill_embeddings(self, batch=200) -> int:
         """Embed rows lacking a vector. If the active model/dims differ from
-        what produced the stored vectors, clear them all first so the store
-        never mixes incompatible embeddings. Returns rows embedded. No-op
-        (returns 0) without an embedder; never raises."""
+        what produced the stored vectors (per this device - see
+        _embedding_meta_key), clear them all first so the store never mixes
+        incompatible embeddings. Returns rows embedded. No-op (returns 0)
+        without an embedder; never raises."""
         if self._embedder is None:
             return 0
         try:
-            prev_model = self._meta_get("embedding_model")
-            prev_dims = self._meta_get("embedding_dims")
+            model_key = self._embedding_meta_key("embedding_model")
+            dims_key = self._embedding_meta_key("embedding_dims")
+            prev_model = self._meta_get(model_key)
+            prev_dims = self._meta_get(dims_key)
             if (prev_model != self._embedder.name
                     or prev_dims != str(self._embedder.dims)):
                 self._conn.execute("UPDATE memories SET embedding=NULL")
-                self._meta_set("embedding_model", self._embedder.name)
-                self._meta_set("embedding_dims", self._embedder.dims)
+                self._meta_set(model_key, self._embedder.name)
+                self._meta_set(dims_key, self._embedder.dims)
                 self._conn.commit()
             done = 0
             while True:
@@ -738,11 +751,47 @@ class Store:
         return {"dismissed": [id_a, id_b]}
 
     def forget(self, id) -> dict:
+        """Soft-delete: mark the memory no longer current via the same
+        valid_to machinery consolidation and forgetting-by-disconnection
+        already use. Reversible (clear valid_to to restore) and, like the
+        forgetting sweep, keeps edges intact rather than tearing down the
+        usage graph. Excluded from recall/boot_index like any other
+        no-longer-current row. Use purge() for a real, non-reversible delete."""
+        now = _now()
+        cur = self._conn.execute(
+            "UPDATE memories SET valid_to=? WHERE id=? AND valid_to IS NULL",
+            (now, id))
+        self._conn.commit()
+        self._sync_now()
+        return {"forgotten": id, "existed": cur.rowcount > 0}
+
+    def purge(self, id) -> dict:
+        """Permanent, non-reversible delete - bypasses valid_to entirely.
+        Deliberately NOT exposed as a default MCP tool argument (#49); reserved
+        for an explicit admin path (the CLI) so an agent can't trigger it by
+        hallucinating a flag."""
         cur = self._conn.execute("DELETE FROM memories WHERE id=?", (id,))
         self._graph.on_forget(id)
         self._conn.commit()
         self._sync_now()
-        return {"forgotten": id, "existed": cur.rowcount > 0}
+        return {"purged": id, "existed": cur.rowcount > 0}
+
+    def export_all(self) -> list:
+        """Dump every CURRENT memory as a plain dict - a backup/export path
+        independent of the DB file itself (#49). Excludes the embedding
+        vector: it's derived data, cheaply recomputed by backfill_embeddings."""
+        rows = self._conn.execute(
+            "SELECT id, type, title, body, tags, links, created_at, updated_at, "
+            "device_id, author FROM memories WHERE valid_to IS NULL ORDER BY id ASC"
+        ).fetchall()
+        cols = ("id", "type", "title", "body", "tags", "links", "created_at",
+                "updated_at", "device_id", "author")
+        out = []
+        for row in rows:
+            d = dict(zip(cols, row))
+            d["links"] = json.loads(d["links"] or "[]")
+            out.append(d)
+        return out
 
     def boot_index(self) -> str:
         rows = self._conn.execute(
@@ -751,14 +800,20 @@ class Store:
         ).fetchall()
         if not rows:
             return "(no memories yet)"
-        full = "\n".join(f"[{t}] #{i} {title}" for i, t, title, _ in rows)
-        if not self._graph.enabled or len(rows) <= self._boot_index_cap:
-            return full                                  # today's behavior
-        try:
-            return self._curated_index(rows, self._graph.degree_map(),
-                                       self._boot_index_cap)
-        except Exception:
-            return full                                  # curation failure -> full list
+        if len(rows) <= self._boot_index_cap:
+            return "\n".join(f"[{t}] #{i} {title}" for i, t, title, _ in rows)
+        if self._graph.enabled:
+            try:
+                return self._curated_index(rows, self._graph.degree_map(),
+                                           self._boot_index_cap)
+            except Exception:
+                pass                                      # curation failure -> capped fallback below
+        # No graph (or curation failed): still apply the cap, just without
+        # hub-curation - a size cap must never depend on graph state (#52).
+        return self._recency_capped_index(rows, self._boot_index_cap)
+
+    def _recency_capped_index(self, rows, cap) -> str:
+        return "\n".join(f"[{t}] #{i} {title}" for i, t, title, _ in rows[:cap])
 
     def _curated_index(self, rows, deg, cap) -> str:
         # rows: [(id, type, title, updated_at)] newest-first

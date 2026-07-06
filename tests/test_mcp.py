@@ -170,6 +170,40 @@ def test_server_recall_budget_session(monkeypatch, tmp_path):
         server._store = None
 
 
+def test_mcp_forget_is_soft_delete(tmp_path):
+    env = dict(os.environ, TETHER_DB=str(tmp_path / "mem.db"),
+               TETHER_DEVICE_ID="ci")
+    env.pop("TETHER_SYNC_URL", None)
+    env.pop("TETHER_SYNC_TOKEN", None)
+    env["TETHER_SEMANTIC"] = "0"
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "tether.server"], env=env)
+
+    async def run():
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                created = json.loads(_text(await session.call_tool(
+                    "remember", {"type": "user", "title": "A", "body": "b"})))
+                mid = created["id"]
+
+                forgotten = json.loads(_text(await session.call_tool(
+                    "forget", {"id": mid})))
+                assert forgotten == {"forgotten": mid, "existed": True}
+
+                recall_result = json.loads(_text(await session.call_tool(
+                    "recall", {"query": "A"})))
+                assert recall_result.get("results", []) == []
+
+                res = await session.read_resource("tether://status")
+                status = json.loads(
+                    "".join(getattr(c, "text", "") for c in res.contents))
+                # soft-deleted, not gone: memory_count excludes it (valid_to set)
+                assert status["memory_count"] == 0
+
+    asyncio.run(run())
+
+
 def test_server_wires_forget_config(monkeypatch, tmp_path):
     from tether import server
     monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
@@ -183,6 +217,88 @@ def test_server_wires_forget_config(monkeypatch, tmp_path):
         assert s._boot_index_cap == 7
     finally:
         server._store = None
+
+
+def test_mcp_status_resource(tmp_path):
+    env = dict(os.environ, TETHER_DB=str(tmp_path / "mem.db"),
+               TETHER_DEVICE_ID="ci")
+    env.pop("TETHER_SYNC_URL", None)
+    env.pop("TETHER_SYNC_TOKEN", None)
+    env["TETHER_SEMANTIC"] = "0"  # keyword-only: no model download in CI
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "tether.server"], env=env)
+
+    async def run():
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                await session.call_tool(
+                    "remember", {"type": "user", "title": "A", "body": "b"})
+
+                res = await session.read_resource("tether://status")
+                text = "".join(getattr(c, "text", "") for c in res.contents)
+                data = json.loads(text)
+                assert data["semantic_enabled"] is False
+                assert data["embedding_model"] is None
+                assert data["sync_mode"] == "local"
+                assert data["memory_count"] == 1
+                assert data["edge_count"] == 0
+                assert data["db_path"] == str(tmp_path / "mem.db")
+
+    asyncio.run(run())
+
+
+def test_status_resource_reports_semantic_and_sync_config(monkeypatch, tmp_path):
+    pytest.importorskip("numpy")
+    from tether import server
+
+    class Fake:
+        name = "fake-3d"
+        dims = 3
+
+        def embed(self, text):
+            return [1.0, 0.0, 0.0]
+
+    monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
+    monkeypatch.delenv("TETHER_SEMANTIC", raising=False)
+    monkeypatch.delenv("TETHER_SYNC_URL", raising=False)
+    monkeypatch.delenv("TETHER_SYNC_TOKEN", raising=False)
+    monkeypatch.setattr("tether.embed.get_embedder", lambda *a, **k: Fake())
+
+    server._store = None
+    server._sync_mode = None
+    try:
+        data = json.loads(server.status())
+        assert data["semantic_enabled"] is True
+        assert data["embedding_model"] == "fake-3d"
+        assert data["sync_mode"] == "local"
+        assert data["memory_count"] == 0
+        assert data["db_path"] == str(tmp_path / "m.db")
+    finally:
+        server._store = None
+        server._sync_mode = None
+
+
+def test_status_resource_reports_degraded_sync(monkeypatch, tmp_path):
+    from tether import server, sync
+
+    def boom(*a, **k):
+        raise RuntimeError("cannot reach turso")
+    monkeypatch.setattr(sync, "_open_replica", boom)
+
+    monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")
+    monkeypatch.setenv("TETHER_SYNC_URL", "libsql://x.turso.io")
+    monkeypatch.setenv("TETHER_SYNC_TOKEN", "tok")
+
+    server._store = None
+    server._sync_mode = None
+    try:
+        data = json.loads(server.status())
+        assert data["sync_mode"] == "degraded"
+    finally:
+        server._store = None
+        server._sync_mode = None
 
 
 def test_mcp_crystallization_resource(tmp_path):
