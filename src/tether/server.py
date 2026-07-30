@@ -69,7 +69,8 @@ def _get_store() -> Store:
                       forget=config.forget_enabled(),
                       forget_age_days=config.forget_age_days(),
                       forget_interval=config.forget_interval(),
-                      forget_max_per_sweep=config.forget_max_per_sweep())
+                      forget_max_per_sweep=config.forget_max_per_sweep(),
+                      sync_read_interval=config.sync_read_interval())
         store.migrate()
         if embedder is not None:
             store.backfill_embeddings()
