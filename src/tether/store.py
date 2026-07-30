@@ -936,6 +936,102 @@ class Store:
         self._sync_now()
         return {"forgotten": id, "existed": cur.rowcount > 0}
 
+    def restore(self, id) -> dict:
+        """Un-forget: clear valid_to so a soft-deleted memory is current again.
+
+        forget(), consolidation and the forgetting sweep all promise to be
+        reversible, but nothing exposed the reversal (#64) - so in practice a
+        soft-deleted memory was only recoverable by hand-editing the DB. This
+        is that reversal, kept CLI-only for the same reason purge is: it is an
+        operator action, not something an agent should reach for.
+        """
+        return self._write_with_replica_fallback(lambda: self._restore_impl(id))
+
+    def _restore_impl(self, id) -> dict:
+        row = self._conn.execute(
+            "SELECT type, title_norm, valid_to FROM memories WHERE id=?",
+            (id,)).fetchone()
+        if row is None:
+            return {"restored": id, "existed": False, "action": "missing"}
+        type_, norm, valid_to = row
+        if valid_to is None:
+            return {"restored": id, "existed": True, "action": "already-current"}
+        # A newer memory may have taken over this (type, title) while the row
+        # was archived. Restoring would then put two current rows on one dedup
+        # key - which the #41 partial unique index rejects anyway, but with an
+        # opaque IntegrityError. Check first so the operator gets a message
+        # that names the blocking id and what to do about it.
+        clash = self._conn.execute(
+            "SELECT id FROM memories WHERE type=? AND title_norm=? "
+            "AND valid_to IS NULL AND id != ?", (type_, norm, id)).fetchone()
+        if clash is not None:
+            raise ValueError(
+                f"cannot restore #{id}: memory #{clash[0]} is already the "
+                f"current {type_!r} titled {norm!r}. forget #{clash[0]} first, "
+                f"or edit one of the titles.")
+        self._conn.execute(
+            "UPDATE memories SET valid_to=NULL, superseded_by=NULL WHERE id=?",
+            (id,))
+        self._conn.commit()
+        self._sync_now()
+        return {"restored": id, "existed": True, "action": "restored"}
+
+    def import_records(self, records) -> dict:
+        """Replay exported records through the normal write path.
+
+        Deliberately NOT raw INSERTs: going through remember()/link() means
+        upsert-on-(type,title), consolidation, embedding and graph wiring all
+        apply, so importing into a non-empty store MERGES rather than
+        duplicating or clobbering. The consequence is that ids are not
+        preserved - an id in the file may map to a different id here - so
+        links are remapped through the (type, title) identity in a second
+        pass, and any link pointing outside the file is dropped rather than
+        silently pointed at the wrong memory.
+        """
+        created = updated = skipped = 0
+        id_map = {}
+        for rec in records:
+            try:
+                type_ = rec["type"]
+                title = rec["title"]
+                body = rec.get("body", "")
+            except (TypeError, KeyError):
+                skipped += 1
+                continue
+            if type_ not in VALID_TYPES or not str(title).strip():
+                skipped += 1
+                continue
+            res = self.remember(type_, title, body, tags=rec.get("tags", ""))
+            if rec.get("id") is not None:
+                id_map[rec["id"]] = res["id"]
+            if res["action"] == "created":
+                created += 1
+            else:
+                updated += 1
+
+        linked = dropped_links = 0
+        seen_pairs = set()
+        for rec in records:
+            src = id_map.get(rec.get("id")) if isinstance(rec, dict) else None
+            if src is None:
+                continue
+            for old_dst in (rec.get("links") or []):
+                new_dst = id_map.get(old_dst)
+                if new_dst is None:
+                    dropped_links += 1      # points outside the file: unresolvable
+                    continue
+                pair = (src, new_dst) if src < new_dst else (new_dst, src)
+                if pair in seen_pairs or src == new_dst:
+                    continue
+                seen_pairs.add(pair)
+                try:
+                    self.link(src, new_dst)
+                    linked += 1
+                except Exception:
+                    dropped_links += 1
+        return {"created": created, "updated": updated, "skipped": skipped,
+                "linked": linked, "dropped_links": dropped_links}
+
     def purge(self, id) -> dict:
         """Permanent, non-reversible delete - bypasses valid_to entirely.
         Deliberately NOT exposed as a default MCP tool argument (#49); reserved

@@ -239,10 +239,24 @@ trigger them, live in a small CLI instead:
 ```sh
 tether export                    # dump all current memories to JSON (stdout)
 tether export -o backup.json     # ...or to a file
+tether import backup.json        # merge an export back into the store
+tether restore <id>              # un-forget a soft-deleted memory
 tether purge <id> --yes          # permanently delete a memory (bypasses forget)
 ```
 
-`purge` refuses to run without `--yes`. Both commands honor the same
+`import` replays records through the normal write path, so it upserts on
+`type`+`title` like `remember` does — importing into a non-empty store merges
+rather than duplicating. Ids are not preserved (an id in the file may map to a
+different one here); links are remapped accordingly, and a link pointing
+outside the file is dropped rather than pointed at the wrong memory. The
+report tells you what happened: `{"created", "updated", "skipped", "linked",
+"dropped_links"}`.
+
+`restore` clears `valid_to`, reversing a `forget` (or a consolidation, or a
+forgetting sweep). It refuses if a newer memory has since claimed the same
+`type`+`title`, naming the blocker rather than failing opaquely.
+
+`purge` refuses to run without `--yes`. All commands honor the same
 `TETHER_DB`/`TETHER_SYNC_*` env vars as the server.
 
 ## License
