@@ -1,5 +1,6 @@
 # tests/test_crystallize.py — new file
 import sqlite3
+
 from tether import crystallize
 
 

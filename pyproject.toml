@@ -39,3 +39,36 @@ Issues = "https://github.com/sidyellur/tether/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tether"]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+# Deliberately NOT a maximal rule set. tether's degrade-never contract means
+# broad `except Exception: return <neutral>` is the intended idiom in the
+# store/graph/sync layers, so BLE001/S110 are left unselected rather than
+# suppressed line-by-line 40+ times. What's selected here is the subset that
+# catches real defects: undefined names, unused code, import hygiene,
+# mutable-default and implicit-Optional footguns, and py3.10+ modernization.
+select = ["E", "F", "W", "I", "UP", "RUF"]
+ignore = [
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests bind ids/handles for readability at the point of setup even when a
+# given assertion doesn't consume them (F841/RUF059) - that's documentation,
+# not dead code. The rest here are style-only rules whose "violations" are
+# how compact table-driven test setup is meant to read; correctness rules
+# (E4/E7/E9/F) stay fully enabled in tests.
+"tests/*" = [
+    "F841",    # assigned-but-unused: setup bindings that name what they are
+    "RUF059",  # same, for unpacked tuples
+    "E501",    # long lines: mostly inline expectation comments
+    "E701",    # `if x: return` one-liners in tiny fakes
+    "E702",    # `a = 1; b = 2` paired setup
+    "E731",    # lambda stubs standing in for injected callables
+    "RUF012",  # ClassVar annotations on throwaway fake classes
+    "RUF015",  # hits[0]["id"] reads better than next(...) in assertions
+    "RUF005",  # explicit list concat is clearer than unpacking in fixtures
+]

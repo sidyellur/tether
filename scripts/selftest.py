@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from tether.store import Store  # noqa: E402
+from tether.store import Store
 
 
 def main():

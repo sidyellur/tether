@@ -35,6 +35,35 @@ def test_server_imports_against_installed_mcp_major():
         assert callable(getattr(server, verb)), f"{verb} not defined"
 
 
+def test_optional_tool_params_advertise_null_in_schema():
+    """A param defaulting to None must say so in its JSON schema.
+
+    Before the implicit-Optional cleanup these were annotated `type: str = None`,
+    which made the SDK emit {"type": "string", "default": null} — a schema whose
+    own default violates the type it declares. A strict client validating
+    defaults can reject that. Each such param should now be a null-accepting
+    union instead.
+    """
+    from tether import server
+
+    async def get_schemas():
+        tools = await server.mcp.list_tools()
+        return {t.name: (getattr(t, "input_schema", None)
+                         or getattr(t, "inputSchema")) for t in tools}
+
+    schemas = asyncio.run(get_schemas())
+    optional_params = [("recall", "type"), ("recall", "budget"),
+                       ("recall", "session"), ("recall", "tags"),
+                       ("remember", "links"), ("remember", "crystallizes")]
+    for tool, param in optional_params:
+        prop = schemas[tool]["properties"][param]
+        assert prop.get("default", "missing") is None, f"{tool}.{param} default"
+        variants = prop.get("anyOf") or prop.get("oneOf") or [prop]
+        assert any(v.get("type") == "null" for v in variants), (
+            f"{tool}.{param} defaults to null but its schema does not "
+            f"accept null: {prop}")
+
+
 def test_mcp_stdio_roundtrip(tmp_path):
     env = dict(os.environ, TETHER_DB=str(tmp_path / "mem.db"),
                TETHER_DEVICE_ID="ci")

@@ -6,7 +6,7 @@ Headline numbers:
   no_regression  = warmed >= v2 - eps AND zero regressed (control class)
 Distributions ({improved/unchanged/regressed}) accompany every comparison so a
 mean can't hide a single-query swing (small N)."""
-from bench import metrics, selfcheck, conditions
+from bench import conditions, metrics, selfcheck
 
 
 def _snapshot_graph(conn):
@@ -205,7 +205,7 @@ def _print(report):
           f"{report['headroom_ndcg']:+.3f}")
     cz = report.get("crystallization")
     if cz:
-        print(f"\nCRYSTALLIZATION (graph_only nDCG, FROZEN):")
+        print("\nCRYSTALLIZATION (graph_only nDCG, FROZEN):")
         print(f"  MECHANISM (oracle-style hub over each task, bypasses detection): "
               f"cold {cz['cold_frozen_ndcg']:.3f} -> crystallized "
               f"{cz['crystallized_frozen_ndcg']:.3f}  (delta {cz['delta_vs_cold']:+.3f})")
@@ -228,8 +228,8 @@ def main():
         raise SystemExit(
             "bench real run needs model2vec — `pip install model2vec` "
             "(the hermetic suite in tests/test_bench.py needs no model).")
-    from tether.embed import get_embedder
     from bench.corpus import SCENARIO
+    from tether.embed import get_embedder
     embedder = get_embedder()
     if embedder is None:
         raise SystemExit("embedder unavailable: Model2Vec model failed to load.")

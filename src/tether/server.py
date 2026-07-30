@@ -79,8 +79,8 @@ def _get_store() -> Store:
 
 @mcp.tool()
 def remember(type: str, title: str, body: str,
-             tags: str = "", links: list = None,
-             crystallizes: list = None) -> dict:
+             tags: str = "", links: list | None = None,
+             crystallizes: list | None = None) -> dict:
     """Save a durable memory. UPSERTS: a memory of the same `type` with the same
     (whitespace/case-normalized) `title` is updated in place instead of
     duplicated, so re-remembering a fact refines it rather than cluttering.
@@ -107,8 +107,9 @@ def remember(type: str, title: str, body: str,
 
 
 @mcp.tool()
-def recall(query: str = "", type: str = None, limit: int = 20,
-           budget: int = None, session: str = None, tags: str = None) -> dict:
+def recall(query: str = "", type: str | None = None, limit: int = 20,
+           budget: int | None = None, session: str | None = None,
+           tags: str | None = None) -> dict:
     """Search memories by keyword and semantic similarity, then follow the
     usage graph to related memories, most relevant first.
 
