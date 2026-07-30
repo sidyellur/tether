@@ -122,31 +122,44 @@ class Graph:
         except Exception:
             pass
 
-    def on_remember(self, mid, emb_blob) -> None:
+    def on_remember(self, mid, emb_blob, matrix=None) -> None:
+        """Wire semantic kNN edges for `mid`.
+
+        `matrix` is an optional (ids, mat, types) triple the caller has already
+        built - the Store passes its cached one (#61) so a single remember()
+        doesn't deserialize every embedding in the store twice (once for the
+        near-duplicate probe, once here). Falls back to its own scan when the
+        caller has nothing to share, so Graph stays usable standalone.
+        """
         if not self.enabled or emb_blob is None:
             return
         try:
             import numpy as np
 
             q = np.frombuffer(emb_blob, dtype="<f4")
-            rows = self._conn.execute(
-                "SELECT id, embedding FROM memories "
-                "WHERE embedding IS NOT NULL AND valid_to IS NULL AND id != ?",
-                (mid,)).fetchall()
-            if not rows:
-                return
-            ids = [r[0] for r in rows]
-            mat = np.frombuffer(b"".join(r[1] for r in rows),
-                                dtype="<f4").reshape(len(ids), -1)
+            if matrix is not None and matrix[1] is not None:
+                ids, mat = matrix[0], matrix[1]
+            else:
+                rows = self._conn.execute(
+                    "SELECT id, embedding FROM memories "
+                    "WHERE embedding IS NOT NULL AND valid_to IS NULL").fetchall()
+                if not rows:
+                    return
+                ids = [r[0] for r in rows]
+                mat = np.frombuffer(b"".join(r[1] for r in rows),
+                                    dtype="<f4").reshape(len(ids), -1)
             sims = mat @ q
-            k = min(KNN_K, len(ids))
-            top = np.argsort(-sims)[:k]
+            # `mid` itself is in the shared matrix (it was just written), and
+            # self-similarity is 1.0 - so it would win every kNN. _upsert_edge
+            # already refuses a self-edge, but excluding it here keeps it from
+            # consuming one of the k slots.
+            order = [int(i) for i in np.argsort(-sims) if ids[int(i)] != mid]
             now = _now()
-            for i in top:
+            for i in order[:KNN_K]:
                 w = float(sims[i])
                 if w <= 0:
                     continue
-                self._upsert_edge(mid, ids[int(i)], "semantic", w, now, mode="max")
+                self._upsert_edge(mid, ids[i], "semantic", w, now, mode="max")
         except Exception:
             return
 
@@ -195,15 +208,35 @@ class Graph:
         except Exception:
             return set()
 
-    def backfill_semantic(self) -> None:
+    def backfill_semantic(self, matrix=None) -> None:
+        """Wire semantic edges for the whole store.
+
+        Builds the embedding matrix ONCE and hands the same one to every
+        on_remember (#61). Previously each of the n calls re-read and
+        re-deserialized all n embeddings, making a backfill quadratic in I/O
+        on top of the unavoidable quadratic in similarity math - the dominant
+        cost of first boot on a large store.
+        """
         if not self.enabled:
             return
         try:
-            rows = self._conn.execute(
-                "SELECT id, embedding FROM memories "
-                "WHERE embedding IS NOT NULL AND valid_to IS NULL").fetchall()
-            for mid, blob in rows:
-                self.on_remember(mid, blob)
+            import numpy as np
+
+            if matrix is not None and matrix[1] is not None:
+                ids, mat = matrix[0], matrix[1]
+            else:
+                rows = self._conn.execute(
+                    "SELECT id, embedding FROM memories "
+                    "WHERE embedding IS NOT NULL AND valid_to IS NULL "
+                    "ORDER BY id").fetchall()
+                if not rows:
+                    return
+                ids = [r[0] for r in rows]
+                mat = np.frombuffer(b"".join(r[1] for r in rows),
+                                    dtype="<f4").reshape(len(ids), -1)
+            shared = (ids, mat, None)
+            for i, mid in enumerate(ids):
+                self.on_remember(mid, mat[i].tobytes(), matrix=shared)
         except Exception:
             return
 

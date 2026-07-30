@@ -248,6 +248,12 @@ class Store:
         # too, debounced to at most once per this many seconds (0/None = off).
         self._sync_read_interval = sync_read_interval
         self._last_sync_at = None
+        # #61: (ids, matrix, types) for every current embedding, built once and
+        # reused until a write invalidates it. Before this, _vector_ids,
+        # _find_near_duplicate and graph.on_remember each re-read and
+        # re-deserialized every embedding blob in the store on every call - a
+        # single remember() paid for two full scans, and recall paid for one.
+        self._emb_cache = None
 
     def _degrade_to_local(self) -> bool:
         """A replica write just failed (e.g. the network dropped mid-session).
@@ -264,6 +270,7 @@ class Store:
         self._conn = conn
         self._graph._conn = conn
         self._sync_now = sync_now
+        self._invalidate_embedding_cache()   # different DB, different rows
         self._degraded = True
         if self._on_degrade is not None:
             try:
@@ -274,6 +281,38 @@ class Store:
             "tether: replica write failed; degrading to local-only for the "
             "remainder of the process\n")
         return True
+
+    def _invalidate_embedding_cache(self) -> None:
+        """Called by every write that can change which embeddings are current
+        (#61). Deliberately blunt - drop the whole thing rather than patch it -
+        because a subtly-stale vector cache would silently corrupt recall
+        ranking and consolidation, and rebuilding costs one scan, which is what
+        every call used to pay anyway."""
+        self._emb_cache = None
+
+    def _embedding_matrix(self):
+        """(ids, matrix, types) over every CURRENT embedding, or (None, ...) if
+        semantic support is unavailable. One scan, then reused until a write
+        invalidates it. Never raises - callers degrade to keyword-only."""
+        if self._emb_cache is not None:
+            return self._emb_cache
+        try:
+            import numpy as np
+
+            rows = self._conn.execute(
+                "SELECT id, embedding, type FROM memories "
+                "WHERE embedding IS NOT NULL AND valid_to IS NULL "
+                "ORDER BY id").fetchall()
+            if not rows:
+                self._emb_cache = ([], None, [])
+                return self._emb_cache
+            ids = [r[0] for r in rows]
+            mat = np.frombuffer(b"".join(r[1] for r in rows),
+                                dtype="<f4").reshape(len(ids), -1)
+            self._emb_cache = (ids, mat, [r[2] for r in rows])
+            return self._emb_cache
+        except Exception:
+            return ([], None, [])
 
     def _sync(self, timeout=2.0) -> None:
         """Every sync goes through here so the read-path debounce (#62) sees
@@ -465,13 +504,17 @@ class Store:
                     blob = self._embed_or_none(title, body)
                     if blob is None:
                         # embedder broke mid-run: stop, leave the rest for later
+                        self._invalidate_embedding_cache()
                         self._conn.commit()
                         return done
                     self._conn.execute(
                         "UPDATE memories SET embedding=? WHERE id=?", (blob, mid))
                     done += 1
                 self._conn.commit()
-            self._graph.backfill_semantic()
+            # Vectors just changed wholesale (and the model-change branch above
+            # may have NULLed every one of them), so anything cached is stale.
+            self._invalidate_embedding_cache()
+            self._graph.backfill_semantic(matrix=self._embedding_matrix())
             return done
         except Exception:
             return 0
@@ -517,7 +560,15 @@ class Store:
             mid, action = self._upsert_locked(
                 type, title, norm, body, tags_s, incoming_links, now, emb, existing)
 
-        self._graph.on_remember(mid, emb)
+        # Share one matrix across the whole write (#61). When consolidation ran,
+        # _find_near_duplicate already built it and this is a free cache hit;
+        # otherwise it's built here - either way on_remember doesn't repeat the
+        # scan. on_remember excludes `mid` itself, so it doesn't matter whether
+        # the matrix predates this row or includes it.
+        shared = (self._embedding_matrix()
+                  if emb is not None and self._graph.enabled else None)
+        self._graph.on_remember(mid, emb, matrix=shared)
+        self._invalidate_embedding_cache()
         if self._crystallize and crystallizes:
             self._graph.on_crystallize(mid, crystallizes)
         self._conn.commit()
@@ -578,6 +629,7 @@ class Store:
                 "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
                 (now, mid, superseded))
             self._graph.unprime(superseded)
+            self._invalidate_embedding_cache()
             action = "consolidated"
         return mid, action
 
@@ -610,6 +662,7 @@ class Store:
                 "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
                 (now, mid, superseded))
             self._graph.unprime(superseded)
+            self._invalidate_embedding_cache()
             action = "consolidated"
         return mid, action
 
@@ -680,6 +733,7 @@ class Store:
                 self._graph.unprime(mid)
                 archived += 1
             if archived:
+                self._invalidate_embedding_cache()
                 self._conn.commit()
             return archived
         except Exception:
@@ -694,14 +748,16 @@ class Store:
         try:
             import numpy as np
 
+            ids, mat, types = self._embedding_matrix()
+            if mat is None:
+                return None
             q = np.frombuffer(emb, dtype="<f4")
-            rows = self._conn.execute(
-                "SELECT id, embedding FROM memories "
-                "WHERE type=? AND valid_to IS NULL AND embedding IS NOT NULL",
-                (type,)).fetchall()
+            sims = mat @ q                       # both unit-norm, so dot == cosine
             best_id, best_sim = None, -1.0
-            for mid, blob in rows:
-                sim = float(np.frombuffer(blob, dtype="<f4") @ q)  # both unit-norm
+            for i, mid in enumerate(ids):
+                if types[i] != type:
+                    continue
+                sim = float(sims[i])
                 if sim > best_sim:
                     best_id, best_sim = mid, sim
             return best_id if best_sim >= self._dedup_threshold else None
@@ -740,18 +796,17 @@ class Store:
             # order, so semantic search contributes nothing here.
             if not np.any(q):
                 return []
-            sql = ("SELECT id, embedding FROM memories "
-                   "WHERE embedding IS NOT NULL AND valid_to IS NULL")
-            params = []
-            if type is not None:
-                sql += " AND type = ?"
-                params.append(type)
-            rows = self._conn.execute(sql, params).fetchall()
-            if not rows:
+            all_ids, mat, all_types = self._embedding_matrix()
+            if mat is None:
                 return []
-            ids = [r[0] for r in rows]
-            mat = np.frombuffer(b"".join(r[1] for r in rows),
-                                dtype="<f4").reshape(len(ids), -1)
+            if type is not None:
+                keep = [i for i, t in enumerate(all_types) if t == type]
+                if not keep:
+                    return []
+                ids = [all_ids[i] for i in keep]
+                mat = mat[keep]
+            else:
+                ids = all_ids
             # stored vectors and q are unit-normalized, so dot == cosine
             sims = mat @ q
             # #15: only genuinely-similar rows seed the walk. Rows below the
@@ -973,6 +1028,7 @@ class Store:
             (now, id))
         if cur.rowcount > 0:
             self._graph.unprime(id)          # #42: don't let it linger as primed context
+            self._invalidate_embedding_cache()
         self._conn.commit()
         self._sync()
         return {"forgotten": id, "existed": cur.rowcount > 0}
@@ -1013,6 +1069,7 @@ class Store:
         self._conn.execute(
             "UPDATE memories SET valid_to=NULL, superseded_by=NULL WHERE id=?",
             (id,))
+        self._invalidate_embedding_cache()
         self._conn.commit()
         self._sync()
         return {"restored": id, "existed": True, "action": "restored"}
@@ -1083,6 +1140,7 @@ class Store:
     def _purge_impl(self, id) -> dict:
         cur = self._conn.execute("DELETE FROM memories WHERE id=?", (id,))
         self._graph.on_forget(id)
+        self._invalidate_embedding_cache()
         self._conn.commit()
         self._sync()
         return {"purged": id, "existed": cur.rowcount > 0}
