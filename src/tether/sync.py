@@ -6,17 +6,36 @@ that round-trip to the hosted primary. ANY failure on the replica path
 degrades to the local file. Memory must never break the agent's work, so
 open_connection never raises.
 
-SPIKE FINDINGS (verified live against libsql-experimental, PyPI releases
-0.0.41/0.0.55, on macOS arm64):
+SPIKE FINDINGS (originally verified against libsql-experimental 0.0.41/0.0.55
+on macOS arm64; re-verified against mainline libsql 0.1.11 on linux for #63,
+with deltas noted):
   - Import name and connect signature match what's used below:
     `libsql_experimental.connect(database, sync_url=None, auth_token="", ...)`.
+    STILL TRUE on mainline `libsql`, with ONE breaking rename:
+    `check_same_thread` became `_check_same_thread`. Passing the old name to
+    the new client raises TypeError at connect() -- which open_connection
+    would catch and degrade, so the failure mode of a naive dependency bump
+    is a SILENT drop to local-only, not a crash. `_import_libsql()` resolves
+    the right name for whichever client is installed.
+    Mainline also adds `sync_interval` (native periodic background sync) and
+    `offline`; neither is used yet -- `sync_interval` is a natural follow-up
+    to the read-path debounce added in #62.
   - `.sync()` on a connection opened WITHOUT sync_url raises ValueError
     ("Sync is not supported in databases opened in File mode.") -- confirms
     the local path must never call `.sync()`, which is why `_local()` below
-    uses a no-op.
+    uses a no-op. RE-VERIFIED on mainline: same behavior, byte-identical
+    message.
   - Cross-thread `.execute()`/`.sync()` calls did not hit any thread-safety
     guard in the versions tested, so the background-thread + join(timeout)
     pattern is safe to use.
+  - NOT RE-VERIFIED for #63: the two findings below (retry-forever on an
+    unreachable host, and the abandoned probe thread) both need a network
+    black hole to observe. The sandbox used for the #63 re-verification gets
+    a definitive 403 from its egress proxy instead, which mainline libsql
+    surfaces immediately (degrades in ~0.2s) -- that exercises the error
+    path, not the hang. So the bounded-probe machinery below stays exactly as
+    it was: it is still the only thing standing between a black-holed backend
+    and a server that never finishes starting.
   - IMPORTANT DEVIATION FROM THE ORIGINAL PLAN: `.sync()` does NOT fail fast
     against an unreachable/bogus sync_url. It retries the handshake
     internally (observed every ~2-3s) and does not return control or raise
@@ -40,6 +59,28 @@ import threading
 
 _INITIAL_SYNC_TIMEOUT = 5.0
 _BUSY_TIMEOUT_MS = 5000
+
+
+def _import_libsql():
+    """(module, thread_kwarg_name) for whichever libSQL client is installed.
+
+    Prefers mainline `libsql`; falls back to `libsql-experimental`, which is
+    frozen at 0.0.55 and superseded (#63). The two differ in one detail that
+    matters here: mainline renamed `check_same_thread` to `_check_same_thread`.
+
+    That rename is why this cannot be a plain dependency bump. Passing the old
+    name to the new client raises TypeError at connect() - and open_connection
+    catches everything and degrades - so a naive version bump would have
+    silently dropped every sync user to local-only, with nothing but a `sync
+    offline` line to show for it. Resolving the name here keeps both clients
+    working and keeps that failure impossible.
+    """
+    try:
+        import libsql
+        return libsql, "_check_same_thread"
+    except ImportError:
+        import libsql_experimental
+        return libsql_experimental, "check_same_thread"
 
 
 def _local(db_path, mode="local"):
@@ -66,11 +107,11 @@ def _open_replica(db_path, sync_cfg):
     See the module docstring's SPIKE FINDINGS for why the initial sync is
     bounded with a background thread rather than called inline.
     """
-    import libsql_experimental as libsql
+    libsql, thread_kwarg = _import_libsql()
 
     conn = libsql.connect(
         str(db_path), sync_url=sync_cfg.url, auth_token=sync_cfg.token,
-        check_same_thread=False)
+        **{thread_kwarg: False})
 
     errors = []
 

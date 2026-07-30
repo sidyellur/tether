@@ -22,7 +22,10 @@ classifiers = [
 dependencies = ["mcp>=1.0"]
 
 [project.optional-dependencies]
-sync = ["libsql-experimental>=0.0.30"]
+# Mainline libsql supersedes libsql-experimental, which is frozen at 0.0.55
+# (#63). sync.py imports either one - an existing libsql-experimental install
+# keeps working - but new installs get the maintained client.
+sync = ["libsql>=0.1"]
 semantic = ["model2vec>=0.3", "numpy>=1.21"]
 dev = ["pytest>=7", "build", "numpy>=1.21"]
 
