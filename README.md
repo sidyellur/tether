@@ -92,6 +92,18 @@ export TETHER_SYNC_TOKEN='<your-auth-token>'
 If the backend is unreachable, tether logs `sync offline` and keeps working
 against the local file; writes converge when it comes back.
 
+Writes push immediately. Reads also pull, debounced to at most once every
+`TETHER_SYNC_READ_INTERVAL` seconds (default 30) — so a device that only
+*asks* things still sees what your other devices wrote, instead of staying
+frozen at its own startup state until it happens to write something. The
+read-path pull is bounded much more tightly than the write-path one: if the
+backend is slow, the recall returns local data and the pull lands for the
+next read rather than making you wait.
+
+| Var | Default | Effect |
+|---|---|---|
+| `TETHER_SYNC_READ_INTERVAL` | `30` | seconds between read-path pulls; `0` = only sync on writes |
+
 ## Semantic search (optional)
 
 By default `recall` is **hybrid**: keyword (FTS5) results are fused with

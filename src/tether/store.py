@@ -9,6 +9,7 @@ import json
 import re
 import struct
 import sys
+import time
 import warnings
 from datetime import datetime, timezone
 
@@ -187,6 +188,15 @@ def _decay_factor(age_days: float, half_life_days: float) -> float:
     return 0.5 ** (age_days / half_life_days)
 
 
+# How long a read-path sync is allowed to block (#62). Deliberately much
+# shorter than the 2.0s write-path default: recall is the latency-visible hot
+# path, and sync_now runs the pull on a background thread that keeps going
+# after we stop waiting. So a slow backend costs at most this much, and its
+# data lands for the NEXT read instead - the freshening is self-healing rather
+# than something recall has to block on.
+_READ_SYNC_TIMEOUT = 1.0
+
+
 class Store:
     def __init__(self, conn, device_id: str, sync_now, embedder=None,
                  author="", consolidate=False, dedup_threshold=0.92,
@@ -195,7 +205,7 @@ class Store:
                  crystallize=False,
                  boot_index_cap=50, forget=False, forget_age_days=90,
                  forget_interval=20, forget_max_per_sweep=10,
-                 session_sweep_interval=50,
+                 session_sweep_interval=50, sync_read_interval=30,
                  db_path=None, on_degrade=None):
         self._conn = conn
         self._device_id = device_id
@@ -232,6 +242,12 @@ class Store:
         self._forget_interval = forget_interval
         self._forget_max_per_sweep = forget_max_per_sweep
         self._session_sweep_interval = session_sweep_interval
+        # #62: sync_now only ran after writes, so a device that merely READS
+        # never pulled other devices' updates - it saw the store as of its own
+        # startup probe until it happened to write something. Reads now pull
+        # too, debounced to at most once per this many seconds (0/None = off).
+        self._sync_read_interval = sync_read_interval
+        self._last_sync_at = None
 
     def _degrade_to_local(self) -> bool:
         """A replica write just failed (e.g. the network dropped mid-session).
@@ -258,6 +274,30 @@ class Store:
             "tether: replica write failed; degrading to local-only for the "
             "remainder of the process\n")
         return True
+
+    def _sync(self, timeout=2.0) -> None:
+        """Every sync goes through here so the read-path debounce (#62) sees
+        writes too - a chatty writer shouldn't also pull on every read."""
+        self._last_sync_at = time.monotonic()
+        self._sync_now(timeout)
+
+    def _maybe_sync_for_read(self) -> None:
+        """Pull before a read, at most once per _sync_read_interval seconds.
+
+        Bounded by _READ_SYNC_TIMEOUT rather than the write default, and never
+        allowed to raise: a read must still serve local data when the backend
+        is unreachable - exactly what it would have served before this existed.
+        """
+        if not self._sync_read_interval:
+            return
+        now = time.monotonic()
+        if (self._last_sync_at is not None
+                and now - self._last_sync_at < self._sync_read_interval):
+            return
+        try:
+            self._sync(timeout=_READ_SYNC_TIMEOUT)
+        except Exception:
+            self._last_sync_at = now    # don't retry-storm a broken backend
 
     def _write_with_replica_fallback(self, fn):
         """Run a write; on failure, degrade to local once and retry."""
@@ -481,7 +521,7 @@ class Store:
         if self._crystallize and crystallizes:
             self._graph.on_crystallize(mid, crystallizes)
         self._conn.commit()
-        self._sync_now()
+        self._sync()
         self._maybe_forget()
         return {"id": mid, "action": action}
 
@@ -782,6 +822,7 @@ class Store:
 
     def recall(self, query, type=None, limit=20, budget=None, session=None,
                tags=None) -> list:
+        self._maybe_sync_for_read()      # #62: a read-only device pulls too
         tag_list = _parse_tags(tags)
         if not query or not query.strip():
             if not tag_list:
@@ -899,7 +940,7 @@ class Store:
                            (json.dumps(b), now, id_b))
         self._graph.on_link(id_a, id_b)
         self._conn.commit()
-        self._sync_now()
+        self._sync()
         return {"linked": [id_a, id_b]}
 
     def dismiss_cluster(self, id_a, id_b) -> dict:
@@ -933,7 +974,7 @@ class Store:
         if cur.rowcount > 0:
             self._graph.unprime(id)          # #42: don't let it linger as primed context
         self._conn.commit()
-        self._sync_now()
+        self._sync()
         return {"forgotten": id, "existed": cur.rowcount > 0}
 
     def restore(self, id) -> dict:
@@ -973,7 +1014,7 @@ class Store:
             "UPDATE memories SET valid_to=NULL, superseded_by=NULL WHERE id=?",
             (id,))
         self._conn.commit()
-        self._sync_now()
+        self._sync()
         return {"restored": id, "existed": True, "action": "restored"}
 
     def import_records(self, records) -> dict:
@@ -1043,7 +1084,7 @@ class Store:
         cur = self._conn.execute("DELETE FROM memories WHERE id=?", (id,))
         self._graph.on_forget(id)
         self._conn.commit()
-        self._sync_now()
+        self._sync()
         return {"purged": id, "existed": cur.rowcount > 0}
 
     def export_all(self) -> list:
@@ -1064,6 +1105,7 @@ class Store:
         return out
 
     def boot_index(self) -> str:
+        self._maybe_sync_for_read()      # #62: the session-start read pulls too
         rows = self._conn.execute(
             "SELECT id, type, title, updated_at FROM memories WHERE valid_to IS NULL "
             "ORDER BY updated_at DESC, id DESC"

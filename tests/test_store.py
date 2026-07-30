@@ -1506,3 +1506,113 @@ def test_remember_concurrent_new_title_unions_links_not_last_writer_wins(
     assert row is not None
     links = set(_json.loads(row[1]))
     assert links == {1, 2}  # both racers' links survive - neither got dropped
+
+
+# --- #62: reads pull too, debounced ------------------------------------------
+
+class _RecordingSync:
+    """Stands in for sync_now, recording the timeout each call was given."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, timeout=2.0):
+        self.calls.append(timeout)
+
+
+def _sync_store(interval=30, **kw):
+    conn = sqlite3.connect(":memory:")
+    rec = _RecordingSync()
+    s = Store(conn, "d", rec, sync_read_interval=interval, **kw)
+    s.migrate()
+    return s, rec
+
+
+def test_recall_pulls_before_reading():
+    """#62: sync_now only ran after writes, so a device that merely READS never
+    saw other devices' updates - it was stuck at its own startup probe until it
+    happened to write something."""
+    s, rec = _sync_store()
+    s.remember("user", "A", "body a")
+    write_calls = len(rec.calls)
+    assert write_calls >= 1                       # the write itself synced
+
+    s._last_sync_at = None                        # simulate time having passed
+    s.recall("body")
+    assert len(rec.calls) == write_calls + 1, "recall did not pull"
+
+
+def test_boot_index_pulls_before_reading():
+    s, rec = _sync_store()
+    s.remember("user", "A", "body a")
+    before = len(rec.calls)
+    s._last_sync_at = None
+    s.boot_index()
+    assert len(rec.calls) == before + 1
+
+
+def test_read_sync_is_debounced():
+    """A burst of reads must pull once, not once per read."""
+    s, rec = _sync_store(interval=30)
+    s._last_sync_at = None
+    s.recall("anything")
+    after_first = len(rec.calls)
+    for _ in range(5):
+        s.recall("anything")
+    assert len(rec.calls) == after_first, "every read pulled; debounce is not working"
+
+
+def test_writes_reset_the_read_debounce():
+    """A chatty writer already syncs on every write; reads shouldn't then pull
+    again on top of that."""
+    s, rec = _sync_store(interval=30)
+    s._last_sync_at = None
+    s.recall("x")                                 # arms the debounce
+    before = len(rec.calls)
+    s.remember("user", "B", "body b")             # write syncs, resets the clock
+    after_write = len(rec.calls)
+    assert after_write > before
+    s.recall("x")
+    assert len(rec.calls) == after_write, "read pulled despite a just-synced write"
+
+
+def test_read_sync_uses_a_short_timeout():
+    """recall is the latency-visible path: a read-path pull must be bounded far
+    below the 2.0s write default, since the background pull keeps going and
+    lands for the next read anyway."""
+    from tether.store import _READ_SYNC_TIMEOUT
+
+    s, rec = _sync_store()
+    s._last_sync_at = None
+    s.recall("x")
+    assert rec.calls[-1] == _READ_SYNC_TIMEOUT
+    assert _READ_SYNC_TIMEOUT < 2.0
+
+
+def test_read_sync_can_be_disabled():
+    s, rec = _sync_store(interval=0)
+    s._last_sync_at = None
+    s.recall("x")
+    s.boot_index()
+    assert rec.calls == [], "interval 0 must restore write-only syncing"
+
+
+def test_read_sync_failure_never_breaks_the_read():
+    """Degrade-never: an unreachable backend must not turn a recall into an
+    error - it serves local data, exactly as it did before reads pulled."""
+    conn = sqlite3.connect(":memory:")
+
+    def boom(timeout=2.0):
+        raise RuntimeError("backend on fire")
+
+    s = Store(conn, "d", boom, sync_read_interval=30)
+    s.migrate()
+    conn.execute(
+        "INSERT INTO memories(type,title,title_norm,body,tags,links,"
+        "created_at,updated_at,device_id,valid_from) "
+        "VALUES('user','A','a','findable','','[]','2026-01-01','2026-01-01','d','2026-01-01')")
+    conn.commit()
+    s._last_sync_at = None
+    hits = s.recall("findable")
+    assert [h["title"] for h in hits] == ["A"]
+    assert s.boot_index() != ""

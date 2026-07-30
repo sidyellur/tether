@@ -195,3 +195,21 @@ def forget_interval() -> int:
 
 def forget_max_per_sweep() -> int:
     return _pos_int("TETHER_FORGET_MAX_PER_SWEEP", _DEFAULT_FORGET_MAX_PER_SWEEP)
+
+
+_DEFAULT_SYNC_READ_INTERVAL = 30
+
+
+def sync_read_interval() -> int:
+    """Seconds between read-path sync pulls (#62). Reads debounce to at most
+    one pull per interval; 0 disables read-path syncing entirely (restoring
+    the write-only-sync behavior). Unparseable or negative falls back to the
+    default."""
+    raw = os.environ.get("TETHER_SYNC_READ_INTERVAL")
+    if raw is None or not raw.strip():
+        return _DEFAULT_SYNC_READ_INTERVAL
+    try:
+        val = int(raw)
+    except ValueError:
+        return _DEFAULT_SYNC_READ_INTERVAL
+    return val if val >= 0 else _DEFAULT_SYNC_READ_INTERVAL
