@@ -971,7 +971,7 @@ class Store:
                 return self._curated_index(rows, self._graph.degree_map(),
                                            self._boot_index_cap)
             except Exception:
-                pass                                      # curation failure -> capped fallback below
+                pass                      # curation failure -> capped fallback below
         # No graph (or curation failed): still apply the cap, just without
         # hub-curation - a size cap must never depend on graph state (#52).
         return self._recency_capped_index(rows, self._boot_index_cap)
@@ -990,7 +990,7 @@ class Store:
         hubs = sorted(
             (mid for mid in deg if deg[mid] > 0 and mid not in recent_set),
             key=lambda mid: (deg[mid], upd[mid], mid), reverse=True,
-        )[: cap - reserve]                               # degree desc, then updated_at desc, then id desc
+        )[: cap - reserve]               # degree desc, then updated_at desc, then id desc
         chosen = set(hubs) | recent_set
         for mid in newest:                               # fill remaining budget with recency
             if len(chosen) >= cap:

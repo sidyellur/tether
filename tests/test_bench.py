@@ -1,7 +1,9 @@
 import math
 import sqlite3
-from bench import metrics
+
 from bench import corpus as corpus_mod
+from bench import metrics
+
 from tether.store import Store
 
 
@@ -72,7 +74,8 @@ def test_mini_corpus_shape():
 def test_loader_maps_keys_to_ids_and_links():
     import pytest
     pytest.importorskip("numpy")
-    from bench import loader, corpus as corpus_mod
+    from bench import corpus as corpus_mod
+    from bench import loader
     s = _store(assoc=True, embedder=FakeEmbedder())
     id_of = loader.load(corpus_mod.MINI, s)
     assert set(id_of) == {"bug", "pref", "editor", "car"}
@@ -85,7 +88,8 @@ def test_loader_maps_keys_to_ids_and_links():
 def test_assert_golds_far_passes_and_flags():
     import pytest
     pytest.importorskip("numpy")
-    from bench import selfcheck, corpus as corpus_mod
+    from bench import corpus as corpus_mod
+    from bench import selfcheck
     e = FakeEmbedder()
     # MINI graph_only gold ("dave distrusts the ORM layer") shares no vocab
     # token with query ("why did login break") -> cosine 0 -> passes.
@@ -105,7 +109,8 @@ def test_assert_golds_far_passes_and_flags():
 def test_assert_targets_found_passes_and_flags():
     import pytest
     pytest.importorskip("numpy")
-    from bench import selfcheck, loader, corpus as corpus_mod
+    from bench import corpus as corpus_mod
+    from bench import loader, selfcheck
     s = _store(assoc=False, embedder=FakeEmbedder())
     id_of = loader.load(corpus_mod.MINI, s)
     selfcheck.assert_targets_found(corpus_mod.MINI, s, id_of, k=10)
@@ -121,7 +126,8 @@ def test_assert_targets_found_passes_and_flags():
 def test_warm_creates_hebbian_edges():
     import pytest
     pytest.importorskip("numpy")
-    from bench import warmup, loader, corpus as corpus_mod
+    from bench import corpus as corpus_mod
+    from bench import loader, warmup
     s = _store(assoc=True, embedder=FakeEmbedder())
     id_of = loader.load(corpus_mod.MINI, s)
     # before warm-up: no hebbian edges
@@ -137,7 +143,8 @@ def test_warm_creates_hebbian_edges():
 def test_build_conditions_edge_states():
     import pytest
     pytest.importorskip("numpy")
-    from bench import conditions, corpus as corpus_mod
+    from bench import conditions
+    from bench import corpus as corpus_mod
 
     def heb(store):
         return store._conn.execute(
@@ -166,7 +173,8 @@ def test_build_conditions_edge_states():
 def test_run_smoke_all_conditions_both_classes():
     import pytest
     pytest.importorskip("numpy")
-    from bench import run, corpus as corpus_mod
+    from bench import corpus as corpus_mod
+    from bench import run
     rep = run.run(corpus_mod.MINI, FakeEmbedder(), k=5)
     # all four conditions present, both classes measured
     for cond in ("v2", "cold", "warmed", "oracle"):
@@ -189,7 +197,8 @@ def test_evaluate_freeze_leaves_graph_unchanged():
     # learning delta contamination-free.
     import pytest
     pytest.importorskip("numpy")
-    from bench import run, conditions, corpus as corpus_mod
+    from bench import conditions, run
+    from bench import corpus as corpus_mod
     s, id_of = conditions.build(corpus_mod.MINI, "warmed", FakeEmbedder())
     q = "SELECT src,dst,kind,weight FROM edges ORDER BY 1,2,3,4"
     before = s._conn.execute(q).fetchall()
@@ -206,7 +215,8 @@ def test_evaluate_without_freeze_mutates_graph():
     # which is equally contaminating (priming) and equally freeze-restored.
     import pytest
     pytest.importorskip("numpy")
-    from bench import run, conditions, corpus as corpus_mod
+    from bench import conditions, run
+    from bench import corpus as corpus_mod
     s, id_of = conditions.build(corpus_mod.MINI, "warmed", FakeEmbedder())
     qe = "SELECT src,dst,kind,weight FROM edges ORDER BY 1,2,3,4"
     qs = ("SELECT session_id,memory_id,activation FROM session_members "
@@ -219,7 +229,8 @@ def test_evaluate_without_freeze_mutates_graph():
 
 def test_assert_warmup_disjoint_passes_and_flags():
     import pytest
-    from bench import selfcheck, corpus as corpus_mod
+    from bench import corpus as corpus_mod
+    from bench import selfcheck
     # MINI: member titles ("auth 500s", ...) are disjoint from the eval queries.
     selfcheck.assert_warmup_disjoint(corpus_mod.MINI)
     # rigged: an eval query IS a member title -> warmup would train on the exact
@@ -239,7 +250,8 @@ def test_assert_warmup_disjoint_passes_and_flags():
 def test_crystallized_condition_wires_hub_edges():
     import pytest
     pytest.importorskip("numpy")
-    from bench import conditions, corpus as corpus_mod
+    from bench import conditions
+    from bench import corpus as corpus_mod
     s, id_of = conditions.build(corpus_mod.MINI, "crystallized", FakeEmbedder())
     # MINI's 'auth' task has 2 members -> a principle crystallized over both
     # writes 2 directional principle->source edges.
@@ -254,7 +266,8 @@ def test_crystallized_detected_condition_builds():
     # point is that build() runs the detector path without error.
     import pytest
     pytest.importorskip("numpy")
-    from bench import conditions, corpus as corpus_mod
+    from bench import conditions
+    from bench import corpus as corpus_mod
     s, id_of = conditions.build(
         corpus_mod.MINI, "crystallized_detected", FakeEmbedder())
     n = s._conn.execute(
@@ -265,7 +278,8 @@ def test_crystallized_detected_condition_builds():
 def test_assert_principles_far_passes_and_flags():
     import pytest
     pytest.importorskip("numpy")
-    from bench import selfcheck, conditions, corpus as corpus_mod
+    from bench import conditions, selfcheck
+    from bench import corpus as corpus_mod
     e = FakeEmbedder()
     # neutral principle bodies share no vocab with MINI queries/golds -> pass.
     selfcheck.assert_principles_far(corpus_mod.MINI, e, threshold=0.35)
@@ -282,7 +296,8 @@ def test_assert_principles_far_passes_and_flags():
 def test_run_reports_crystallization_block():
     import pytest
     pytest.importorskip("numpy")
-    from bench import run, corpus as corpus_mod
+    from bench import corpus as corpus_mod
+    from bench import run
     rep = run.run(corpus_mod.MINI, FakeEmbedder(), k=5)
     cz = rep["crystallization"]
     for key in ("cold_frozen_ndcg", "warmed_frozen_ndcg", "oracle_frozen_ndcg",

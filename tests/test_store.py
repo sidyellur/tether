@@ -1,6 +1,5 @@
 import json as _json
 import sqlite3
-import tempfile
 import threading
 
 import pytest

@@ -2,9 +2,9 @@
 import sqlite3
 from itertools import combinations
 
-from tether.store import Store
-from tether.graph import HEBBIAN_CAP
 from bench import loader, warmup
+from tether.graph import HEBBIAN_CAP
+from tether.store import Store
 
 
 def _fresh(embedder, assoc, crystallize=False):

@@ -82,8 +82,8 @@ def _expand(members, conn, current):
 
 def _descriptor(conn, member_ids):
     rows = conn.execute(
-        "SELECT title, tags FROM memories WHERE id IN (%s)"
-        % ",".join("?" for _ in member_ids), member_ids).fetchall()
+        f"SELECT title, tags FROM memories WHERE id IN "
+        f"({','.join('?' for _ in member_ids)})", member_ids).fetchall()
     titles = "; ".join(r[0] for r in rows if r[0])
     tags = sorted({t for r in rows for t in (r[1] or "").split(",") if t})
     return titles + (f" [tags: {', '.join(tags)}]" if tags else "")
@@ -144,7 +144,8 @@ def _semantic_outlier_seeds(conn, current):
 
 
 def candidates(conn, embedder=None, fallback=False):
-    """Candidate clusters (peak-seeded, semantic-expanded; dedup + dismissed suppression; optional gated cold-start fallback)."""
+    """Candidate clusters: peak-seeded, semantic-expanded, with dedup +
+    dismissed suppression and an optional gated cold-start fallback."""
     try:
         current = _current_ids(conn)
         if not current:
@@ -172,8 +173,9 @@ def candidates(conn, embedder=None, fallback=False):
                     "peak_key": root_peaks[0],
                     "member_ids": member_ids,
                     "member_titles": [r[0] for r in conn.execute(
-                        "SELECT title FROM memories WHERE id IN (%s) ORDER BY id"
-                        % ",".join("?" for _ in member_ids), member_ids).fetchall()],
+                        f"SELECT title FROM memories WHERE id IN "
+                        f"({','.join('?' for _ in member_ids)}) ORDER BY id",
+                        member_ids).fetchall()],
                     "why": [(a, b, "peak") for a, b in root_peaks],
                     "descriptor": _descriptor(conn, member_ids),
                 })
@@ -192,8 +194,9 @@ def candidates(conn, embedder=None, fallback=False):
                     "peak_key": (node, node),              # semantic seed: self-key
                     "member_ids": member_ids,
                     "member_titles": [r[0] for r in conn.execute(
-                        "SELECT title FROM memories WHERE id IN (%s) ORDER BY id"
-                        % ",".join("?" for _ in member_ids), member_ids).fetchall()],
+                        f"SELECT title FROM memories WHERE id IN "
+                        f"({','.join('?' for _ in member_ids)}) ORDER BY id",
+                        member_ids).fetchall()],
                     "why": [("semantic-density", node, "fallback")],
                     "descriptor": _descriptor(conn, member_ids),
                 })
