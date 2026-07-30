@@ -197,6 +197,23 @@ def forget_max_per_sweep() -> int:
     return _pos_int("TETHER_FORGET_MAX_PER_SWEEP", _DEFAULT_FORGET_MAX_PER_SWEEP)
 
 
+_DEFAULT_EXCERPT_CHARS = 500
+
+
+def excerpt_chars() -> int:
+    """Width of the relevance-centered excerpt recall returns per hit (#30).
+    0 restores full-body recall. Unparseable or negative falls back to the
+    default."""
+    raw = os.environ.get("TETHER_EXCERPT_CHARS")
+    if raw is None or not raw.strip():
+        return _DEFAULT_EXCERPT_CHARS
+    try:
+        val = int(raw)
+    except ValueError:
+        return _DEFAULT_EXCERPT_CHARS
+    return val if val >= 0 else _DEFAULT_EXCERPT_CHARS
+
+
 _DEFAULT_SYNC_READ_INTERVAL = 30
 
 

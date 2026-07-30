@@ -70,7 +70,8 @@ def _get_store() -> Store:
                       forget_age_days=config.forget_age_days(),
                       forget_interval=config.forget_interval(),
                       forget_max_per_sweep=config.forget_max_per_sweep(),
-                      sync_read_interval=config.sync_read_interval())
+                      sync_read_interval=config.sync_read_interval(),
+                      excerpt_chars=config.excerpt_chars())
         store.migrate()
         if embedder is not None:
             store.backfill_embeddings()
@@ -110,7 +111,8 @@ def remember(type: str, title: str, body: str,
 @mcp.tool()
 def recall(query: str = "", type: str | None = None, limit: int = 20,
            budget: int | None = None, session: str | None = None,
-           tags: str | None = None) -> dict:
+           tags: str | None = None, id: int | None = None,
+           full: bool = False) -> dict:
     """Search memories by keyword and semantic similarity, then follow the
     usage graph to related memories, most relevant first.
 
@@ -119,6 +121,11 @@ def recall(query: str = "", type: str | None = None, limit: int = 20,
     reached through). Use `updated_at` to judge staleness (an old fact may no
     longer hold; verify before relying on it) and `id` to cite what you update
     via remember/link.
+
+    `body` is an EXCERPT centered on your query, not the whole memory. When a
+    memory was longer than the excerpt, the hit also carries `truncated: true`
+    and `body_chars` (the full length). To read one in full, call
+    recall(id=N) - that returns just that memory, whole.
 
     Args:
         query: free text; punctuation is safe. May be omitted if `tags` is given.
@@ -131,11 +138,19 @@ def recall(query: str = "", type: str | None = None, limit: int = 20,
             hits, or use alone (query omitted) to list every current memory
             with those tags, newest first, deterministic rather than
             ranked - raise `limit` to fetch beyond the default page size.
+        id: fetch this one memory in full instead of searching. Use it after a
+            search returns a `truncated` hit you want to read completely.
+        full: return complete bodies for every hit instead of excerpts. Costs
+            the whole payload - prefer id= for the one memory you actually need.
     """
     try:
-        return {"results": _get_store().recall(
+        store = _get_store()
+        if id is not None:
+            hit = store.get(id)
+            return {"results": [hit] if hit else []}
+        return {"results": store.recall(
             query, type=type, limit=limit, budget=budget, session=session,
-            tags=tags)}
+            tags=tags, full=full)}
     except Exception as e:
         return {"error": str(e)}
 

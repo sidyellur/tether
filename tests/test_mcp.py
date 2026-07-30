@@ -446,3 +446,40 @@ def test_mcp_crystallization_resource(tmp_path):
                 assert isinstance(data["candidates"], list)
 
     asyncio.run(run())
+
+
+def test_mcp_recall_excerpts_then_fetches_whole(tmp_path):
+    """#30 end-to-end over stdio: a search returns a marked excerpt, and
+    recall(id=N) - an overload rather than a fifth verb - returns that memory
+    whole. This is the contract an agent actually sees."""
+    long_body = ("preamble. " + "filler. " * 300
+                 + " the DISTINCTIVE detail sits here. " + "tail. " * 300)
+    env = dict(os.environ, TETHER_DB=str(tmp_path / "mem.db"),
+               TETHER_DEVICE_ID="ci", TETHER_SEMANTIC="0")
+    env.pop("TETHER_SYNC_URL", None)
+    env.pop("TETHER_SYNC_TOKEN", None)
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "tether.server"], env=env)
+
+    async def run():
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                await session.call_tool("remember", {
+                    "type": "project", "title": "Big", "body": long_body})
+
+                found = json.loads(_text(await session.call_tool(
+                    "recall", {"query": "distinctive"})))["results"]
+                assert found, "excerpted recall lost the hit entirely"
+                hit = found[0]
+                assert hit["truncated"] is True
+                assert hit["body_chars"] == len(long_body)
+                assert len(hit["body"]) < len(long_body) / 5
+                assert "DISTINCTIVE" in hit["body"]
+
+                whole = json.loads(_text(await session.call_tool(
+                    "recall", {"id": hit["id"]})))["results"]
+                assert whole[0]["body"] == long_body
+                assert "truncated" not in whole[0]
+
+    asyncio.run(run())
