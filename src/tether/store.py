@@ -903,6 +903,16 @@ class Store:
         return {"linked": [id_a, id_b]}
 
     def dismiss_cluster(self, id_a, id_b) -> dict:
+        """Reflection control, not a memory operation. Refuses when
+        crystallization is off (#65): dismissals are persistent rows in
+        crystallize_dismissed, so a stray call against a store that isn't
+        crystallizing would silently suppress a candidate later, whenever the
+        feature does get enabled. Nothing else in tether consumes the table,
+        so writing it while disabled is pure future damage."""
+        if not self._crystallize:
+            raise ValueError(
+                "crystallization is not enabled (set TETHER_CRYSTALLIZE=1); "
+                "dismiss_cluster has nothing to dismiss")
         self._graph.dismiss_peak(id_a, id_b)
         return {"dismissed": [id_a, id_b]}
 
