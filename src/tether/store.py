@@ -974,25 +974,35 @@ class Store:
             raise ValueError(f"no memory with id {mid}")
         return json.loads(row[0])
 
-    def link(self, id_a, id_b) -> dict:
-        # Resolve + validate ids outside the retry wrapper: a bad id raises
-        # ValueError here, which must surface as-is rather than be mistaken
-        # for a replica write failure and trigger a needless degrade.
-        a = self._links_of(id_a)
-        b = self._links_of(id_b)
-        if id_b not in a:
-            a.append(id_b)
-        if id_a not in b:
-            b.append(id_a)
-        return self._write_with_replica_fallback(
-            lambda: self._link_impl(id_a, id_b, a, b))
+    # #38: union the new id into links inside the statement itself, rather than
+    # SELECT-ing the list into Python, appending, and writing it back. The old
+    # read-modify-write ran its SELECT outside any transaction (sqlite3 only
+    # opens one on the first DML), so two concurrent link() calls touching the
+    # same memory could both read the same "before" list and the later UPDATE
+    # would clobber the earlier one's addition - the reproduction in #38 left
+    # every node with 1 of its 3 expected links. Computing the union in SQL
+    # makes each UPDATE self-contained: it reads the row's true current value
+    # at write time, under the row lock, so there is no window to lose.
+    _LINK_UNION_SQL = (
+        "UPDATE memories SET links = ("
+        "    SELECT json_group_array(value) FROM ("
+        "        SELECT value FROM json_each(memories.links)"
+        "        UNION SELECT ?))"
+        ", updated_at = ? WHERE id = ?")
 
-    def _link_impl(self, id_a, id_b, a, b) -> dict:
+    def link(self, id_a, id_b) -> dict:
+        # Validate ids outside the retry wrapper: a bad id raises ValueError
+        # here, which must surface as-is rather than be mistaken for a replica
+        # write failure and trigger a needless degrade.
+        self._links_of(id_a)
+        self._links_of(id_b)
+        return self._write_with_replica_fallback(
+            lambda: self._link_impl(id_a, id_b))
+
+    def _link_impl(self, id_a, id_b) -> dict:
         now = _now()
-        self._conn.execute("UPDATE memories SET links=?, updated_at=? WHERE id=?",
-                           (json.dumps(a), now, id_a))
-        self._conn.execute("UPDATE memories SET links=?, updated_at=? WHERE id=?",
-                           (json.dumps(b), now, id_b))
+        self._conn.execute(self._LINK_UNION_SQL, (id_b, now, id_a))
+        self._conn.execute(self._LINK_UNION_SQL, (id_a, now, id_b))
         self._graph.on_link(id_a, id_b)
         self._conn.commit()
         self._sync()

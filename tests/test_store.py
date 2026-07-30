@@ -1751,3 +1751,83 @@ def test_consolidation_invalidates_the_cache():
     s.recall("vehicle")
     s.remember("user", "Auto", "I drive my automobile")   # near-duplicate
     assert s._emb_cache is None
+
+
+# --- #38: concurrent link() must not lose updates ----------------------------
+
+def test_concurrent_links_do_not_clobber_each_other(tmp_path):
+    """#38: link() used to SELECT the links list into Python, append, and write
+    it back. That SELECT ran outside any transaction (sqlite3 only opens one on
+    the first DML), so two concurrent link() calls touching the same memory
+    both read the same "before" list and the later UPDATE clobbered the
+    earlier one's addition.
+
+    This is the issue's own reproduction: 4 memories, all 6 pairwise links
+    fired from genuinely simultaneous threads on separate connections, so every
+    node is touched by 3 of the 6 calls - the worst case for the race. Against
+    the old read-modify-write every node ended up with 1 of its 3 expected
+    links; each must now keep all 3.
+    """
+    import itertools
+
+    db_path = tmp_path / "memory.db"
+    seed = _file_store(db_path, assoc=True)
+    ids = [seed.remember("user", f"M{i}", f"body {i}")["id"] for i in range(4)]
+
+    pairs = list(itertools.combinations(ids, 2))
+    barrier = threading.Barrier(len(pairs))
+    errors = []
+
+    def worker(a, b):
+        store = _file_store(db_path, assoc=True)
+        try:
+            barrier.wait(timeout=10)      # fire all six at the same instant
+            store.link(a, b)
+        except Exception as e:            # surfaced via `errors`, asserted below
+            errors.append(e)
+        finally:
+            store._conn.close()
+
+    threads = [threading.Thread(target=worker, args=p) for p in pairs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert not errors, f"link() raised under concurrency: {errors}"
+    check = sqlite3.connect(str(db_path))
+    for mid in ids:
+        stored = set(_json.loads(check.execute(
+            "SELECT links FROM memories WHERE id=?", (mid,)).fetchone()[0]))
+        assert stored == set(ids) - {mid}, (
+            f"memory {mid} lost links: has {sorted(stored)}, "
+            f"expected {sorted(set(ids) - {mid})}")
+    # the edges table was always correct (atomic upsert); assert it stays so,
+    # since memories.links is the only source of truth if edges were rebuilt
+    assert check.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='explicit'").fetchone()[0] == len(pairs)
+
+
+def test_link_is_idempotent_and_does_not_duplicate():
+    s = make_store()
+    a = s.remember("user", "A", "body a")["id"]
+    b = s.remember("user", "B", "body b")["id"]
+    s.link(a, b)
+    s.link(a, b)                                    # again
+    s.link(b, a)                                    # and reversed
+    assert _json.loads(s._conn.execute(
+        "SELECT links FROM memories WHERE id=?", (a,)).fetchone()[0]) == [b]
+    assert _json.loads(s._conn.execute(
+        "SELECT links FROM memories WHERE id=?", (b,)).fetchone()[0]) == [a]
+
+
+def test_link_preserves_links_added_by_remember():
+    """The SQL union must merge with what's already there, not replace it."""
+    s = make_store()
+    a = s.remember("user", "A", "body a")["id"]
+    b = s.remember("user", "B", "body b")["id"]
+    c = s.remember("user", "C", "body c", links=[a])["id"]
+    s.link(c, b)
+    stored = set(_json.loads(s._conn.execute(
+        "SELECT links FROM memories WHERE id=?", (c,)).fetchone()[0]))
+    assert stored == {a, b}, f"link() dropped a pre-existing link: {stored}"
