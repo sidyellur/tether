@@ -12,11 +12,28 @@ from pathlib import Path
 SyncConfig = namedtuple("SyncConfig", ["url", "token"])
 
 
+def _is_windows() -> bool:
+    """Indirection so tests can exercise the Windows branch on any host -
+    monkeypatching os.name directly would also change what pathlib
+    instantiates, which fails outright on a POSIX box."""
+    return os.name == "nt"
+
+
 def db_path() -> Path:
+    """Where memory.db lives. TETHER_DB wins; then XDG_DATA_HOME (honored on
+    every platform, since someone who sets it means it); then the platform's
+    own convention - %LOCALAPPDATA% on Windows (#68), ~/.local/share
+    elsewhere."""
     override = os.environ.get("TETHER_DB")
     if override:
         return Path(override)
-    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    base = os.environ.get("XDG_DATA_HOME")
+    if not base:
+        if _is_windows():
+            base = (os.environ.get("LOCALAPPDATA")
+                    or str(Path.home() / "AppData" / "Local"))
+        else:
+            base = str(Path.home() / ".local" / "share")
     return Path(base) / "tether" / "memory.db"
 
 

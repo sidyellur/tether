@@ -53,7 +53,7 @@ crystallization (Tier B2) each have their own design doc under
 
 ## Install
 
-Requires Python ≥3.10 on a POSIX system (Linux/macOS).
+Requires Python ≥3.10 on Linux, macOS, or Windows.
 
 Register it with Claude Code — with [uv](https://docs.astral.sh/uv/):
 
@@ -74,7 +74,9 @@ label Claude Code uses to refer to this server; it doesn't need to match the
 installed command.)
 
 By default memory lives in a local SQLite file at
-`~/.local/share/tether/memory.db` (override with `TETHER_DB`). No accounts, no
+`~/.local/share/tether/memory.db` — on Windows,
+`%LOCALAPPDATA%\tether\memory.db` (override either with `TETHER_DB`, or set
+`XDG_DATA_HOME`, which is honored on every platform). No accounts, no
 network — this is the whole tool for a single machine.
 
 ## Sync across devices (optional)

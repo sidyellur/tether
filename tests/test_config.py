@@ -180,3 +180,37 @@ def test_crystallize_off_by_default(monkeypatch):
         assert config.crystallize_enabled() is True
     monkeypatch.setenv("TETHER_CRYSTALLIZE", "0")
     assert config.crystallize_enabled() is False
+
+
+def test_db_path_uses_localappdata_on_windows(monkeypatch):
+    """#68: ~/.local/share technically works on Windows but isn't where a
+    Windows user expects application data. LOCALAPPDATA is."""
+    monkeypatch.delenv("TETHER_DB", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setattr(config, "_is_windows", lambda: True)
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\me\AppData\Local")
+    assert config.db_path() == Path(r"C:\Users\me\AppData\Local") / "tether" / "memory.db"
+
+
+def test_db_path_falls_back_under_windows_without_localappdata(monkeypatch):
+    monkeypatch.delenv("TETHER_DB", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(config, "_is_windows", lambda: True)
+    assert config.db_path() == Path.home() / "AppData" / "Local" / "tether" / "memory.db"
+
+
+def test_xdg_still_wins_on_windows(monkeypatch):
+    """Someone who sets XDG_DATA_HOME means it, whatever the platform."""
+    monkeypatch.delenv("TETHER_DB", raising=False)
+    monkeypatch.setattr(config, "_is_windows", lambda: True)
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\me\AppData\Local")
+    monkeypatch.setenv("XDG_DATA_HOME", "/tmp/xdg")
+    assert config.db_path() == Path("/tmp/xdg") / "tether" / "memory.db"
+
+
+def test_posix_default_is_unchanged(monkeypatch):
+    monkeypatch.delenv("TETHER_DB", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setattr(config, "_is_windows", lambda: False)
+    assert config.db_path() == Path.home() / ".local" / "share" / "tether" / "memory.db"
