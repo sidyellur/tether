@@ -13,13 +13,20 @@ Run it as an MCP stdio server:
 
 import json
 
-from mcp.server.fastmcp import FastMCP
+try:
+    # mcp >= 2.0 (released 2026-07-28) renamed FastMCP -> MCPServer and moved
+    # it to mcp.server.mcpserver, with no back-compat alias (#69). The surface
+    # tether uses - constructor, @tool(), @resource(uri), run() - is identical
+    # across both, so a plain import shim covers both majors.
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # pragma: no cover - exercised by whichever mcp is installed
+    from mcp.server.fastmcp import FastMCP as MCPServer
 
 from . import config
 from .store import Store
 from .sync import open_connection
 
-mcp = FastMCP("tether")
+mcp = MCPServer("tether")
 
 _store = None
 _sync_mode = None
