@@ -1616,3 +1616,138 @@ def test_read_sync_failure_never_breaks_the_read():
     hits = s.recall("findable")
     assert [h["title"] for h in hits] == ["A"]
     assert s.boot_index() != ""
+
+
+# --- #61: cached embedding matrix -------------------------------------------
+
+def _cache_store(**kw):
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              sync_read_interval=0, **kw)
+    s.migrate()
+    return s
+
+
+def test_embedding_matrix_is_cached_between_reads():
+    s = _cache_store()
+    s.remember("user", "Car", "I drive my automobile")
+    s.recall("vehicle")
+    cached = s._emb_cache
+    assert cached is not None
+    s.recall("vehicle")
+    assert s._emb_cache is cached, "second read rebuilt the matrix"
+
+
+def test_write_invalidates_the_cache():
+    s = _cache_store()
+    s.remember("user", "Car", "I drive my automobile")
+    s.recall("vehicle")
+    assert s._emb_cache is not None
+    s.remember("user", "Pizza", "I eat pizza")
+    assert s._emb_cache is None, "a write left a stale matrix in place"
+
+
+def test_new_memory_is_semantically_findable_immediately():
+    """The invalidation actually matters: a cached matrix that survived a write
+    would make the new memory invisible to semantic recall."""
+    s = _cache_store()
+    s.remember("user", "Car", "I drive my automobile")
+    s.recall("vehicle")                       # warm the cache
+    s.remember("user", "Pizza", "I eat pizza at every meal")
+    hits = s.recall("food")
+    assert "Pizza" in [h["title"] for h in hits]
+
+
+def test_forgotten_memory_leaves_semantic_results_immediately():
+    """The dangerous direction: a stale matrix would keep serving a memory the
+    user just deleted."""
+    s = _cache_store()
+    s.remember("user", "Car", "I drive my automobile")
+    pid = s.remember("user", "Pizza", "I eat pizza at every meal")["id"]
+    assert "Pizza" in [h["title"] for h in s.recall("food")]
+    s.forget(pid)
+    assert "Pizza" not in [h["title"] for h in s.recall("food")]
+
+
+def test_purged_memory_leaves_semantic_results_immediately():
+    s = _cache_store()
+    s.remember("user", "Car", "I drive my automobile")
+    pid = s.remember("user", "Pizza", "I eat pizza at every meal")["id"]
+    s.recall("food")
+    s.purge(pid)
+    assert "Pizza" not in [h["title"] for h in s.recall("food")]
+
+
+def test_restored_memory_returns_to_semantic_results_immediately():
+    s = _cache_store()
+    s.remember("user", "Car", "I drive my automobile")
+    pid = s.remember("user", "Pizza", "I eat pizza at every meal")["id"]
+    s.forget(pid)
+    s.recall("food")                          # warm the cache WITHOUT pizza
+    s.restore(pid)
+    assert "Pizza" in [h["title"] for h in s.recall("food")]
+
+
+def test_backfill_leaves_a_fresh_not_stale_cache():
+    """backfill_embeddings rewrites vectors wholesale, then hands the rebuilt
+    matrix to backfill_semantic - so afterwards the cache is populated rather
+    than empty. What matters is that it reflects the NEW vectors: assert
+    freshness, not emptiness."""
+    s = _cache_store()
+    a = s.remember("user", "Car", "I drive my automobile")["id"]
+    s.recall("vehicle")
+    stale = s._emb_cache
+    assert stale is not None
+
+    b = s.remember("user", "Pizza", "I eat pizza at every meal")["id"]
+    s._conn.execute("UPDATE memories SET embedding=NULL")
+    s._conn.commit()
+    s.backfill_embeddings()
+
+    ids, mat, _types = s._embedding_matrix()
+    assert s._emb_cache is not stale, "backfill kept the pre-backfill matrix"
+    assert set(ids) == {a, b}, f"cache missed a backfilled row: {ids}"
+    assert mat.shape[0] == 2
+    assert "Pizza" in [h["title"] for h in s.recall("food")]
+
+
+def test_cached_and_uncached_recall_agree():
+    """Equivalence: the cache is an optimization, so a warm store and a store
+    forced to rescan on every call must return byte-identical results. This is
+    the test that would catch a subtly-wrong filter in the cached path."""
+    s = _cache_store()
+    for t, title, body in [
+            ("user", "Car", "I drive my automobile to work"),
+            ("user", "Pizza", "I eat pizza at every meal"),
+            ("project", "Tests", "pytest runs the python tests"),
+            ("reference", "Driving", "driving a vehicle safely"),
+            ("project", "Cooking", "cooking food is a meal skill")]:
+        s.remember(t, title, body)
+
+    for query in ("vehicle", "food", "code", "automobile meal", "nothing here"):
+        for type_ in (None, "user", "project", "reference"):
+            s._invalidate_embedding_cache()
+            cold = s._vector_ids(query, type_)
+            warm = s._vector_ids(query, type_)      # same call, now cached
+            assert cold == warm, f"cache changed results for {query!r}/{type_!r}"
+
+
+def test_type_filter_is_honored_through_the_cache():
+    """The cache is unfiltered and filters in Python, so the type filter is the
+    likeliest place for it to go wrong."""
+    s = _cache_store()
+    s.remember("user", "Car", "I drive my automobile")
+    s.remember("project", "Vehicles", "a project about driving a car")
+    ids = s._vector_ids("vehicle", "project")
+    types = {s._conn.execute("SELECT type FROM memories WHERE id=?", (i,)).fetchone()[0]
+             for i in ids}
+    assert types <= {"project"}, f"type filter leaked: {types}"
+
+
+def test_consolidation_invalidates_the_cache():
+    s = _cache_store(consolidate=True, dedup_threshold=0.9)
+    s.remember("user", "Car", "I drive my automobile")
+    s.recall("vehicle")
+    s.remember("user", "Auto", "I drive my automobile")   # near-duplicate
+    assert s._emb_cache is None
