@@ -360,6 +360,67 @@ def test_status_resource_reports_degraded_sync(monkeypatch, tmp_path):
         server._sync_mode = None
 
 
+def _surface(tmp_path, **extra_env):
+    """Tool names + resource URIs an agent is actually offered, over real stdio."""
+    env = dict(os.environ, TETHER_DB=str(tmp_path / "mem.db"),
+               TETHER_DEVICE_ID="ci", TETHER_SEMANTIC="0", **extra_env)
+    env.pop("TETHER_SYNC_URL", None)
+    env.pop("TETHER_SYNC_TOKEN", None)
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "tether.server"], env=env)
+
+    async def run():
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = {t.name for t in (await session.list_tools()).tools}
+                resources = {str(r.uri)
+                             for r in (await session.list_resources()).resources}
+                return tools, resources
+
+    return asyncio.run(run())
+
+
+def test_crystallization_surface_hidden_by_default(tmp_path):
+    """#65: with TETHER_CRYSTALLIZE off (the default), the agent must be offered
+    exactly the four memory verbs - not a fifth tool it can only misuse and a
+    resource that can only return an empty list."""
+    tools, resources = _surface(tmp_path)
+
+    assert tools == EXPECTED_TOOLS, f"expected only the four verbs, got {tools}"
+    assert "dismiss_cluster" not in tools
+    assert not any("crystallization" in u for u in resources), resources
+
+
+def test_crystallization_surface_appears_when_enabled(tmp_path):
+    """...and the same surface DOES appear once the feature is on, so the gate
+    hides the tool rather than removing it."""
+    tools, resources = _surface(tmp_path, TETHER_CRYSTALLIZE="1")
+
+    assert "dismiss_cluster" in tools
+    assert EXPECTED_TOOLS <= tools
+    assert any("crystallization" in u for u in resources), resources
+
+
+def test_dismiss_cluster_refuses_when_crystallization_off(tmp_path):
+    """Defense in depth: hiding the tool stops an agent being *offered* it, but
+    the store must also refuse the write. crystallize_dismissed rows are
+    persistent and nothing else consumes them, so a stray dismissal against a
+    non-crystallizing store would silently suppress a candidate later, whenever
+    the feature does get enabled."""
+    import sqlite3
+
+    from tether.store import Store
+
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, assoc=True)   # crystallize off
+    s.migrate()
+    with pytest.raises(ValueError, match="crystallization is not enabled"):
+        s.dismiss_cluster(1, 2)
+    n = conn.execute("SELECT COUNT(*) FROM crystallize_dismissed").fetchone()[0]
+    assert n == 0, "a refused dismissal must not leave a row behind"
+
+
 def test_mcp_crystallization_resource(tmp_path):
     """Test that the tether://crystallization resource is wired and returns valid JSON."""
     env = dict(os.environ, TETHER_DB=str(tmp_path / "mem.db"),

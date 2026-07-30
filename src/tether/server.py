@@ -148,10 +148,13 @@ def link(id_a: int, id_b: int) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
 def dismiss_cluster(id_a: int, id_b: int) -> dict:
     """Reflection control: dismiss the crystallization candidate nucleated by the
-    peak edge (id_a, id_b) so it is not re-surfaced. Not a memory operation."""
+    peak edge (id_a, id_b) so it is not re-surfaced. Not a memory operation.
+
+    Registered as an MCP tool only when TETHER_CRYSTALLIZE is on - see the
+    _register_crystallization_surface() call at the bottom of this module.
+    """
     try:
         return _get_store().dismiss_cluster(id_a, id_b)
     except Exception as e:
@@ -207,16 +210,39 @@ def status() -> str:
         return json.dumps({"error": str(e)})
 
 
-@mcp.resource("tether://crystallization")
 def crystallization() -> str:
     """Pull-only reflection view: candidate clusters that may want a name. Read
     it during a reflection pass (NOT auto-loaded). For each cluster, name it via
     remember(..., crystallizes=member_ids) or drop it via dismiss_cluster(peak).
+
+    Registered as an MCP resource only when TETHER_CRYSTALLIZE is on.
     """
     try:
         return json.dumps({"candidates": _get_store().crystallization_candidates()})
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+def _register_crystallization_surface() -> bool:
+    """Register the crystallization tool + resource only when the feature is on
+    (#65). With it off - the default - tether's MCP surface is exactly the four
+    memory verbs the README promises, instead of a fifth tool an agent can only
+    misuse and a resource that can only return an empty list.
+
+    Both functions are defined unconditionally above and merely *registered*
+    here, so importing this module gives the same Python surface either way -
+    only what the agent is offered changes. Reading the env at import time is
+    consistent with the module's promise that import never touches the
+    filesystem: config here is a pure environment read.
+    """
+    if not config.crystallize_enabled():
+        return False
+    mcp.tool()(dismiss_cluster)
+    mcp.resource("tether://crystallization")(crystallization)
+    return True
+
+
+_crystallization_registered = _register_crystallization_surface()
 
 
 def main():
