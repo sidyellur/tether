@@ -230,7 +230,7 @@ principle-worthy is a strong signal.
 | Tool | What it does |
 |---|---|
 | `remember(type, title, body, tags?, links?, crystallizes?)` | Save a memory; upserts on `type`+`title` so facts refine rather than duplicate. `crystallizes=[ids]` writes it as a principle over those sources (needs `TETHER_CRYSTALLIZE`) |
-| `recall(query?, type?, limit?, budget?, session?, tags?)` | Hybrid keyword + semantic search, then follows the usage graph to related memories; returns id/type/title/body/tags/updated_at + a `via` receipt. `tags` is an exact-match filter (a memory must carry every listed tag); combine it with `query`, or omit `query` for a guaranteed-complete tag lookup |
+| `recall(query?, type?, limit?, budget?, session?, tags?, id?, full?)` | Hybrid keyword + semantic search, then follows the usage graph to related memories; returns id/type/title/body/tags/updated_at + a `via` receipt. `body` is a **query-centered excerpt** — see [Excerpts](#excerpts) — with `id=N` fetching one memory whole. `tags` is an exact-match filter (a memory must carry every listed tag); combine it with `query`, or omit `query` for a guaranteed-complete tag lookup |
 | `link(id_a, id_b)` | Bidirectional link between two memories |
 | `forget(id)` | Soft-delete a memory: marks it no longer current (excluded from recall/the boot index) via the same reversible `valid_to` machinery as consolidation, rather than deleting the row. See [Export and permanent deletion](#export-and-permanent-deletion) for a real, permanent delete |
 | `dismiss_cluster(id_a, id_b)` | Reflection control (crystallization): drop the candidate cluster nucleated by peak edge `(id_a, id_b)` so it isn't re-surfaced. Not a memory operation; only relevant with `TETHER_CRYSTALLIZE` |
@@ -241,6 +241,35 @@ one-line-per-memory index surfaced each session), the pull-only
 counts, DB path — for debugging what's actually active), and, with
 `TETHER_CRYSTALLIZE`, the pull-only `tether://crystallization` (candidate
 clusters for a reflection pass).
+
+## Excerpts
+
+`recall` returns a **relevance-centered excerpt** of each memory's body, not
+the whole thing — the window is centered on the first query term that appears,
+so you see *why* the memory matched rather than just its opening lines. A hit
+that was cut also carries `truncated: true` and `body_chars` (the real length),
+and you fetch the one memory you actually want in full with `recall(id=N)`.
+
+This is the search-engine shape: the result list is an index of pointers with
+enough text to judge relevance, not a payload of documents. It matters because
+memories can be large — a single 44KB journal memory made unrelated queries
+cost ~57–67KB per call while the retrieval itself took under a millisecond.
+The response was fat, not the engine:
+
+| query | full bodies | excerpts |
+|---|---|---|
+| `seed dominance` | 57.0KB | **1.4KB** |
+| `hebbian edges` | 66.9KB | **2.0KB** |
+| `cold start latency` | 66.9KB | **2.0KB** |
+
+A memory shorter than the excerpt width is returned whole and unmarked, exactly
+as before.
+
+| Var / arg | Default | Effect |
+|---|---|---|
+| `TETHER_EXCERPT_CHARS` | `500` | excerpt width; `0` returns full bodies |
+| `id` (per call) | — | fetch just this memory, whole |
+| `full` (per call) | `false` | full bodies for every hit — costs the whole payload; prefer `id=` |
 
 ## Export and permanent deletion
 

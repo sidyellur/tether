@@ -196,6 +196,57 @@ def _decay_factor(age_days: float, half_life_days: float) -> float:
 # than something recall has to block on.
 _READ_SYNC_TIMEOUT = 1.0
 
+# Default excerpt width (#30). recall used to return every hit's FULL body, so
+# one 55KB memory made unrelated queries cost 77KB of serialize-and-pipe while
+# the retrieval itself took under a millisecond - the response was fat, not the
+# engine. Search engines solved this long ago: return a ranked index of
+# pointers with enough text to judge relevance, and let the caller fetch the
+# one document it actually wants. 500 chars is the issue's own estimate for
+# taking those 77KB payloads to ~1-2KB.
+_EXCERPT_CHARS = 500
+# How far to hunt for a word boundary before giving up and cutting mid-word.
+_EXCERPT_SNAP = 40
+
+
+def _excerpt(body: str, query, max_chars: int):
+    """(text, truncated) - a relevance-centered window of `body`.
+
+    Centers on the first query term that appears in the body, so the caller
+    sees WHY the memory matched rather than just its opening lines. Falls back
+    to the head of the body when nothing matches (a semantic-only hit, or a
+    tag lookup with no query at all). Ellipses mark where text was cut.
+    """
+    if max_chars <= 0 or not body or len(body) <= max_chars:
+        return body, False
+    low = body.lower()
+    pos = -1
+    for tok in re.split(r"\W+", (query or "").lower()):
+        if len(tok) < 3:
+            continue                    # too short to locate anything useful
+        found = low.find(tok)
+        if found != -1 and (pos == -1 or found < pos):
+            pos = found
+    if pos == -1:
+        cut = body[:max_chars].rstrip()
+        return cut + "…", True
+    start = max(0, pos - max_chars // 2)
+    end = min(len(body), start + max_chars)
+    start = max(0, end - max_chars)     # re-anchor if we hit the tail
+    if start > 0:                       # snap forward to a word boundary
+        space = body.find(" ", start, start + _EXCERPT_SNAP)
+        if space != -1:
+            start = space + 1
+    if end < len(body):                 # snap back to a word boundary
+        space = body.rfind(" ", max(start, end - _EXCERPT_SNAP), end)
+        if space != -1:
+            end = space
+    out = body[start:end].strip()
+    if start > 0:
+        out = "…" + out
+    if end < len(body):
+        out = out + "…"
+    return out, True
+
 
 class Store:
     def __init__(self, conn, device_id: str, sync_now, embedder=None,
@@ -206,6 +257,7 @@ class Store:
                  boot_index_cap=50, forget=False, forget_age_days=90,
                  forget_interval=20, forget_max_per_sweep=10,
                  session_sweep_interval=50, sync_read_interval=30,
+                 excerpt_chars=_EXCERPT_CHARS,
                  db_path=None, on_degrade=None):
         self._conn = conn
         self._device_id = device_id
@@ -248,6 +300,7 @@ class Store:
         # too, debounced to at most once per this many seconds (0/None = off).
         self._sync_read_interval = sync_read_interval
         self._last_sync_at = None
+        self._excerpt_chars = excerpt_chars
         # #61: (ids, matrix, types) for every current embedding, built once and
         # reused until a write invalidates it. Before this, _vector_ids,
         # _find_near_duplicate and graph.on_remember each re-read and
@@ -875,14 +928,41 @@ class Store:
         ids = [mid for mid, tags_s in rows if _tags_match(tags_s, tag_list)]
         return self._hydrate(ids[:limit])
 
+    def get(self, id) -> dict:
+        """One memory, whole - the fetch half of snippet-plus-fetch (#30).
+        Returns None when the id doesn't exist or is no longer current."""
+        self._maybe_sync_for_read()
+        hits = self._hydrate([id])
+        return hits[0] if hits else None
+
+    def _excerpt_hits(self, hits, query, full) -> list:
+        """Replace each hit's body with a relevance-centered excerpt (#30).
+
+        Keeps the `body` key rather than renaming it to `excerpt`: a caller
+        doing hit["body"] keeps working, it just gets the part that matters
+        instead of tens of KB. `truncated` and `body_chars` are added only when
+        text was actually cut, so a hit that fits is byte-identical to before
+        and the agent can tell when there is more to fetch.
+        """
+        if full or not self._excerpt_chars:
+            return hits
+        for h in hits:
+            text, cut = _excerpt(h["body"], query, self._excerpt_chars)
+            if cut:
+                h["body_chars"] = len(h["body"])
+                h["truncated"] = True
+            h["body"] = text
+        return hits
+
     def recall(self, query, type=None, limit=20, budget=None, session=None,
-               tags=None) -> list:
+               tags=None, full=False) -> list:
         self._maybe_sync_for_read()      # #62: a read-only device pulls too
         tag_list = _parse_tags(tags)
         if not query or not query.strip():
             if not tag_list:
                 return []
-            return self._recall_by_tags(type, tag_list, limit)
+            return self._excerpt_hits(
+                self._recall_by_tags(type, tag_list, limit), query, full)
         seeds = self._seed_scores(query, type)
         if tag_list:
             tags_by_id = self._tags_of_many(list(seeds))
@@ -893,7 +973,8 @@ class Store:
                 return []
             order = [mid for mid, _ in sorted(
                 seeds.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
-            return self._hydrate(order)          # v0.2 shape, no `via`
+            return self._excerpt_hits(
+                self._hydrate(order), query, full)   # v0.2 shape, no `via`
         # associative path: seed -> prime -> spread -> two-tier rank -> learn -> receipts
         if budget is None:
             budget = self._recall_budget
@@ -951,7 +1032,7 @@ class Store:
                             "hops": r["hops"]}
             else:
                 h["via"] = {"seed": True}
-        return hits
+        return self._excerpt_hits(hits, query, full)
 
     def _recency_order(self, ids):
         if not ids:

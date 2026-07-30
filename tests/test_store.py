@@ -1831,3 +1831,108 @@ def test_link_preserves_links_added_by_remember():
     stored = set(_json.loads(s._conn.execute(
         "SELECT links FROM memories WHERE id=?", (c,)).fetchone()[0]))
     assert stored == {a, b}, f"link() dropped a pre-existing link: {stored}"
+
+
+# --- #30: snippet payloads + fetch-on-demand ---------------------------------
+
+_LONG = ("Intro line about nothing much. " + "filler filler filler. " * 200
+         + " The HEBBIAN wiring detail lives here in the middle. "
+         + "trailing trailing trailing. " * 200)
+
+
+def test_short_bodies_are_returned_whole_and_unmarked():
+    """A memory that fits must be byte-identical to pre-#30 output - no
+    ellipsis, no truncated flag, no body_chars."""
+    s = make_store()
+    s.remember("user", "Short", "a brief fact")
+    hit = s.recall("brief")[0]
+    assert hit["body"] == "a brief fact"
+    assert "truncated" not in hit and "body_chars" not in hit
+
+
+def test_long_bodies_are_excerpted_and_marked():
+    s = make_store()
+    s.remember("project", "Long", _LONG)
+    hit = s.recall("hebbian")[0]
+    assert len(hit["body"]) < len(_LONG) / 10
+    assert hit["truncated"] is True
+    assert hit["body_chars"] == len(_LONG)
+
+
+def test_excerpt_is_centered_on_the_query_match():
+    """The excerpt must show WHY the memory matched, not just its opening -
+    the match is deliberately buried in the middle of _LONG."""
+    s = make_store()
+    s.remember("project", "Long", _LONG)
+    body = s.recall("hebbian")[0]["body"]
+    assert "HEBBIAN" in body, f"excerpt missed the match: {body[:120]!r}"
+    assert body.startswith("…") and body.endswith("…")
+
+
+def test_excerpt_falls_back_to_the_head_when_nothing_matches():
+    """Tag-only lookups have no query at all; take the opening rather than
+    returning nothing useful."""
+    s = make_store()
+    s.remember("project", "Long", _LONG, tags="proj:x")
+    hit = s.recall("", tags="proj:x")[0]
+    assert hit["body"].startswith("Intro line")
+    assert hit["body"].endswith("…")
+    assert hit["truncated"] is True
+
+
+def test_full_true_returns_whole_bodies():
+    s = make_store()
+    s.remember("project", "Long", _LONG)
+    hit = s.recall("hebbian", full=True)[0]
+    assert hit["body"] == _LONG
+    assert "truncated" not in hit
+
+
+def test_excerpting_can_be_disabled_entirely():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, excerpt_chars=0,
+              sync_read_interval=0)
+    s.migrate()
+    s.remember("project", "Long", _LONG)
+    assert s.recall("hebbian")[0]["body"] == _LONG
+
+
+def test_get_returns_one_memory_whole():
+    """The fetch half of snippet-plus-fetch."""
+    s = make_store()
+    mid = s.remember("project", "Long", _LONG)["id"]
+    assert s.recall("hebbian")[0]["truncated"] is True     # excerpt first...
+    assert s.get(mid)["body"] == _LONG                     # ...then fetch whole
+
+
+def test_get_refuses_missing_and_forgotten_ids():
+    s = make_store()
+    mid = s.remember("user", "Gone", "body")["id"]
+    assert s.get(9999) is None
+    s.forget(mid)
+    assert s.get(mid) is None, "get() must not resurrect a forgotten memory"
+
+
+def test_excerpt_never_exceeds_the_configured_width_by_much():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, excerpt_chars=200,
+              sync_read_interval=0)
+    s.migrate()
+    s.remember("project", "Long", _LONG)
+    body = s.recall("hebbian")[0]["body"]
+    assert len(body) <= 200 + 2, f"excerpt overran its budget: {len(body)}"
+
+
+def test_excerpt_shrinks_the_payload_substantially():
+    """The point of #30, asserted as a property rather than a vibe."""
+    conn = sqlite3.connect(":memory:")
+    full_store = Store(conn, "d", lambda *a, **k: None, excerpt_chars=0,
+                       sync_read_interval=0)
+    full_store.migrate()
+    s = make_store()
+    for st in (full_store, s):
+        for i in range(5):
+            st.remember("project", f"Doc {i}", _LONG)
+    big = len(_json.dumps(full_store.recall("hebbian", limit=5)))
+    small = len(_json.dumps(s.recall("hebbian", limit=5)))
+    assert small * 10 < big, f"excerpting saved too little: {big} -> {small}"
