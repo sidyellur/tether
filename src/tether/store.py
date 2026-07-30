@@ -656,6 +656,12 @@ class Store:
         links_s = json.dumps(incoming_links)
         superseded = (self._find_near_duplicate(type, emb)
                       if (existing is None and self._consolidate) else None)
+        # Snapshot last_insert_rowid() so we can ask the DB which branch of the
+        # upsert actually ran (see the action= line below). Read immediately
+        # before the INSERT - everything above is SELECT-only, so nothing can
+        # have moved it since.
+        rowid_before = self._conn.execute(
+            "SELECT last_insert_rowid()").fetchone()[0]
         self._conn.execute(
             "INSERT INTO memories(type, title, title_norm, body, tags, links, "
             "created_at, updated_at, device_id, embedding, author, valid_from) "
@@ -669,14 +675,29 @@ class Store:
             "author=excluded.author, embedding=excluded.embedding",
             (type, title, norm, body, tags_s, links_s, now, now,
              self._device_id, emb, self._author, now))
-        # lastrowid isn't reliable across the ON CONFLICT DO UPDATE branch (it
-        # only advances on an actual insert), so re-resolve the current row
-        # to get both its id and whether this call created it.
-        mid, created_at = self._conn.execute(
-            "SELECT id, created_at FROM memories "
+        # Re-resolve the row: lastrowid doesn't advance on the DO UPDATE branch,
+        # so it can't identify the row on its own.
+        mid, = self._conn.execute(
+            "SELECT id FROM memories "
             "WHERE type=? AND title_norm=? AND valid_to IS NULL",
             (type, norm)).fetchone()
-        action = "created" if created_at == now else "updated"
+        # Which branch ran? This used to be `created_at == now`, which quietly
+        # assumed the clock ticks between two writes. It doesn't always:
+        # datetime.now() has ~15.6ms resolution on Windows before Python 3.13,
+        # so two remembers inside one tick share a timestamp and an UPDATE
+        # reported itself as "created" (caught by the Windows CI job added in
+        # #68; reproducible anywhere by freezing the clock). The data was right,
+        # but `action` is an agent-facing signal - it's how a caller tells "I
+        # made a new memory" from "I refined an existing one".
+        #
+        # last_insert_rowid() only advances when a row is really inserted, so
+        # asking the DB what it did beats inferring it from wall-clock time.
+        # AUTOINCREMENT never reissues an id, so a genuine insert can't collide
+        # with the previous value.
+        rowid_after = self._conn.execute(
+            "SELECT last_insert_rowid()").fetchone()[0]
+        action = ("created" if rowid_after != rowid_before and rowid_after == mid
+                  else "updated")
         if action == "created" and superseded is not None:
             self._conn.execute(
                 "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",

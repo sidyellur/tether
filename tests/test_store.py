@@ -1936,3 +1936,43 @@ def test_excerpt_shrinks_the_payload_substantially():
     big = len(_json.dumps(full_store.recall("hebbian", limit=5)))
     small = len(_json.dumps(s.recall("hebbian", limit=5)))
     assert small * 10 < big, f"excerpting saved too little: {big} -> {small}"
+
+
+def test_action_is_correct_when_the_clock_does_not_tick(monkeypatch):
+    """#68 (found by the Windows CI job): `action` used to be inferred from
+    `created_at == now`, which assumes the clock advances between two writes.
+    datetime.now() has ~15.6ms resolution on Windows before Python 3.13, so two
+    remembers inside one tick shared a timestamp and an UPDATE reported itself
+    as "created". The row was always correct - but `action` is how a caller
+    tells "I made a new memory" from "I refined an existing one".
+
+    Freezing the clock reproduces it on any platform.
+    """
+    from tether import store as store_module
+
+    monkeypatch.setattr(store_module, "_now",
+                        lambda: "2026-01-01T00:00:00.000000+00:00")
+    s = make_store()
+    first = s.remember("user", "Prefers TDD", "Wants tests first.")
+    again = s.remember("user", "  prefers   tdd ", "Wants tests first, plus evidence.")
+
+    assert first["action"] == "created"
+    assert again["action"] == "updated", "an upsert misreported itself as a create"
+    assert again["id"] == first["id"]
+    assert s._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+    assert s._conn.execute(
+        "SELECT body FROM memories").fetchone()[0] == "Wants tests first, plus evidence."
+
+
+def test_action_still_reports_created_for_distinct_titles_on_a_frozen_clock(monkeypatch):
+    """The mirror case: a frozen clock must not make genuine creates look like
+    updates either."""
+    from tether import store as store_module
+
+    monkeypatch.setattr(store_module, "_now",
+                        lambda: "2026-01-01T00:00:00.000000+00:00")
+    s = make_store()
+    a = s.remember("user", "First", "body one")
+    b = s.remember("user", "Second", "body two")
+    assert a["action"] == "created" and b["action"] == "created"
+    assert a["id"] != b["id"]
