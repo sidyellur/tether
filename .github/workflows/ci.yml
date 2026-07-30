@@ -28,3 +28,35 @@ jobs:
 
       - name: Run tests
         run: pytest -v
+
+  # The matrix above always resolves the newest `mcp`. That is exactly how #69
+  # slipped through: mcp 2.0 renamed FastMCP -> MCPServer and broke every fresh
+  # install, with no red build until a user hit it. tether supports both majors
+  # via an import shim, so pin the OLD major here and prove it still works.
+  mcp-compat:
+    name: mcp ${{ matrix.mcp }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp: ["<2", ">=2"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package + pinned mcp major
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install "mcp${{ matrix.mcp }}"
+
+      - name: Show resolved mcp + server binding
+        run: |
+          pip show mcp | head -2
+          python -c "from tether import server; print('bound:', type(server.mcp).__module__)"
+
+      - name: Run tests
+        run: pytest -v

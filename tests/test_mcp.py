@@ -17,6 +17,24 @@ def _text(result):
                    if getattr(c, "type", "") == "text")
 
 
+def test_server_imports_against_installed_mcp_major():
+    """#69: mcp 2.0 renamed FastMCP -> MCPServer and moved it to
+    mcp.server.mcpserver with no back-compat alias, which broke every fresh
+    install (`mcp>=1.0` is unbounded). server.py carries an import shim; this
+    asserts it resolved against whatever mcp major is actually installed and
+    produced a usable server object, rather than the module merely importing.
+    """
+    from tether import server
+
+    assert server.mcp is not None
+    # the decorators must have bound to a real server: constructor + @tool()
+    # + @resource() + run() are the whole surface tether depends on.
+    for attr in ("tool", "resource", "run"):
+        assert callable(getattr(server.mcp, attr)), f"mcp.{attr} missing"
+    for verb in EXPECTED_TOOLS:
+        assert callable(getattr(server, verb)), f"{verb} not defined"
+
+
 def test_mcp_stdio_roundtrip(tmp_path):
     env = dict(os.environ, TETHER_DB=str(tmp_path / "mem.db"),
                TETHER_DEVICE_ID="ci")
