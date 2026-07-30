@@ -1,26 +1,29 @@
-# tether — task tracker
+# tether — where the work is tracked
 
-Checklist view of the v0.1 build. Full step-by-step detail (code, tests,
-commands) lives in
-[`docs/superpowers/plans/2026-07-03-tether-v0.1-implementation.md`](docs/superpowers/plans/2026-07-03-tether-v0.1-implementation.md).
-Design rationale is in
-[`docs/superpowers/specs/2026-07-03-tether-design.md`](docs/superpowers/specs/2026-07-03-tether-design.md).
+This file used to be the v0.1 build checklist. Every box in it stayed
+unchecked while the project shipped v0.1 through v0.5.1, so it described a
+state of the world that hadn't been true for months. Rather than maintain a
+second, slower copy of the truth, it now just points at the real sources.
 
-## v0.1 — local-first memory MCP server + opt-in sync
+**Current status: v0.5.1.** The four memory verbs, boot index, FTS5, semantic
+recall, consolidation, the associative usage graph, the self-organizing store,
+and opt-in crystallization are all implemented. See the README for what each
+one does and how to turn it on.
 
-- [ ] **Task 1 — Scaffolding.** `pyproject.toml`, `src/tether/__init__.py`, `tests/__init__.py`. Editable install + pytest run green.
-- [ ] **Task 2 — `config.py`.** DB path, sync credentials, device id resolved from env. Zero-config default = local file, no sync.
-- [ ] **Task 3 — `store.py` schema.** `memories` table + external-content FTS5 index + sync triggers; idempotent `migrate()`.
-- [ ] **Task 4 — `remember()`.** Upsert on `type` + normalized `title` so facts refine instead of duplicating.
-- [ ] **Task 5 — `recall()`.** FTS5 keyword search, type filter, rich returns (id/type/title/body/tags/updated_at); punctuation-safe.
-- [ ] **Task 6 — `link()` / `forget()` / `boot_index()`.** Bidirectional links, hard delete, compact newest-first index.
-- [ ] **Task 7 — `sync.py`.** Connection factory: local `sqlite3` or libSQL embedded replica; degrade-to-local on any failure. **Spike the `libsql-experimental` client first.**
-- [ ] **Task 8 — `server.py`.** `FastMCP` — four verbs + `tether://memory-index` resource + `main()`. Tools return `{"error": ...}` rather than crash.
-- [ ] **Task 9 — Docs + self-test.** README install/sync/tools; `scripts/selftest.py` end-to-end smoke.
+## Where things live
 
-## Deferred (not in v0.1 — designed for, not built)
+| What | Where |
+|---|---|
+| **Open work** | [GitHub Issues](https://github.com/sidyellur/tether/issues) |
+| **Design rationale** | [`docs/superpowers/specs/`](docs/superpowers/specs/) — one spec per feature, starting with [the original design](docs/superpowers/specs/2026-07-03-tether-design.md) |
+| **Implementation plans** | [`docs/superpowers/plans/`](docs/superpowers/plans/) — the step-by-step build record matching each spec |
+| **Shipped behavior** | [README](README.md) |
 
-- [ ] Semantic/embedding search (`embedding BLOB` + `sqlite-vec`, backfill; no data migration).
-- [ ] Entity/edge graph model layered alongside `memories`.
-- [ ] Automatic corrupt-DB move-aside-and-recreate recovery (v0.1 degrades to a per-call error instead).
-- [ ] True bounded/backgrounded sync tick beyond the best-effort `sync_now`.
+## Historical note
+
+The v0.1 plan's "deferred, designed-for-but-not-built" list has largely been
+built: semantic/embedding search shipped in v0.2, and the entity/edge graph
+became `graph.py` in the associative core. What remains from that list —
+`sqlite-vec`-backed vector search, automatic corrupt-DB recovery, and a true
+backgrounded sync tick — is tracked in Issues, where it can carry the
+discussion and evidence a checkbox can't.
