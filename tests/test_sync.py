@@ -53,3 +53,86 @@ def test_backend_failure_degrades_to_local(tmp_path, monkeypatch, capsys):
     conn.execute("CREATE TABLE t(x)")
     assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
     assert "sync offline" in capsys.readouterr().err
+
+
+# --- #63: works with mainline libsql AND the frozen experimental client ------
+
+def _fake_client(monkeypatch, name, thread_kwarg):
+    """Install a stand-in libSQL module that records how connect() was called."""
+    import sys
+    import types
+
+    calls = {}
+
+    def connect(database, **kwargs):
+        calls["database"] = database
+        calls["kwargs"] = kwargs
+        if thread_kwarg not in kwargs:
+            raise TypeError(
+                f"connect() got an unexpected keyword argument "
+                f"{sorted(set(kwargs) - {'sync_url', 'auth_token'})}")
+
+        class Conn:
+            def sync(self):
+                return None
+
+        return Conn()
+
+    mod = types.ModuleType(name)
+    mod.connect = connect
+    monkeypatch.setitem(sys.modules, name, mod)
+    return calls
+
+
+def test_uses_underscored_kwarg_for_mainline_libsql(tmp_path, monkeypatch):
+    """Mainline libsql renamed check_same_thread -> _check_same_thread. Passing
+    the old name raises TypeError at connect(), which open_connection catches
+    and degrades - so getting this wrong silently drops every sync user to
+    local-only instead of failing loudly."""
+    calls = _fake_client(monkeypatch, "libsql", "_check_same_thread")
+
+    cfg = SyncConfig("libsql://x.turso.io", "tok")
+    _conn, _sync_now, mode = sync.open_connection(tmp_path / "m.db", cfg)
+
+    assert mode == "replica", "replica path degraded when it should have worked"
+    assert calls["kwargs"]["_check_same_thread"] is False
+    assert "check_same_thread" not in calls["kwargs"]
+    assert calls["kwargs"]["sync_url"] == "libsql://x.turso.io"
+
+
+def test_falls_back_to_experimental_client_with_its_own_kwarg(tmp_path, monkeypatch):
+    """An existing libsql-experimental install must keep working - the extra
+    moved, but nobody's environment has to."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "libsql", None)   # simulate not installed
+    calls = _fake_client(monkeypatch, "libsql_experimental", "check_same_thread")
+
+    real_import = sync._import_libsql
+
+    def only_experimental():
+        import libsql_experimental
+        return libsql_experimental, "check_same_thread"
+
+    monkeypatch.setattr(sync, "_import_libsql", only_experimental)
+    try:
+        cfg = SyncConfig("libsql://x.turso.io", "tok")
+        _conn, _sync_now, mode = sync.open_connection(tmp_path / "m.db", cfg)
+        assert mode == "replica"
+        assert calls["kwargs"]["check_same_thread"] is False
+    finally:
+        monkeypatch.setattr(sync, "_import_libsql", real_import)
+
+
+def test_missing_client_still_degrades_to_local(tmp_path, monkeypatch, capsys):
+    """No libSQL client installed at all: sync is an optional extra, so this
+    must degrade rather than raise."""
+    def no_client():
+        raise ImportError("no libsql here")
+
+    monkeypatch.setattr(sync, "_import_libsql", no_client)
+    cfg = SyncConfig("libsql://x.turso.io", "tok")
+    conn, _sync_now, mode = sync.open_connection(tmp_path / "m.db", cfg)
+    assert mode == "degraded"
+    assert isinstance(conn, sqlite3.Connection)
+    assert "sync offline" in capsys.readouterr().err
