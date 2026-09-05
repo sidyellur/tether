@@ -1971,6 +1971,66 @@ def test_store_lock_is_reentrant_for_import():
     assert out["created"] == 2 and out["linked"] == 1
 
 
+# --- #90: porter stemming in the keyword index -------------------------------
+
+def _fts_sql(conn):
+    return conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='memories_fts'").fetchone()[0]
+
+
+def test_new_store_indexes_with_porter_stemming():
+    s = make_store()
+    assert "porter" in _fts_sql(s._conn)
+    s.remember("project", "Runner", "we decided pytest runs the tests")
+    assert [h["title"] for h in s.recall("deciding test")] == ["Runner"]
+
+
+def test_stemming_can_be_turned_off():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, stemming=False)
+    s.migrate()
+    assert "porter" not in _fts_sql(conn)
+    s.remember("project", "Runner", "pytest runs the tests")
+    assert s.recall("test") == []                    # no stem -> no match
+    assert [h["title"] for h in s.recall("tests")] == ["Runner"]
+
+
+def test_migrate_rebuilds_a_pre_stemming_index_with_its_rows(tmp_path):
+    """A DB built before #90 has a unicode61 table. Opening it with stemming
+    on must recreate the index AND re-index the existing rows, so an old
+    memory is findable by a stemmed query immediately after upgrade."""
+    path = str(tmp_path / "m.db")
+    old = Store(sqlite3.connect(path), "d", lambda *a, **k: None, stemming=False)
+    old.migrate()
+    old.remember("project", "Legacy", "the tests were written before stemming")
+    assert "porter" not in _fts_sql(old._conn)
+    old._conn.close()
+
+    new = Store(sqlite3.connect(path), "d", lambda *a, **k: None)   # stemming on
+    new.migrate()
+    assert "porter" in _fts_sql(new._conn)
+    assert [h["title"] for h in new.recall("test writing")] == ["Legacy"]
+    # and the triggers still keep the rebuilt index in sync
+    new.remember("project", "Fresh", "added after the upgrade")
+    assert [h["title"] for h in new.recall("adding")] == ["Fresh"]
+    # idempotent: a second migrate on a matching index does not touch it
+    new.migrate()
+    assert [h["title"] for h in new.recall("test writing")] == ["Legacy"]
+
+
+def test_migrate_rebuilds_back_when_stemming_is_turned_off(tmp_path):
+    path = str(tmp_path / "m.db")
+    on = Store(sqlite3.connect(path), "d", lambda *a, **k: None)
+    on.migrate()
+    on.remember("project", "Runner", "pytest runs the tests")
+    on._conn.close()
+    off = Store(sqlite3.connect(path), "d", lambda *a, **k: None, stemming=False)
+    off.migrate()
+    assert "porter" not in _fts_sql(off._conn)
+    assert off.recall("test") == []
+    assert [h["title"] for h in off.recall("tests")] == ["Runner"]
+
+
 # --- #92: project awareness --------------------------------------------------
 
 def make_project_store(project="tether", **kw):

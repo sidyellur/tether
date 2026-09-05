@@ -256,6 +256,19 @@ def excerpt_chars() -> int:
     return val if val >= 0 else _DEFAULT_EXCERPT_CHARS
 
 
+_STEMMING_OFF = {"0", "false", "no", "off"}
+
+
+def fts_stemming() -> bool:
+    """Porter stemming in the keyword index (#90) is on by default; any of
+    0/false/no/off turns it off (the stemmer is English-only). migrate()
+    rebuilds the index whenever this differs from what the DB was built with."""
+    val = os.environ.get("TETHER_FTS_STEMMING")
+    if val is None:
+        return True
+    return val.strip().lower() not in _STEMMING_OFF
+
+
 _DEFAULT_SYNC_READ_INTERVAL = 30
 
 

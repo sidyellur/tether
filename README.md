@@ -149,6 +149,26 @@ over time. On a replica that makes each recall a few network round-trips on
 top of the local search. If that matters more to you than learned
 associations, `TETHER_ASSOC=0` makes recall read-only again.
 
+## Keyword search
+
+The keyword arm is SQLite FTS5 over title, body and tags, ranked by bm25. Ask
+in plain language: a memory that contains *some* of the query's words is a
+hit, and one that contains more of them ranks higher, so "how do we run the
+integration tests?" finds the note that says "pytest runs the tests" (common
+function words are ignored). The index stems English words, so `tests`
+matches `test` and `deciding` matches `decided`. Stemming is English-only;
+turn it off for a store in another language and tether rebuilds the index
+on the next start.
+
+| Var | Default | Effect |
+|---|---|---|
+| `TETHER_FTS_STEMMING` | on | set `0`/`false`/`off` to index words exactly as written |
+
+Measured on the LoCoMo long-conversation benchmark (one memory per dialogue
+turn, 1,536 questions, "did recall return the turns that answer it" in the
+top 10), the keyword arm alone finds the evidence for 62% of questions,
+against 54% for a textbook BM25 over the same text.
+
 ## Semantic search (optional)
 
 By default `recall` is **hybrid**: keyword (FTS5) results are fused with

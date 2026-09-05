@@ -21,7 +21,7 @@ from .graph import Graph
 
 VALID_TYPES = ("user", "feedback", "project", "reference")
 
-_SCHEMA = """
+_TABLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     type       TEXT NOT NULL CHECK (type IN ('user','feedback','project','reference')),
@@ -38,8 +38,23 @@ CREATE TABLE IF NOT EXISTS memories (
 -- here: it needs to become a partial UNIQUE index (#41) but must degrade
 -- gracefully on a live DB that already has duplicate current rows, which
 -- plain executescript() can't express.
-CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-    USING fts5(title, body, tags, content='memories', content_rowid='id');
+"""
+
+# The FTS5 tokenizer is a property of the virtual table (#90). `porter`
+# stems both index and query ("tests" matches "test", "deciding" matches
+# "decided"): +4 points of evidence recall on LoCoMo. It is English-only, so
+# it can be turned off (TETHER_FTS_STEMMING=0); either way migrate() rebuilds
+# the table whenever the on-disk tokenizer differs from the configured one.
+_FTS_TOKENIZE = {True: "tokenize='porter unicode61', ", False: ""}
+
+
+def _fts_schema(stemming: bool) -> str:
+    return ("CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5("
+            f"title, body, tags, {_FTS_TOKENIZE[bool(stemming)]}"
+            "content='memories', content_rowid='id');")
+
+
+_TRIGGER_SCHEMA = """
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
     INSERT INTO memories_fts(rowid, title, body, tags)
         VALUES (new.id, new.title, new.body, new.tags);
@@ -327,8 +342,9 @@ class Store:
                  forget_interval=20, forget_max_per_sweep=10,
                  session_sweep_interval=50, sync_read_interval=30,
                  excerpt_chars=_EXCERPT_CHARS,
-                 db_path=None, on_degrade=None, project=None):
+                 db_path=None, on_degrade=None, project=None, stemming=True):
         self._conn = conn
+        self._stemming = bool(stemming)
         # #92: the project this server serves (config.project()), or None.
         # Drives the auto `proj:<name>` tag on remember, the "# This project"
         # slice of the boot index, and the same-project recall bonus.
@@ -605,8 +621,18 @@ class Store:
 
     @_locked
     def migrate(self) -> None:
+        self._conn.executescript(_TABLE_SCHEMA)
         fts_existed = self._table_exists("memories_fts")
-        self._conn.executescript(_SCHEMA)
+        if fts_existed and self._fts_tokenizer_mismatch():
+            # #90: the tokenizer lives in the table definition, so switching
+            # stemming on (the new default) or off means recreating the
+            # index. The shadow tables go with the virtual table; the
+            # triggers reference it by name and are unaffected. Rebuilt
+            # from `memories` below, exactly like a first-time index.
+            self._conn.execute("DROP TABLE memories_fts")
+            fts_existed = False
+        self._conn.execute(_fts_schema(self._stemming))
+        self._conn.executescript(_TRIGGER_SCHEMA)
         self._conn.executescript(_META_SCHEMA)
         self._ensure_embedding_column()
         if not fts_existed:
@@ -633,6 +659,15 @@ class Store:
         return self._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
             (name,)).fetchone() is not None
+
+    def _fts_tokenizer_mismatch(self) -> bool:
+        """True when the existing memories_fts table was created with a
+        different tokenizer than this Store is configured for (#90)."""
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories_fts'"
+        ).fetchone()
+        has_porter = bool(row and row[0] and "porter" in row[0].lower())
+        return has_porter != self._stemming
 
     def _ensure_embedding_column(self) -> None:
         cols = {r[1] for r in self._conn.execute(
