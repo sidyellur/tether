@@ -170,6 +170,25 @@ def _unpack(blob: bytes) -> tuple:
 
 _RECENCY_WEIGHT = 0.25
 _PRIMING_WEIGHT = 0.25
+# #92: a flat bonus added to the seed score of every hit tagged with the
+# current project. RRF scores are ~1/(60+rank), so adjacent ranks differ by
+# ~0.00026 and 0.002 lifts a same-project hit about eight places past an
+# otherwise-equal hit from another project - enough to win ties and near-ties,
+# not enough to bury a clearly better match. Untagged memories (type "user",
+# anything remembered before project awareness) are neither boosted nor
+# penalized.
+_PROJECT_BONUS = 0.002
+# Memories about the person are global; everything else is about the work
+# and gets the project tag by default.
+_PROJECT_TAGGED_TYPES = frozenset({"project", "feedback", "reference"})
+
+
+def _project_tag(project) -> str:
+    return f"proj:{project}"
+
+
+def _has_project_tag(tags_s: str) -> bool:
+    return any(t.strip().startswith("proj:") for t in tags_s.split(","))
 # Associative ranking protects the head and re-ranks the tail. _PROTECT_HEAD
 # locks that many top v0.2 hits in place (so a direct hit can't be buried by
 # spreading - the #25 regression), and everything below is re-ranked by spread
@@ -308,8 +327,12 @@ class Store:
                  forget_interval=20, forget_max_per_sweep=10,
                  session_sweep_interval=50, sync_read_interval=30,
                  excerpt_chars=_EXCERPT_CHARS,
-                 db_path=None, on_degrade=None):
+                 db_path=None, on_degrade=None, project=None):
         self._conn = conn
+        # #92: the project this server serves (config.project()), or None.
+        # Drives the auto `proj:<name>` tag on remember, the "# This project"
+        # slice of the boot index, and the same-project recall bonus.
+        self._project = project or None
         # #83: every public method runs under this (see _locked). Held across
         # the whole call, including a write-path sync, so a call is atomic
         # from the agent's point of view.
@@ -766,6 +789,11 @@ class Store:
         now = _now()
         norm = _norm(title)
         tags_s = _tags_to_str(tags)
+        # #92: stamp the current project on work-related memories unless the
+        # caller already said which project (any proj: tag is respected).
+        if (self._project and type in _PROJECT_TAGGED_TYPES
+                and not _has_project_tag(tags_s)):
+            tags_s = _tags_to_str([*_parse_tags(tags_s), _project_tag(self._project)])
         incoming_links = _dedupe_links(links)
         emb = self._embed_or_none(title, body)
 
@@ -1114,6 +1142,12 @@ class Store:
         recency = _rrf_scores([self._recency_order(list(scores))])
         for mid, s in recency.items():
             scores[mid] += _RECENCY_WEIGHT * s
+        # #92: same-project hits edge out otherwise-equal hits from elsewhere
+        if self._project:
+            tag = _project_tag(self._project)
+            for mid, tags_s in self._tags_of_many(list(scores)).items():
+                if _tags_match(tags_s, [tag]):
+                    scores[mid] += _PROJECT_BONUS
         # optional exponential time-decay
         if self._decay_half_life_days:
             now = _now()
@@ -1485,25 +1519,47 @@ class Store:
     def boot_index(self) -> str:
         self._maybe_sync_for_read()      # #62: the session-start read pulls too
         rows = self._conn.execute(
-            "SELECT id, type, title, updated_at FROM memories WHERE valid_to IS NULL "
-            "ORDER BY updated_at DESC, id DESC"
+            "SELECT id, type, title, updated_at, tags FROM memories "
+            "WHERE valid_to IS NULL ORDER BY updated_at DESC, id DESC"
         ).fetchall()
         if not rows:
             return "(no memories yet)"
-        if len(rows) <= self._boot_index_cap:
-            return "\n".join(f"[{t}] #{i} {title}" for i, t, title, _ in rows)
-        if self._graph.enabled:
+        cap = self._boot_index_cap
+        prefix = ""
+        if self._project:
+            # #92: lead with this project's memories - the thing the agent is
+            # most likely to need in the first message of a session - and
+            # curate the rest of the store into whatever budget remains.
+            tag = _project_tag(self._project)
+            mine = [r for r in rows if _tags_match(r[4], [tag])]
+            if mine:
+                shown = mine if len(rows) <= cap else mine[:max(1, cap // 2)]
+                shown_ids = {r[0] for r in shown}
+                prefix = "\n".join(
+                    [f"# This project ({self._project})",
+                     *(f"[{t}] #{i} {title}" for i, t, title, *_ in shown)])
+                rows = [r for r in rows if r[0] not in shown_ids]
+                cap = max(0, cap - len(shown))
+                if not rows:
+                    return prefix
+                prefix += "\n# Everything else\n"
+        if len(rows) <= cap:
+            body = "\n".join(f"[{t}] #{i} {title}" for i, t, title, *_ in rows)
+            return prefix + body
+        body = None
+        if self._graph.enabled and cap > 0:
             try:
-                return self._curated_index(rows, self._graph.degree_map(),
-                                           self._boot_index_cap)
+                body = self._curated_index(rows, self._graph.degree_map(), cap)
             except Exception:
-                pass                      # curation failure -> capped fallback below
-        # No graph (or curation failed): still apply the cap, just without
-        # hub-curation - a size cap must never depend on graph state (#52).
-        return self._recency_capped_index(rows, self._boot_index_cap)
+                body = None               # curation failure -> capped fallback below
+        if body is None:
+            # No graph (or curation failed): still apply the cap, just without
+            # hub-curation - a size cap must never depend on graph state (#52).
+            body = self._recency_capped_index(rows, cap)
+        return prefix + body
 
     def _recency_capped_index(self, rows, cap) -> str:
-        return "\n".join(f"[{t}] #{i} {title}" for i, t, title, _ in rows[:cap])
+        return "\n".join(f"[{t}] #{i} {title}" for i, t, title, *_ in rows[:cap])
 
     def _curated_index(self, rows, deg, cap) -> str:
         # rows: [(id, type, title, updated_at)] newest-first

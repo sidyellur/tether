@@ -49,6 +49,31 @@ def device_id() -> str:
     return os.environ.get("TETHER_DEVICE_ID") or socket.gethostname()
 
 
+_PROJECT_OFF = {"0", "false", "no", "off"}
+
+
+def project():
+    """The project this server is serving, or None (#92).
+
+    TETHER_PROJECT names it explicitly (any of 0/false/no/off disables project
+    awareness). Otherwise it is the basename of CLAUDE_PROJECT_DIR, which
+    Claude Code sets in every stdio MCP server's environment to the stable
+    project root. Nothing falls back to the working directory: that is
+    wherever the client happened to launch from, and a wrong project is
+    worse than none. Commas are replaced (they separate tags) and whitespace
+    trimmed so the value is safe as a `proj:<name>` tag."""
+    raw = os.environ.get("TETHER_PROJECT")
+    if raw is not None and raw.strip():
+        if raw.strip().lower() in _PROJECT_OFF:
+            return None
+        name = raw
+    else:
+        root = os.environ.get("CLAUDE_PROJECT_DIR", "")
+        name = os.path.basename(os.path.normpath(root)) if root.strip() else ""
+    name = name.strip().replace(",", "-")
+    return name or None
+
+
 _SEMANTIC_OFF = {"0", "false", "no", "off"}
 _DEFAULT_EMBEDDING_MODEL = "minishlab/potion-base-8M"
 
