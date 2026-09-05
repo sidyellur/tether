@@ -91,6 +91,15 @@ def _local(db_path, mode="local"):
     # associative graph is enabled, so concurrent recalls can contend).
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+    # #84: SQLite's default synchronous=FULL fsyncs the WAL on EVERY commit,
+    # and tether commits on the hot path (remember once; recall twice with
+    # the graph on). In WAL mode NORMAL is still safe against corruption -
+    # it only fsyncs at checkpoints - and the sole exposure is that the last
+    # few committed transactions can roll back after a power loss or OS
+    # crash (an application crash loses nothing). Measured 0.29 ms -> 0.02 ms
+    # per commit here; an SSD fsync is typically 1-5 ms. Connection-level,
+    # so it lives with busy_timeout rather than in the file.
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn, (lambda timeout=2.0: None), mode
 
 
