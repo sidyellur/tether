@@ -12,6 +12,7 @@ Run it as an MCP stdio server:
 """
 
 import json
+import threading
 
 try:
     # mcp >= 2.0 (released 2026-07-28) renamed FastMCP -> MCPServer and moved
@@ -30,11 +31,18 @@ mcp = MCPServer("tether")
 
 _store = None
 _sync_mode = None
+# #83: tool calls run on worker threads, so two first calls could otherwise
+# both build a store (two connections, two migrations, two model loads).
+_store_lock = threading.Lock()
 
 
 def _get_store() -> Store:
     global _store, _sync_mode
-    if _store is None:
+    if _store is not None:
+        return _store
+    with _store_lock:
+        if _store is not None:
+            return _store
         path = config.db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         conn, sync_now, _sync_mode = open_connection(path, config.sync_config())

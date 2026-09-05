@@ -163,6 +163,37 @@ def test_server_consolidation_defaults_off(monkeypatch, tmp_path):
         server._store = None
 
 
+def test_get_store_builds_one_store_under_parallel_first_calls(monkeypatch, tmp_path):
+    """#83: tool calls run on worker threads, so two first calls raced the
+    lazy init and could each build a store (two connections, two migrates).
+    The init is now guarded: however many threads arrive first, one Store."""
+    import threading
+
+    from tether import server
+    monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")
+    monkeypatch.delenv("TETHER_SYNC_URL", raising=False)
+    monkeypatch.delenv("TETHER_SYNC_TOKEN", raising=False)
+
+    server._store = None
+    seen = []
+    gate = threading.Barrier(4)
+
+    def first_call():
+        gate.wait()                       # all four arrive together
+        seen.append(id(server._get_store()))
+
+    try:
+        threads = [threading.Thread(target=first_call) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(set(seen)) == 1, "parallel first calls built more than one store"
+    finally:
+        server._store = None
+
+
 @pytest.mark.skipif(os.environ.get("TETHER_TEST_REAL_MODEL") != "1",
                     reason="set TETHER_TEST_REAL_MODEL=1 to run the real model over stdio")
 def test_mcp_roundtrip_with_real_semantic(tmp_path):

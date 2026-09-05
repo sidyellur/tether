@@ -6,10 +6,12 @@ nothing outside this module speaks SQL.
 """
 
 import bisect
+import functools
 import json
 import re
 import struct
 import sys
+import threading
 import time
 import warnings
 from datetime import datetime, timezone
@@ -162,6 +164,29 @@ _PROTECT_HEAD = 8
 _SEED_FLOOR = 0.35
 
 
+def _locked(method):
+    """Serialize a public Store method under the store's lock (#83).
+
+    The mcp SDK runs sync tool functions on worker threads, one per inbound
+    request, and an agent issues tool calls in parallel - so two calls can
+    run at once against tether's single sqlite3 connection and single Store.
+    sqlite3 serializes statements, not transactions: the module's implicit
+    BEGIN races another thread's open transaction, one thread's commit()
+    lands the other's half-finished write, and remember()'s
+    last_insert_rowid() bookkeeping sees the other thread's inserts. Under a
+    4-thread stress this produced "cannot start a transaction within a
+    transaction", "cannot commit - no transaction is active" and dozens of
+    creates misreported as updates per run. One re-entrant lock around each
+    public entry point makes every call atomic; re-entrant because
+    import_records calls remember()/link().
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 def _rrf_scores(ranked_lists, k=60):
     """Reciprocal Rank Fusion as a {id: score} map (deterministic)."""
     scores = {}
@@ -261,6 +286,10 @@ class Store:
                  excerpt_chars=_EXCERPT_CHARS,
                  db_path=None, on_degrade=None):
         self._conn = conn
+        # #83: every public method runs under this (see _locked). Held across
+        # the whole call, including a write-path sync, so a call is atomic
+        # from the agent's point of view.
+        self._lock = threading.RLock()
         self._device_id = device_id
         self._sync_now = sync_now
         self._embedder = embedder
@@ -527,6 +556,7 @@ class Store:
                 raise
             return fn()
 
+    @_locked
     def migrate(self) -> None:
         fts_existed = self._table_exists("memories_fts")
         self._conn.executescript(_SCHEMA)
@@ -654,6 +684,7 @@ class Store:
         scope = self._author or self._device_id
         return f"{name}:{scope}" if scope else name
 
+    @_locked
     def backfill_embeddings(self, batch=200) -> int:
         """Embed rows lacking a vector. If the active model/dims differ from
         what produced the stored vectors (per this device - see
@@ -699,6 +730,7 @@ class Store:
         except Exception:
             return 0
 
+    @_locked
     def remember(self, type, title, body, tags=None, links=None,
                  crystallizes=None) -> dict:
         if type not in VALID_TYPES:
@@ -755,6 +787,13 @@ class Store:
         self._maybe_forget()
         return {"id": mid, "action": action}
 
+    def _memories_seq(self):
+        """The last id AUTOINCREMENT handed out for `memories` (None before the
+        first ever insert). Per-table, unlike last_insert_rowid() (#85)."""
+        row = self._conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='memories'").fetchone()
+        return row[0] if row else None
+
     def _merge_links(self, existing_links_json, incoming_links) -> str:
         """#47: union the incoming links with the row's current links rather
         than replacing - re-remembering a memory without re-passing `links`
@@ -782,12 +821,11 @@ class Store:
         links_s = json.dumps(incoming_links)
         superseded = (self._find_near_duplicate(type, emb)
                       if (existing is None and self._consolidate) else None)
-        # Snapshot last_insert_rowid() so we can ask the DB which branch of the
-        # upsert actually ran (see the action= line below). Read immediately
-        # before the INSERT - everything above is SELECT-only, so nothing can
-        # have moved it since.
-        rowid_before = self._conn.execute(
-            "SELECT last_insert_rowid()").fetchone()[0]
+        # Snapshot the memories table's AUTOINCREMENT counter so we can ask
+        # the DB which branch of the upsert actually ran (see the action=
+        # line below). Read immediately before the INSERT - everything above
+        # is SELECT-only, so nothing can have moved it since.
+        seq_before = self._memories_seq()
         self._conn.execute(
             "INSERT INTO memories(type, title, title_norm, body, tags, links, "
             "created_at, updated_at, device_id, embedding, author, valid_from) "
@@ -816,13 +854,17 @@ class Store:
         # but `action` is an agent-facing signal - it's how a caller tells "I
         # made a new memory" from "I refined an existing one".
         #
-        # last_insert_rowid() only advances when a row is really inserted, so
-        # asking the DB what it did beats inferring it from wall-clock time.
-        # AUTOINCREMENT never reissues an id, so a genuine insert can't collide
-        # with the previous value.
-        rowid_after = self._conn.execute(
-            "SELECT last_insert_rowid()").fetchone()[0]
-        action = ("created" if rowid_after != rowid_before and rowid_after == mid
+        # Asking the DB what it did beats inferring it from wall-clock time.
+        # #68 first asked via last_insert_rowid(), but that is connection-wide
+        # across ALL tables (#85): recall() inserts session_members/edges/meta
+        # rows, and whenever one of those happened to take the same rowid as
+        # the next memory id, a genuine create compared equal and reported
+        # "updated". sqlite_sequence.seq for `memories` advances only when a
+        # row is really inserted into memories, and AUTOINCREMENT never
+        # reissues an id, so a genuine insert can't collide with the previous
+        # value - and the new id IS the new seq.
+        seq_after = self._memories_seq()
+        action = ("created" if seq_after != seq_before and seq_after == mid
                   else "updated")
         # Either branch leaves `mid` current with embedding=emb (#81).
         self._cache_put(mid, emb, type)
@@ -1079,6 +1121,7 @@ class Store:
         ids = [mid for mid, tags_s in rows if _tags_match(tags_s, tag_list)]
         return self._hydrate(ids[:limit])
 
+    @_locked
     def get(self, id) -> dict:
         """One memory, whole - the fetch half of snippet-plus-fetch (#30).
         Returns None when the id doesn't exist or is no longer current."""
@@ -1105,6 +1148,7 @@ class Store:
             h["body"] = text
         return hits
 
+    @_locked
     def recall(self, query, type=None, limit=20, budget=None, session=None,
                tags=None, full=False) -> list:
         self._maybe_sync_for_read()      # #62: a read-only device pulls too
@@ -1222,6 +1266,7 @@ class Store:
         "        UNION SELECT ?))"
         ", updated_at = ? WHERE id = ?")
 
+    @_locked
     def link(self, id_a, id_b) -> dict:
         # Validate ids outside the retry wrapper: a bad id raises ValueError
         # here, which must surface as-is rather than be mistaken for a replica
@@ -1240,6 +1285,7 @@ class Store:
         self._sync()
         return {"linked": [id_a, id_b]}
 
+    @_locked
     def dismiss_cluster(self, id_a, id_b) -> dict:
         """Reflection control, not a memory operation. Refuses when
         crystallization is off (#65): dismissals are persistent rows in
@@ -1254,6 +1300,7 @@ class Store:
         self._graph.dismiss_peak(id_a, id_b)
         return {"dismissed": [id_a, id_b]}
 
+    @_locked
     def forget(self, id) -> dict:
         return self._write_with_replica_fallback(lambda: self._forget_impl(id))
 
@@ -1275,6 +1322,7 @@ class Store:
         self._sync()
         return {"forgotten": id, "existed": cur.rowcount > 0}
 
+    @_locked
     def restore(self, id) -> dict:
         """Un-forget: clear valid_to so a soft-deleted memory is current again.
 
@@ -1318,6 +1366,7 @@ class Store:
         self._sync()
         return {"restored": id, "existed": True, "action": "restored"}
 
+    @_locked
     def import_records(self, records) -> dict:
         """Replay exported records through the normal write path.
 
@@ -1374,6 +1423,7 @@ class Store:
         return {"created": created, "updated": updated, "skipped": skipped,
                 "linked": linked, "dropped_links": dropped_links}
 
+    @_locked
     def purge(self, id) -> dict:
         """Permanent, non-reversible delete - bypasses valid_to entirely.
         Deliberately NOT exposed as a default MCP tool argument (#49); reserved
@@ -1389,6 +1439,7 @@ class Store:
         self._sync()
         return {"purged": id, "existed": cur.rowcount > 0}
 
+    @_locked
     def export_all(self) -> list:
         """Dump every CURRENT memory as a plain dict - a backup/export path
         independent of the DB file itself (#49). Excludes the embedding
@@ -1406,6 +1457,7 @@ class Store:
             out.append(d)
         return out
 
+    @_locked
     def boot_index(self) -> str:
         self._maybe_sync_for_read()      # #62: the session-start read pulls too
         rows = self._conn.execute(
@@ -1459,6 +1511,7 @@ class Store:
         parts += ["# Recent"] + [line(mid) for mid in recent]
         return "\n".join(parts)
 
+    @_locked
     def crystallization_candidates(self) -> list:
         """Read-time derived view of principle candidates. [] when disabled.
         Process-memoized on a cheap graph signature (adjustment C) so repeated
