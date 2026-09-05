@@ -116,17 +116,41 @@ def _dedupe_links(links) -> list:
     return out
 
 
+# Function words that carry no retrieval signal. Dropped from the FTS query
+# (#89) so a question's "when did ... the" doesn't OR in every memory that
+# happens to contain "the"; FTS5's bm25 already down-weights them, but at
+# OR-time they still cost candidates and rank. Deliberately short - anything
+# not here just gets its (low) bm25 weight.
+_STOPWORDS = frozenset("""
+a an the and or but of to in on at for with by from as is are was were be been
+being am do does did have has had will would can could should may might shall
+what when where who whom whose which why how this that these those it its i
+you he she they we me him her them us my your his their our mine yours theirs
+ours if then than so not no yes about into over under again there here
+""".split())
+
+
 def _fts_query(raw: str):
     """Turn a free-text query into a safe FTS5 MATCH string.
 
-    Each whitespace token is escaped and double-quoted so punctuation in the
-    query can never produce an FTS5 syntax error (degrade, never throw).
-    Returns None when the query has no usable tokens.
+    Each token is escaped and double-quoted so punctuation in the query can
+    never produce an FTS5 syntax error (degrade, never throw), and the tokens
+    are joined with OR so a natural-language query matches memories that
+    contain SOME of its words - FTS5's bm25 then ranks a memory matching more
+    of them higher. Before #89 tokens were space-joined, which FTS5 reads as
+    AND: a memory had to contain EVERY word, so a question-shaped query
+    ("when did I decide on the testing framework?") matched nothing 99.7% of
+    the time on LoCoMo and the keyword arm was silent. Stop-words are dropped
+    unless that would empty the query. Returns None when nothing usable is
+    left.
     """
-    toks = [t for t in re.split(r"\s+", raw.strip()) if t]
+    toks = [t for t in re.split(r"\s+", raw.strip()) if re.search(r"\w", t)]
     if not toks:
         return None
-    return " ".join('"' + t.replace('"', '""') + '"' for t in toks)
+    kept = [t for t in toks
+            if re.sub(r"[^\w]+", "", t).lower() not in _STOPWORDS]
+    toks = kept or toks
+    return " OR ".join('"' + t.replace('"', '""') + '"' for t in toks)
 
 
 def _embed_text(title: str, body: str) -> str:

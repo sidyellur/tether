@@ -98,6 +98,45 @@ def test_recall_tolerates_punctuation():
     assert isinstance(hits, list)
 
 
+# --- #89: keyword recall must work for question-shaped queries --------------
+
+def test_natural_language_query_matches_partial_words():
+    """#89: the FTS query used to AND every token, so a memory had to contain
+    EVERY word of the query. A question like this matched nothing for 99.7%
+    of LoCoMo questions and the keyword arm was silent. OR semantics: a memory
+    that contains SOME of the words is a hit."""
+    s = make_store()
+    s.remember("project", "Test runner", "We settled on pytest; it runs the tests.")
+    # shares only "runs" and "tests" with the memory; under AND this was []
+    hits = s.recall("when did we decide which framework runs the tests?")
+    assert [h["title"] for h in hits] == ["Test runner"]
+
+
+def test_memory_matching_more_query_words_ranks_first():
+    s = make_store()
+    s.remember("project", "Partial", "pytest is installed")
+    s.remember("project", "Full", "pytest runs the whole test suite in CI")
+    hits = s.recall("pytest test suite CI")
+    assert hits[0]["title"] == "Full"
+
+
+def test_stopword_only_query_still_searches():
+    """Dropping stop-words must never empty a query that was all stop-words:
+    fall back to searching the words as given."""
+    s = make_store()
+    s.remember("user", "The band", "They call themselves The The.")
+    assert [h["title"] for h in s.recall("the")] == ["The band"]
+
+
+def test_fts_query_shape():
+    from tether.store import _fts_query
+    assert _fts_query("   ") is None
+    assert _fts_query("?? --") is None                       # no word characters
+    assert _fts_query("pytest") == '"pytest"'
+    assert _fts_query("when did we pick pytest?") == '"pick" OR "pytest?"'
+    assert _fts_query('say "hi"') == '"say" OR """hi"""'     # quotes still escaped
+
+
 def test_link_is_bidirectional_and_idempotent():
     s = make_store()
     a = s.remember("user", "A", "a")["id"]
