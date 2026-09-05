@@ -22,6 +22,22 @@ def test_local_connection_sets_wal_and_busy_timeout(tmp_path):
     conn, _, _ = sync.open_connection(tmp_path / "m.db", None)
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == sync._BUSY_TIMEOUT_MS
+    # #84: WAL + synchronous=NORMAL (1) - no fsync per commit, only at
+    # checkpoints; still corruption-safe in WAL mode.
+    assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+
+
+def test_synchronous_normal_is_per_connection_not_in_the_file(tmp_path):
+    """#84: `synchronous` is connection-level (unlike journal_mode, which
+    persists in the file), so a second plain sqlite3 connection to the same
+    file gets SQLite's default again - which is why it must be set in
+    _local() alongside busy_timeout rather than once at migrate time."""
+    conn, _, _ = sync.open_connection(tmp_path / "m.db", None)
+    assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+    other = sqlite3.connect(str(tmp_path / "m.db"))
+    assert other.execute("PRAGMA synchronous").fetchone()[0] == 2     # FULL default
+    conn2, _, _ = sync.open_connection(tmp_path / "m.db", None)
+    assert conn2.execute("PRAGMA synchronous").fetchone()[0] == 1
 
 
 def test_every_local_connection_gets_the_pragmas(tmp_path, monkeypatch):
@@ -35,6 +51,7 @@ def test_every_local_connection_gets_the_pragmas(tmp_path, monkeypatch):
     conn, _, _ = sync.open_connection(tmp_path / "m.db", cfg)
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == sync._BUSY_TIMEOUT_MS
+    assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
 
 
 def test_backend_failure_degrades_to_local(tmp_path, monkeypatch, capsys):
