@@ -41,15 +41,22 @@ crystallization (Tier B2) each have their own design doc under
   crystallization adds one reflection-control tool, `dismiss_cluster` — not a
   memory operation.)
 - **Upsert on write** so the store doesn't rot into near-duplicates.
-- **Rich recall** (id, type, title, body, tags, `updated_at`) so an agent can
-  judge staleness and cite what it updates.
+- **Rich recall** (id, type, title, body, tags, `updated_at`, plus a `via`
+  receipt saying why each hit surfaced) so an agent can judge staleness and
+  cite what it updates. `body` is a query-centered excerpt, not the whole
+  memory — see [Excerpts](#excerpts).
 - **An auto-loaded boot index** — a compact one-line-per-memory list surfaced to
   the agent each session, so memory helps even when the agent doesn't think to
   search.
 - **Local-first, sync optional** — the local path is untouched when no backend is
   configured; degradation never throws.
-- **Keyword search now, embeddings later** — the SQLite schema is built so
-  semantic search and a full entity/edge graph slot in without migrating data.
+- **Hybrid search, associative on top** — FTS5 keyword hits and local static
+  embeddings are fused, then a usage graph (explicit links, learned co-recall,
+  semantic neighbours) pulls in connected memories. Every layer is additive
+  and degrades to plain keyword recall.
+- **Safe under parallel tool calls** — an agent that fires several
+  `remember`/`recall` calls at once gets atomic, correctly-reported results;
+  see [Performance and durability](#performance-and-durability).
 
 ## Install
 
@@ -105,6 +112,14 @@ next read rather than making you wait.
 | Var | Default | Effect |
 |---|---|---|
 | `TETHER_SYNC_READ_INTERVAL` | `30` | seconds between read-path pulls; `0` = only sync on writes |
+| `TETHER_DEVICE_ID` | hostname | the device id recorded on each memory (and the default `TETHER_AUTHOR`) |
+
+One thing to know about replicas: libSQL forwards **every write** to the
+hosted primary, and with the associative graph on (the default) `recall`
+writes too — it records what was recalled together so memories can wire up
+over time. On a replica that makes each recall a few network round-trips on
+top of the local search. If that matters more to you than learned
+associations, `TETHER_ASSOC=0` makes recall read-only again.
 
 ## Semantic search (optional)
 
@@ -168,6 +183,7 @@ edge it came through), and two optional `recall` args tune it:
 | `TETHER_ASSOC` | on | set `0`/`false`/`off` for plain keyword+semantic recall |
 | `TETHER_RECALL_BUDGET` | `8` | default association breadth |
 | `TETHER_PROTECT_HEAD` | `8` | how many top direct hits are locked above associations |
+| `TETHER_SEED_FLOOR` | `0.35` | minimum cosine similarity a semantic hit needs to seed an associative walk; below it a memory is only reachable through an edge. `0` disables the floor |
 
 Associative recall is **seed-dominant**: the top direct matches are locked in
 place, and associations only fill the slots below them — so turning association
@@ -272,6 +288,48 @@ as before.
 | `TETHER_EXCERPT_CHARS` | `500` | excerpt width; `0` returns full bodies |
 | `id` (per call) | — | fetch just this memory, whole |
 | `full` (per call) | `false` | full bodies for every hit — costs the whole payload; prefer `id=` |
+
+## Performance and durability
+
+tether is meant to be invisible in an agent's loop, so the hot paths are
+measured and kept flat as the store grows. Numbers below are from a local
+SQLite store with the semantic and associative layers on, single process:
+
+| memories | `remember` | `recall` (rare term) | `recall` (term in most memories) |
+|---|---|---|---|
+| 500 | 1.6 ms | 1.8 ms | 3.7 ms |
+| 2,000 | 1.8 ms | 2.5 ms | 7.7 ms |
+| 8,000 | 3.4 ms | 1.0 ms | 19 ms |
+
+A few things that make this hold:
+
+- **Writes don't scale with the store.** The embedding matrix used for
+  semantic search and neighbour wiring is kept in memory and patched row by
+  row on every write, rather than re-read from SQLite. It is rebuilt only
+  when vectors change wholesale (a model change, a backfill) or when another
+  process has written to the file (a CLI `purge`, a second server, a sync
+  pull) — SQLite's `data_version` counter catches that.
+- **Parallel tool calls are serialized.** MCP runs each tool call on its own
+  thread, and agents issue calls in parallel. All Store operations take one
+  lock, so a `recall` and a `remember` arriving together are each atomic:
+  no interleaved transactions, no half-committed writes, and `action` is
+  always right.
+- **Commits don't fsync.** Local connections run WAL with
+  `synchronous=NORMAL`: still safe against corruption, but the last few
+  transactions can be lost if the *machine* loses power before a checkpoint
+  (an application crash loses nothing). Every `remember` and, with the graph
+  on, every `recall` commits, so this is one disk sync saved per call.
+- **Search stays cheap.** Vector search is a single numpy matmul over the
+  in-memory matrix — well under a millisecond at thousands of memories,
+  which is why there is no vector-index extension to install. Keyword cost
+  is FTS5's: proportional to how many memories match the query.
+
+Costs to expect once: the first boot after installing the `[semantic]` extra
+(or changing the model) embeds every existing memory and wires its
+neighbours, which takes a second or two per few thousand memories. The boot
+index and tag-only lookups scan the store on each call; both are fast at
+typical sizes (under 10 ms at 2,000 memories) and are the next things on the
+list to cache.
 
 ## Export and permanent deletion
 
