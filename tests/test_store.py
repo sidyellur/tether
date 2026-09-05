@@ -1639,13 +1639,26 @@ def test_embedding_matrix_is_cached_between_reads():
     assert s._emb_cache is cached, "second read rebuilt the matrix"
 
 
-def test_write_invalidates_the_cache():
+def test_write_keeps_the_cache_current_without_a_rescan():
+    """#81: a write used to drop the cache, so every remember re-read every
+    embedding in the store to rebuild it for kNN wiring. Now the row is
+    patched in: after the write the cache is still there, contains the new
+    id, and neither the write nor the next read touched the embedding scan."""
     s = _cache_store()
     s.remember("user", "Car", "I drive my automobile")
     s.recall("vehicle")
     assert s._emb_cache is not None
-    s.remember("user", "Pizza", "I eat pizza")
-    assert s._emb_cache is None, "a write left a stale matrix in place"
+    scans = []
+    s._conn.set_trace_callback(
+        lambda sql: scans.append(sql) if "SELECT id, embedding, type" in sql else None)
+    try:
+        pid = s.remember("user", "Pizza", "I eat pizza")["id"]
+        s.recall("food")
+    finally:
+        s._conn.set_trace_callback(None)
+    assert scans == [], f"write or read rebuilt the matrix from SQL: {scans}"
+    ids, mat, _types = s._emb_cache
+    assert pid in ids and mat.shape[0] == 2
 
 
 def test_new_memory_is_semantically_findable_immediately():
@@ -1745,12 +1758,120 @@ def test_type_filter_is_honored_through_the_cache():
     assert types <= {"project"}, f"type filter leaked: {types}"
 
 
-def test_consolidation_invalidates_the_cache():
+def test_consolidation_swaps_the_superseded_row_in_the_cache():
     s = _cache_store(consolidate=True, dedup_threshold=0.9)
-    s.remember("user", "Car", "I drive my automobile")
+    old = s.remember("user", "Car", "I drive my automobile")["id"]
     s.recall("vehicle")
-    s.remember("user", "Auto", "I drive my automobile")   # near-duplicate
+    r = s.remember("user", "Auto", "I drive my automobile")   # near-duplicate
+    assert r["action"] == "consolidated"
+    ids, _mat, _types = s._emb_cache
+    assert r["id"] in ids and old not in ids
+
+
+# --- #81: the cache is maintained incrementally, not dropped per write ------
+
+def _fresh_matrix(s):
+    """What a from-scratch scan would produce right now."""
+    saved = s._emb_cache, s._emb_buf, s._emb_cache_version
+    s._invalidate_embedding_cache()
+    fresh = s._embedding_matrix()
+    s._emb_cache, s._emb_buf, s._emb_cache_version = saved
+    return fresh
+
+
+def _assert_cache_matches_scan(s, where):
+    import numpy as np
+    assert s._emb_cache is not None, f"{where}: cache was dropped"
+    ids, mat, types = s._emb_cache
+    fids, fmat, ftypes = _fresh_matrix(s)
+    assert ids == fids, f"{where}: ids {ids} != scan {fids}"
+    assert types == ftypes, f"{where}: types differ"
+    if fmat is None:
+        assert mat is None, where
+    else:
+        assert np.array_equal(mat, fmat), f"{where}: matrix differs from scan"
+
+
+def test_incremental_cache_matches_a_full_rebuild_after_every_write():
+    """Equivalence, the test that matters: after each kind of row-level write
+    the patched cache must be byte-identical to a fresh ORDER BY id scan -
+    same ids in the same order, same vectors, same types - because ranking
+    ties break on row order and a drifted matrix would corrupt recall."""
+    s = _cache_store(consolidate=True, dedup_threshold=0.9)
+    car = s.remember("user", "Car", "I drive my automobile")["id"]
+    s.recall("vehicle")                                     # warm
+    _assert_cache_matches_scan(s, "warm")
+
+    pizza = s.remember("user", "Pizza", "I eat pizza")["id"]
+    _assert_cache_matches_scan(s, "insert")
+
+    s.remember("user", "Pizza", "I eat pizza and write python code")   # update
+    _assert_cache_matches_scan(s, "update (vector replaced)")
+
+    tests = s.remember("project", "Tests", "pytest runs the tests")["id"]
+    s.forget(car)
+    _assert_cache_matches_scan(s, "forget")
+
+    s.restore(car)                       # id below the others -> sorted insert
+    _assert_cache_matches_scan(s, "restore")
+
+    r = s.remember("user", "Auto", "I drive my automobile")  # supersedes car
+    assert r["action"] == "consolidated"
+    _assert_cache_matches_scan(s, "consolidate")
+
+    s.purge(pizza)
+    _assert_cache_matches_scan(s, "purge")
+
+    s.forget(tests)
+    s.forget(r["id"])
+    _assert_cache_matches_scan(s, "emptied")
+    assert s._emb_cache[1] is None
+
+
+def test_forgetting_sweep_drops_swept_rows_from_the_cache():
+    pytest.importorskip("numpy")
+    s = make_forget_store(embedder=FakeEmbedder())
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(6)]
+    _add_edge(s, ids[4], ids[5], "hebbian")
+    _age(s, ids[0])
+    s.recall("T1")                                          # warm the cache
+    assert ids[0] in s._emb_cache[0]
+    assert s._run_forgetting_sweep() == 1
+    assert ids[0] not in s._emb_cache[0]
+    _assert_cache_matches_scan(s, "sweep")
+
+
+def test_write_from_another_connection_is_noticed(tmp_path):
+    """The incremental path only sees writes made through THIS store. A CLI
+    purge, a second server, or a replica pull commits through another
+    connection - PRAGMA data_version catches that and forces a rebuild, so
+    the cache never serves a matrix the file has moved past."""
+    pytest.importorskip("numpy")
+    path = str(tmp_path / "m.db")
+    a = Store(sqlite3.connect(path), "a", lambda *x, **k: None,
+              embedder=FakeEmbedder(), sync_read_interval=0)
+    a.migrate()
+    b = Store(sqlite3.connect(path), "b", lambda *x, **k: None,
+              embedder=FakeEmbedder(), sync_read_interval=0)
+    b.migrate()
+    a.remember("user", "Car", "I drive my automobile")
+    assert "Car" in [h["title"] for h in a.recall("vehicle")]    # warm a's cache
+    pid = b.remember("user", "Pizza", "I eat pizza at every meal")["id"]
+    assert "Pizza" in [h["title"] for h in a.recall("food")], \
+        "a served a stale matrix after b's write"
+    b.purge(pid)
+    assert "Pizza" not in [h["title"] for h in a.recall("food")]
+
+
+def test_cache_put_and_drop_are_noops_without_a_cache():
+    s = _cache_store()
+    pid = s.remember("user", "Car", "I drive my automobile")["id"]
+    assert s._emb_cache is None                 # nothing has read it yet
+    s.forget(pid)
     assert s._emb_cache is None
+    s.restore(pid)
+    assert s._emb_cache is None
+    assert "Car" in [h["title"] for h in s.recall("vehicle")]
 
 
 # --- #38: concurrent link() must not lose updates ----------------------------

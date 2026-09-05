@@ -5,6 +5,7 @@ triggers. The four verbs and the boot index are the only public surface;
 nothing outside this module speaks SQL.
 """
 
+import bisect
 import json
 import re
 import struct
@@ -302,11 +303,33 @@ class Store:
         self._last_sync_at = None
         self._excerpt_chars = excerpt_chars
         # #61: (ids, matrix, types) for every current embedding, built once and
-        # reused until a write invalidates it. Before this, _vector_ids,
-        # _find_near_duplicate and graph.on_remember each re-read and
-        # re-deserialized every embedding blob in the store on every call - a
-        # single remember() paid for two full scans, and recall paid for one.
+        # reused. Before this, _vector_ids, _find_near_duplicate and
+        # graph.on_remember each re-read and re-deserialized every embedding
+        # blob in the store on every call - a single remember() paid for two
+        # full scans, and recall paid for one.
+        #
+        # #81: the cache is now maintained INCREMENTALLY by the row-level
+        # writes (_cache_put / _cache_drop) instead of being dropped on every
+        # write. Dropping it made each remember() re-read every blob in the
+        # store to rebuild it for kNN wiring - O(N) per write, 77% of a
+        # remember at 8k memories - and the next recall paid the same rebuild
+        # again. `ids` is kept sorted ascending so the incremental matrix is
+        # byte-identical to a fresh `ORDER BY id` scan (ranking ties break on
+        # row order). Full rebuilds remain only where the rows change
+        # wholesale (backfill, degrade) or behind our back (see
+        # _emb_cache_version).
         self._emb_cache = None
+        # Backing storage for the cached matrix: `mat` is a row-prefix view of
+        # this buffer, which is over-allocated (doubling) so appending a new
+        # memory is O(dims) rather than a copy of the whole matrix.
+        self._emb_buf = None
+        # The `PRAGMA data_version` observed when the cache was built. It
+        # changes only when ANOTHER connection commits to the file (our own
+        # writes never bump it), so it is a near-free way to notice a CLI
+        # purge, a second server process, or a replica pull that landed rows
+        # the incremental path never saw - and rebuild instead of serving a
+        # stale matrix. None when the pragma is unavailable (-> no check).
+        self._emb_cache_version = None
 
     def _degrade_to_local(self) -> bool:
         """A replica write just failed (e.g. the network dropped mid-session).
@@ -336,33 +359,137 @@ class Store:
         return True
 
     def _invalidate_embedding_cache(self) -> None:
-        """Called by every write that can change which embeddings are current
-        (#61). Deliberately blunt - drop the whole thing rather than patch it -
-        because a subtly-stale vector cache would silently corrupt recall
-        ranking and consolidation, and rebuilding costs one scan, which is what
-        every call used to pay anyway."""
+        """Drop the whole cache so the next read rebuilds it from SQL. The
+        blunt path (#61), now reserved for writes that change rows wholesale
+        - backfill_embeddings, _degrade_to_local - or any incremental update
+        that can't be applied cleanly. Row-level writes use _cache_put /
+        _cache_drop instead (#81)."""
         self._emb_cache = None
+        self._emb_buf = None
+        self._emb_cache_version = None
 
-    def _embedding_matrix(self):
-        """(ids, matrix, types) over every CURRENT embedding, or (None, ...) if
-        semantic support is unavailable. One scan, then reused until a write
-        invalidates it. Never raises - callers degrade to keyword-only."""
-        if self._emb_cache is not None:
-            return self._emb_cache
+    def _data_version(self):
+        """SQLite's per-connection change counter for OTHER connections'
+        commits, or None if the pragma is unavailable (never raises)."""
+        try:
+            return self._conn.execute("PRAGMA data_version").fetchone()[0]
+        except Exception:
+            return None
+
+    def _cache_put(self, mid, emb, type_) -> None:
+        """Reflect one row's current embedding in the cache (#81): replace it
+        if the row is already cached, otherwise insert it at its sorted
+        position. `emb is None` means the row has no vector any more, so it
+        is dropped. A no-op when there is no cache to maintain (the next read
+        rebuilds from SQL, which already includes this row). Any surprise -
+        a dimension mismatch, a numpy failure - falls back to a full rebuild
+        rather than risking a subtly wrong matrix.
+
+        Rows are edited in the backing buffer in place, and a new highest id
+        (the AUTOINCREMENT common case) is appended into spare capacity, so
+        the per-write cost is O(dims), not a copy of the matrix. Nothing
+        holds a matrix across a put: remember() fetches its shared copy
+        AFTER the upsert has patched the cache.
+        """
+        cache = self._emb_cache
+        if cache is None:
+            return
+        if emb is None:
+            self._cache_drop(mid)
+            return
         try:
             import numpy as np
 
+            ids, mat, types = cache
+            vec = np.frombuffer(emb, dtype="<f4")
+            if mat is not None and vec.shape[0] != mat.shape[1]:
+                self._invalidate_embedding_cache()
+                return
+            pos = bisect.bisect_left(ids, mid)
+            n = len(ids)
+            if pos < n and ids[pos] == mid:
+                mat[pos] = vec
+                types = list(types)
+                types[pos] = type_
+                self._emb_cache = (ids, mat, types)
+                return
+            buf = self._emb_buf
+            if (pos == n and mat is not None and buf is not None
+                    and mat.base is buf and buf.shape[0] > n):
+                buf[n] = vec                          # append, no copy
+            else:
+                # Grow (or insert mid-way, e.g. a restore of an old id):
+                # one copy into a buffer with doubling headroom.
+                buf = np.empty((max(16, 2 * (n + 1)), vec.shape[0]), dtype=np.float32)
+                if mat is not None:
+                    buf[:pos] = mat[:pos]
+                    buf[pos + 1:n + 1] = mat[pos:]
+                buf[pos] = vec
+                self._emb_buf = buf
+            self._emb_cache = ([*ids[:pos], mid, *ids[pos:]], buf[:n + 1],
+                               [*types[:pos], type_, *types[pos:]])
+        except Exception:
+            self._invalidate_embedding_cache()
+
+    def _cache_drop(self, mid) -> None:
+        """Remove one row from the cache (#81): forgotten, superseded, swept,
+        purged, or re-written without a vector. No-op if uncached. Shifts
+        the rows above it down in place (numpy handles the overlap)."""
+        cache = self._emb_cache
+        if cache is None:
+            return
+        try:
+            ids, mat, types = cache
+            pos = bisect.bisect_left(ids, mid)
+            n = len(ids)
+            if pos >= n or ids[pos] != mid:
+                return
+            buf = self._emb_buf
+            if n == 1:
+                mat = None
+            elif buf is not None and mat.base is buf:
+                buf[pos:n - 1] = buf[pos + 1:n]
+                mat = buf[:n - 1]
+            else:
+                import numpy as np
+                mat = np.delete(mat, pos, axis=0)
+            self._emb_cache = ([*ids[:pos], *ids[pos + 1:]], mat,
+                               [*types[:pos], *types[pos + 1:]])
+        except Exception:
+            self._invalidate_embedding_cache()
+
+    def _embedding_matrix(self):
+        """(ids, matrix, types) over every CURRENT embedding, or (None, ...) if
+        semantic support is unavailable. One scan, then kept current by the
+        row-level writes (#81) - rebuilt only if another connection has
+        committed to the file since. Never raises - callers degrade to
+        keyword-only."""
+        if self._emb_cache is not None:
+            version = self._data_version()
+            if version is None or version == self._emb_cache_version:
+                return self._emb_cache
+            self._invalidate_embedding_cache()
+        try:
+            import numpy as np
+
+            # Read the version BEFORE the scan so a commit that lands between
+            # the two is caught on the next read rather than missed forever.
+            version = self._data_version()
             rows = self._conn.execute(
                 "SELECT id, embedding, type FROM memories "
                 "WHERE embedding IS NOT NULL AND valid_to IS NULL "
                 "ORDER BY id").fetchall()
             if not rows:
                 self._emb_cache = ([], None, [])
-                return self._emb_cache
-            ids = [r[0] for r in rows]
-            mat = np.frombuffer(b"".join(r[1] for r in rows),
-                                dtype="<f4").reshape(len(ids), -1)
-            self._emb_cache = (ids, mat, [r[2] for r in rows])
+            else:
+                ids = [r[0] for r in rows]
+                # A writable, exactly-sized buffer (frombuffer's view of the
+                # joined blobs is read-only); the first append grows it.
+                buf = np.array(np.frombuffer(b"".join(r[1] for r in rows),
+                                             dtype="<f4").reshape(len(ids), -1))
+                self._emb_buf = buf
+                self._emb_cache = (ids, buf[:len(ids)], [r[2] for r in rows])
+            self._emb_cache_version = version
             return self._emb_cache
         except Exception:
             return ([], None, [])
@@ -613,15 +740,14 @@ class Store:
             mid, action = self._upsert_locked(
                 type, title, norm, body, tags_s, incoming_links, now, emb, existing)
 
-        # Share one matrix across the whole write (#61). When consolidation ran,
-        # _find_near_duplicate already built it and this is a free cache hit;
-        # otherwise it's built here - either way on_remember doesn't repeat the
-        # scan. on_remember excludes `mid` itself, so it doesn't matter whether
-        # the matrix predates this row or includes it.
+        # Share one matrix across the whole write (#61). The upsert above
+        # already patched this row into the cache (#81), so this is a cache
+        # hit that includes `mid` - on_remember excludes `mid` itself, so the
+        # row costs nothing but also never triggers a rescan. Before #81 the
+        # cache was dropped here and every remember re-read the whole store.
         shared = (self._embedding_matrix()
                   if emb is not None and self._graph.enabled else None)
         self._graph.on_remember(mid, emb, matrix=shared)
-        self._invalidate_embedding_cache()
         if self._crystallize and crystallizes:
             self._graph.on_crystallize(mid, crystallizes)
         self._conn.commit()
@@ -698,12 +824,14 @@ class Store:
             "SELECT last_insert_rowid()").fetchone()[0]
         action = ("created" if rowid_after != rowid_before and rowid_after == mid
                   else "updated")
+        # Either branch leaves `mid` current with embedding=emb (#81).
+        self._cache_put(mid, emb, type)
         if action == "created" and superseded is not None:
             self._conn.execute(
                 "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
                 (now, mid, superseded))
             self._graph.unprime(superseded)
-            self._invalidate_embedding_cache()
+            self._cache_drop(superseded)
             action = "consolidated"
         return mid, action
 
@@ -720,6 +848,7 @@ class Store:
                 "device_id=?, author=?, embedding=? WHERE id=?",
                 (title, body, tags_s, links_s, now, self._device_id,
                  self._author, emb, mid))
+            self._cache_put(mid, emb, type)
             return mid, "updated"
         links_s = json.dumps(incoming_links)
         superseded = self._find_near_duplicate(type, emb) if self._consolidate else None
@@ -731,12 +860,13 @@ class Store:
              self._device_id, emb, self._author, now))
         mid = cur.lastrowid
         action = "created"
+        self._cache_put(mid, emb, type)
         if superseded is not None:
             self._conn.execute(
                 "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
                 (now, mid, superseded))
             self._graph.unprime(superseded)
-            self._invalidate_embedding_cache()
+            self._cache_drop(superseded)
             action = "consolidated"
         return mid, action
 
@@ -805,9 +935,9 @@ class Store:
                 self._conn.execute(
                     "UPDATE memories SET valid_to=? WHERE id=?", (now, mid))
                 self._graph.unprime(mid)
+                self._cache_drop(mid)
                 archived += 1
             if archived:
-                self._invalidate_embedding_cache()
                 self._conn.commit()
             return archived
         except Exception:
@@ -1140,7 +1270,7 @@ class Store:
             (now, id))
         if cur.rowcount > 0:
             self._graph.unprime(id)          # #42: don't let it linger as primed context
-            self._invalidate_embedding_cache()
+            self._cache_drop(id)
         self._conn.commit()
         self._sync()
         return {"forgotten": id, "existed": cur.rowcount > 0}
@@ -1181,7 +1311,9 @@ class Store:
         self._conn.execute(
             "UPDATE memories SET valid_to=NULL, superseded_by=NULL WHERE id=?",
             (id,))
-        self._invalidate_embedding_cache()
+        emb, = self._conn.execute(
+            "SELECT embedding FROM memories WHERE id=?", (id,)).fetchone()
+        self._cache_put(id, emb, type_)      # back in the current set (#81)
         self._conn.commit()
         self._sync()
         return {"restored": id, "existed": True, "action": "restored"}
@@ -1252,7 +1384,7 @@ class Store:
     def _purge_impl(self, id) -> dict:
         cur = self._conn.execute("DELETE FROM memories WHERE id=?", (id,))
         self._graph.on_forget(id)
-        self._invalidate_embedding_cache()
+        self._cache_drop(id)
         self._conn.commit()
         self._sync()
         return {"purged": id, "existed": cur.rowcount > 0}
