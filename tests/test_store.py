@@ -1971,6 +1971,93 @@ def test_store_lock_is_reentrant_for_import():
     assert out["created"] == 2 and out["linked"] == 1
 
 
+# --- #92: project awareness --------------------------------------------------
+
+def make_project_store(project="tether", **kw):
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, device_id="d", sync_now=lambda *a, **k: None,
+              project=project, **kw)
+    s.migrate()
+    return s
+
+
+def _tags(s, mid):
+    return s._conn.execute("SELECT tags FROM memories WHERE id=?", (mid,)).fetchone()[0]
+
+
+def test_remember_auto_tags_work_memories_with_the_project():
+    s = make_project_store()
+    p = s.remember("project", "Test runner", "pytest", tags="ci")["id"]
+    f = s.remember("feedback", "Terse", "keep answers short")["id"]
+    r = s.remember("reference", "Docs", "see wiki")["id"]
+    u = s.remember("user", "Name", "Sid")["id"]
+    assert _tags(s, p) == "ci,proj:tether"           # existing tags preserved
+    assert _tags(s, f) == "proj:tether"
+    assert _tags(s, r) == "proj:tether"
+    assert _tags(s, u) == ""                          # user memories stay global
+
+
+def test_remember_respects_an_explicit_project_tag():
+    s = make_project_store()
+    mid = s.remember("project", "Elsewhere", "x", tags="proj:other,misc")["id"]
+    assert _tags(s, mid) == "proj:other,misc"         # not re-stamped
+
+
+def test_no_project_means_no_tags_and_no_sections():
+    s = make_store()                                  # project=None
+    mid = s.remember("project", "A", "a")["id"]
+    assert _tags(s, mid) == ""
+    assert "# This project" not in s.boot_index()
+
+
+def test_boot_index_leads_with_this_project():
+    s = make_project_store()
+    a = s.remember("project", "Ours", "x")["id"]
+    b = s.remember("project", "Theirs", "y", tags="proj:other")["id"]
+    u = s.remember("user", "Global", "z")["id"]
+    idx = s.boot_index()
+    lines = idx.splitlines()
+    assert lines[0] == "# This project (tether)"
+    assert f"#{a} " in lines[1]
+    assert "# Everything else" in lines
+    rest = idx.split("# Everything else")[1]
+    assert f"#{b} " in rest and f"#{u} " in rest
+
+
+def test_boot_index_project_slice_is_half_the_cap_above_it():
+    s = make_project_store(assoc=False, boot_index_cap=4)
+    mine = [s.remember("project", f"M{i}", "x")["id"] for i in range(6)]
+    others = [s.remember("project", f"O{i}", "y", tags="proj:other")["id"] for i in range(6)]
+    idx = s.boot_index()
+    head, rest = idx.split("# Everything else")
+    def ids_in(text):
+        return [int(line.split("#")[1].split()[0]) for line in text.splitlines()]
+
+    head_ids = ids_in("\n".join(head.splitlines()[1:]))
+    assert head_ids == list(reversed(mine))[:2]       # newest 2 of ours (cap // 2)
+    rest_ids = ids_in(rest.strip())
+    assert rest_ids == list(reversed(others))[:2]     # remaining budget, newest first
+    assert len(head_ids) + len(rest_ids) == 4          # cap still holds overall
+
+
+def test_recall_prefers_same_project_hit_on_an_equal_match():
+    s = make_project_store()
+    ours = s.remember("project", "Ours", "pytest runs the suite")["id"]
+    theirs = s.remember("project", "Theirs", "pytest runs the suite", tags="proj:other")["id"]
+    # `theirs` is newer, so recency alone would rank it first (#92 must win)
+    hits = s.recall("pytest runs the suite", budget=0)
+    assert [h["id"] for h in hits][:2] == [ours, theirs]
+
+
+def test_recall_project_bonus_never_beats_a_clearly_better_match():
+    s = make_project_store()
+    s.remember("project", "Ours", "unrelated note about lunch")
+    theirs = s.remember("project", "Theirs", "pytest runs the whole test suite in CI",
+                        tags="proj:other")["id"]
+    hits = s.recall("pytest test suite CI", budget=0)
+    assert hits[0]["id"] == theirs
+
+
 # --- #38: concurrent link() must not lose updates ----------------------------
 
 def test_concurrent_links_do_not_clobber_each_other(tmp_path):

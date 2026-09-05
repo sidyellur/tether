@@ -163,6 +163,28 @@ def test_server_consolidation_defaults_off(monkeypatch, tmp_path):
         server._store = None
 
 
+def test_status_reports_the_project_from_claude_project_dir(monkeypatch, tmp_path):
+    """#92: the server picks the project up from the env Claude Code sets."""
+    import json
+
+    from tether import server
+    monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")
+    monkeypatch.delenv("TETHER_SYNC_URL", raising=False)
+    monkeypatch.delenv("TETHER_SYNC_TOKEN", raising=False)
+    monkeypatch.delenv("TETHER_PROJECT", raising=False)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path / "myrepo"))
+    server._store = None
+    try:
+        store = server._get_store()
+        assert store._project == "myrepo"
+        assert json.loads(server.status())["project"] == "myrepo"
+        store.remember("project", "Runner", "pytest")
+        assert server.memory_index().startswith("# This project (myrepo)")
+    finally:
+        server._store = None
+
+
 def test_get_store_builds_one_store_under_parallel_first_calls(monkeypatch, tmp_path):
     """#83: tool calls run on worker threads, so two first calls raced the
     lazy init and could each build a store (two connections, two migrates).

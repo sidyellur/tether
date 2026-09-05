@@ -136,6 +136,38 @@ def test_seed_floor_default_and_parsing(monkeypatch):
     assert config.seed_floor() == 0.35
 
 
+# --- #92: project awareness --------------------------------------------------
+
+def test_project_defaults_to_claude_project_dir_basename(monkeypatch):
+    monkeypatch.delenv("TETHER_PROJECT", raising=False)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/home/sid/code/tether/")
+    assert config.project() == "tether"
+
+
+def test_project_is_none_without_any_signal(monkeypatch):
+    """Never fall back to the working directory: a wrong project is worse
+    than none."""
+    monkeypatch.delenv("TETHER_PROJECT", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    assert config.project() is None
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "   ")
+    assert config.project() is None
+
+
+def test_project_explicit_wins_and_off_disables(monkeypatch):
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/x/from-dir")
+    monkeypatch.setenv("TETHER_PROJECT", "explicit-name")
+    assert config.project() == "explicit-name"
+    for off in ("off", "0", "false", "NO"):
+        monkeypatch.setenv("TETHER_PROJECT", off)
+        assert config.project() is None, off
+
+
+def test_project_name_is_tag_safe(monkeypatch):
+    monkeypatch.setenv("TETHER_PROJECT", "  a,b  ")   # comma separates tags
+    assert config.project() == "a-b"
+
+
 def test_boot_index_cap_default_and_parsing(monkeypatch):
     monkeypatch.delenv("TETHER_BOOT_INDEX_CAP", raising=False)
     assert config.boot_index_cap() == 50

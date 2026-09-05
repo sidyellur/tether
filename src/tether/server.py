@@ -79,7 +79,8 @@ def _get_store() -> Store:
                       forget_interval=config.forget_interval(),
                       forget_max_per_sweep=config.forget_max_per_sweep(),
                       sync_read_interval=config.sync_read_interval(),
-                      excerpt_chars=config.excerpt_chars())
+                      excerpt_chars=config.excerpt_chars(),
+                      project=config.project())
         store.migrate()
         if embedder is not None:
             store.backfill_embeddings()
@@ -94,6 +95,17 @@ def remember(type: str, title: str, body: str,
     """Save a durable memory. UPSERTS: a memory of the same `type` with the same
     (whitespace/case-normalized) `title` is updated in place instead of
     duplicated, so re-remembering a fact refines it rather than cluttering.
+
+    Worth remembering: decisions and their reasons, conventions, gotchas that
+    cost time, the user's preferences and how they like to work, facts about
+    the environment (paths, commands, accounts) you had to discover. Not worth
+    it: anything derivable from the code, or a transcript of what you did.
+    Remember it when you learn it, not at the end of the session.
+
+    Memories of type project/feedback/reference are tagged with the current
+    project automatically (`proj:<name>`, from CLAUDE_PROJECT_DIR) unless you
+    pass a `proj:` tag yourself; `user` memories are about the person and
+    stay global.
 
     Args:
         type: one of "user", "feedback", "project", "reference".
@@ -123,6 +135,14 @@ def recall(query: str = "", type: str | None = None, limit: int = 20,
            full: bool = False) -> dict:
     """Search memories by keyword and semantic similarity, then follow the
     usage graph to related memories, most relevant first.
+
+    Ask in plain language, the way you would ask a colleague ("how do we run
+    the integration tests?", "what did the user decide about the auth
+    library?") - a memory matching some of the words is a hit, and the best
+    match ranks first. Recall BEFORE starting a task, not only when stuck:
+    the index you were given at session start is titles only. Memories from
+    the current project rank slightly ahead of equally-good ones from
+    elsewhere.
 
     Each hit carries {id, type, title, body, tags, updated_at} and a `via`
     receipt explaining why it surfaced (a direct match, or the edge it was
@@ -200,9 +220,13 @@ def forget(id: int) -> dict:
 
 @mcp.resource("tether://memory-index")
 def memory_index() -> str:
-    """A compact index of ALL memories - one line per memory as `[type] #id
-    title`, newest first. Auto-loaded each session so memory helps even without
-    an explicit recall; pull full bodies with recall() using the id.
+    """A compact index of memories - one line per memory as `[type] #id title`.
+    When the server knows which project it is serving (CLAUDE_PROJECT_DIR or
+    TETHER_PROJECT), a `# This project` section comes first, then
+    `# Everything else`; a large store is curated to the most load-bearing and
+    most recent memories. Auto-loaded each session so memory helps even
+    without an explicit recall; these are titles only - call recall() with a
+    question, or recall(id=N), to read the ones that matter for the task.
     """
     try:
         return _get_store().boot_index()
@@ -226,6 +250,7 @@ def status() -> str:
             "semantic_enabled": store._embedder is not None,
             "embedding_model": getattr(store._embedder, "name", None),
             "sync_mode": _sync_mode,
+            "project": store._project,
             "memory_count": memory_count,
             "edge_count": edge_count,
             "db_path": str(config.db_path()),

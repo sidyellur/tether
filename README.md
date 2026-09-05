@@ -86,6 +86,34 @@ By default memory lives in a local SQLite file at
 `XDG_DATA_HOME`, which is honored on every platform). No accounts, no
 network — this is the whole tool for a single machine.
 
+## Project awareness
+
+tether knows which project it is serving: Claude Code sets
+`CLAUDE_PROJECT_DIR` in every MCP server's environment, and tether takes the
+directory's name as the project (override or disable with `TETHER_PROJECT`).
+That drives three things, none of which need configuration:
+
+- **The boot index leads with this project.** The auto-loaded index opens
+  with a `# This project (<name>)` section, then `# Everything else`, so the
+  agent starts a session already looking at the decisions and gotchas for the
+  repo it is in rather than whatever you touched last, anywhere.
+- **Work memories are tagged automatically.** `project`, `feedback` and
+  `reference` memories get a `proj:<name>` tag unless the agent passes a
+  `proj:` tag itself. `user` memories are about you, not the work, and stay
+  global. The tag is an ordinary tag: `recall(tags="proj:<name>")` lists a
+  project's memories deterministically.
+- **Recall prefers this project on a near-tie.** A hit tagged with the
+  current project ranks a few places ahead of an equally-good hit from
+  another project; it never outranks a clearly better match, and untagged
+  memories are neither boosted nor penalized.
+
+| Var | Default | Effect |
+|---|---|---|
+| `TETHER_PROJECT` | basename of `CLAUDE_PROJECT_DIR` | name the project explicitly; `off` disables project awareness |
+
+Nothing falls back to the working directory: outside Claude Code (or with
+`TETHER_PROJECT=off`) tether behaves exactly as before.
+
 ## Sync across devices (optional)
 
 Point tether at a [Turso](https://turso.tech) / libSQL database and the local
