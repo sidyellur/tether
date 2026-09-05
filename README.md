@@ -166,8 +166,9 @@ on the next start.
 
 Measured on the LoCoMo long-conversation benchmark (one memory per dialogue
 turn, 1,536 questions, "did recall return the turns that answer it" in the
-top 10), the keyword arm alone finds the evidence for 62% of questions,
-against 54% for a textbook BM25 over the same text.
+top 10), the keyword arm alone finds the evidence for 61% of questions,
+against 54% for a textbook BM25 over the same text. That harness ships in
+the repo — see [Benchmarks](#benchmarks).
 
 ## Semantic search (optional)
 
@@ -378,6 +379,27 @@ neighbours, which takes a second or two per few thousand memories. The boot
 index and tag-only lookups scan the store on each call; both are fast at
 typical sizes (under 10 ms at 2,000 memories) and are the next things on the
 list to cache.
+
+## Benchmarks
+
+Two harnesses live in `bench/`, both runnable without an API key:
+
+- **`python -m bench.locomo`** — retrieval-only evaluation on
+  [LoCoMo](https://github.com/snap-research/locomo), ten long multi-session
+  conversations with ~1,500 questions each labelled with the dialogue turns
+  that answer it. Every turn becomes a memory; the score is whether
+  `recall(question)` returns those turns (recall@k, MRR), per condition:
+  keyword only, keyword + semantic, and the full associative path, next to a
+  textbook BM25 baseline. No LLM is involved, so the number measures the one
+  thing a memory layer controls — did it hand the agent the right facts — and
+  is not comparable to the LLM-judged "accuracy" figures memory vendors
+  publish on the same dataset. The data (~1.5 MB) is downloaded on first
+  use. Install the `[semantic]` extra to measure the semantic and associative
+  conditions with the real model.
+- **`python -m bench.run`** — tether's own associative-recall evaluation: a
+  controlled corpus of tasks whose members are used together, measuring what
+  the usage graph adds over keyword + semantic search after simulated use.
+  Needs the `[semantic]` extra.
 
 ## Export and permanent deletion
 
