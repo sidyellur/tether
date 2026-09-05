@@ -136,6 +136,18 @@ def test_seed_floor_default_and_parsing(monkeypatch):
     assert config.seed_floor() == 0.35
 
 
+# --- #90: keyword stemming ---------------------------------------------------
+
+def test_fts_stemming_default_on_and_off_values(monkeypatch):
+    monkeypatch.delenv("TETHER_FTS_STEMMING", raising=False)
+    assert config.fts_stemming() is True
+    for off in ("0", "false", "no", "OFF"):
+        monkeypatch.setenv("TETHER_FTS_STEMMING", off)
+        assert config.fts_stemming() is False, off
+    monkeypatch.setenv("TETHER_FTS_STEMMING", "1")
+    assert config.fts_stemming() is True
+
+
 # --- #92: project awareness --------------------------------------------------
 
 def test_project_defaults_to_claude_project_dir_basename(monkeypatch):

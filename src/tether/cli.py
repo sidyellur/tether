@@ -24,8 +24,10 @@ def _build_store() -> Store:
     path = config.db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn, sync_now, _mode = open_connection(path, config.sync_config())
+    # Same tokenizer setting as the server, so an admin command never flips
+    # the FTS index back and forth against what the server built (#90).
     store = Store(conn, device_id=config.device_id(), sync_now=sync_now,
-                  author=config.author())
+                  author=config.author(), stemming=config.fts_stemming())
     store.migrate()
     return store
 

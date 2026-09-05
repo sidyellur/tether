@@ -80,7 +80,8 @@ def _get_store() -> Store:
                       forget_max_per_sweep=config.forget_max_per_sweep(),
                       sync_read_interval=config.sync_read_interval(),
                       excerpt_chars=config.excerpt_chars(),
-                      project=config.project())
+                      project=config.project(),
+                      stemming=config.fts_stemming())
         store.migrate()
         if embedder is not None:
             store.backfill_embeddings()
