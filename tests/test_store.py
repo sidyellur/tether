@@ -1874,6 +1874,64 @@ def test_cache_put_and_drop_are_noops_without_a_cache():
     assert "Car" in [h["title"] for h in s.recall("vehicle")]
 
 
+# --- #83: parallel tool calls share one Store -------------------------------
+
+def test_parallel_calls_on_one_store_are_atomic(tmp_path):
+    """#83: the mcp SDK runs sync tool functions on worker threads, so
+    parallel tool calls hit one Store and one sqlite3 connection at once.
+    Without the store lock this raised "cannot start a transaction within a
+    transaction" / "cannot commit - no transaction is active" and reported
+    a fresh create as "updated" (last_insert_rowid() is per-connection, and
+    recall inserts session rows) - dozens of times per run of this exact
+    workload. With it, every call is atomic: no exceptions, right actions."""
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(str(tmp_path / "m.db"), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, sync_read_interval=0)
+    s.migrate()
+    errors, misreports = [], []
+
+    def worker(t):
+        for i in range(40):
+            try:
+                if i % 5 in (0, 1):
+                    r = s.remember("user", f"t{t}-{i}", "I drive my car to eat pizza")
+                    if r["action"] != "created":          # every title is unique
+                        misreports.append((f"t{t}-{i}", r["action"]))
+                elif i % 5 == 4:
+                    ids = [row[0] for row in conn.execute(
+                        "SELECT id FROM memories WHERE valid_to IS NULL LIMIT 2").fetchall()]
+                    if len(ids) == 2:
+                        s.link(ids[0], ids[1])
+                else:
+                    s.recall(["car", "pizza", "food"][i % 3], limit=10)
+            except Exception as e:
+                errors.append(f"{type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(4)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert errors == [], errors[:5]
+    assert misreports == [], misreports[:5]
+    n = conn.execute("SELECT COUNT(*) FROM memories WHERE valid_to IS NULL").fetchone()[0]
+    assert n == 4 * 16                                     # every remember landed
+
+
+def test_store_lock_is_reentrant_for_import():
+    """import_records calls remember()/link() under the lock it already
+    holds - an RLock, so that must not deadlock."""
+    s = make_store()
+    out = s.import_records([
+        {"id": 1, "type": "user", "title": "A", "body": "a", "links": [2]},
+        {"id": 2, "type": "user", "title": "B", "body": "b"},
+    ])
+    assert out["created"] == 2 and out["linked"] == 1
+
+
 # --- #38: concurrent link() must not lose updates ----------------------------
 
 def test_concurrent_links_do_not_clobber_each_other(tmp_path):
@@ -2097,3 +2155,31 @@ def test_action_still_reports_created_for_distinct_titles_on_a_frozen_clock(monk
     b = s.remember("user", "Second", "body two")
     assert a["action"] == "created" and b["action"] == "created"
     assert a["id"] != b["id"]
+
+
+def test_action_is_created_when_another_table_just_took_the_same_rowid():
+    """#85: the #68 fix compared last_insert_rowid() before/after the upsert,
+    but that counter is connection-wide across ALL tables. recall() inserts
+    session_members/edges/meta rows; whenever one of those took the same
+    rowid as the next memory id, a genuine create compared equal and came
+    back "updated". Reproduced here without recall: park last_insert_rowid()
+    on the id the next memory will get, then remember a brand-new title."""
+    s = make_store()
+    s._conn.execute("INSERT INTO meta(key, value) VALUES ('probe', '1')")   # meta rowid 1
+    assert s._conn.execute("SELECT last_insert_rowid()").fetchone()[0] == 1
+    r = s.remember("user", "Brand new", "memory id 1")                     # memories id 1
+    assert r["id"] == 1
+    assert r["action"] == "created", "a fresh create reported as an update (#85)"
+    again = s.remember("user", "Brand new", "refined")
+    assert again["action"] == "updated" and again["id"] == 1
+
+
+def test_action_survives_recall_inserting_rows_between_writes():
+    """#85 through the real path: with the graph on, recall() inserts session
+    rows on the same connection. A create right after must still say so."""
+    s = make_b1_store(assoc=True)
+    ids = [s.remember("user", f"T{i}", "b")["id"] for i in range(3)]
+    for _ in range(3):
+        s.recall("T1")                       # session_members / edges / meta inserts
+    created = s.remember("user", "T-new", "b")
+    assert created["action"] == "created" and created["id"] not in ids
