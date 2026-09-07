@@ -22,7 +22,7 @@ agent more useful when present, and never breaks the agent's work when degraded.
 
 ## Status
 
-**v0.5.1.** The core (four memory verbs + boot index + FTS5) shipped in v0.1;
+**v0.6.0.** The core (four memory verbs + boot index + FTS5) shipped in v0.1;
 since then recall has grown a semantic arm, consolidation, an associative usage
 graph, a self-organizing store, and opt-in crystallization — each additive and
 each degrading cleanly to plain keyword recall. Every feature below is
@@ -79,6 +79,18 @@ claude mcp add tether -- tether-memory
 as a common brand name. `tether` in `claude mcp add tether -- ...` is just the
 label Claude Code uses to refer to this server; it doesn't need to match the
 installed command.)
+
+Or add it as a Claude Code plugin (this repo doubles as a one-plugin
+marketplace; the plugin runs `uvx --from 'tether-memory[semantic]'`, so
+semantic recall comes along):
+
+```sh
+/plugin marketplace add sidyellur/tether
+/plugin install tether@tether
+```
+
+It is also listed in the [MCP Registry](https://registry.modelcontextprotocol.io)
+as `mcp-name: io.github.sidyellur/tether`.
 
 By default memory lives in a local SQLite file at
 `~/.local/share/tether/memory.db` — on Windows,

@@ -1,0 +1,20 @@
+{
+  "name": "tether",
+  "owner": {
+    "name": "sidyellur",
+    "url": "https://github.com/sidyellur"
+  },
+  "metadata": {
+    "description": "Local-first shared memory for Claude Code (tether)"
+  },
+  "plugins": [
+    {
+      "name": "tether",
+      "source": "./",
+      "description": "Local-first shared memory: remember, recall, link, forget durable notes across sessions and devices over a local SQLite file.",
+      "version": "0.6.0",
+      "category": "productivity",
+      "keywords": ["memory", "mcp", "sqlite", "local-first"]
+    }
+  ]
+}
