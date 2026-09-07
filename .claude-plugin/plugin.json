@@ -1,7 +1,7 @@
 {
   "name": "tether",
   "description": "Local-first shared memory for Claude Code: remember, recall, link, forget durable notes across sessions, projects, and devices. Hybrid keyword+semantic recall over a local SQLite file; degrades, never fails.",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "author": {
     "name": "sidyellur",
     "url": "https://github.com/sidyellur"

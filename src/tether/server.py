@@ -230,9 +230,28 @@ def memory_index() -> str:
     question, or recall(id=N), to read the ones that matter for the task.
     """
     try:
-        return _get_store().boot_index()
+        store = _get_store()
+        return f"{store.boot_index()}\n{_status_line(store)}"
     except Exception as e:
         return f"(memory index unavailable: {e})"
+
+
+def _status_line(store: Store) -> str:
+    """One footer line stating what is *actually* active. Degrade-never means
+    a missing [semantic] extra or an offline sync backend never errors - which
+    also means nothing an agent reads says recall is running reduced. This is
+    derived from the live objects (did an embedder load? what did
+    open_connection return?), never from config alone, so it can't lie the
+    way a config echo would."""
+    if store._embedder is not None:
+        model = getattr(store._embedder, "name", None) or "embedder loaded"
+        semantic = f"semantic on ({model})"
+    elif not config.semantic_enabled():
+        semantic = "semantic off (TETHER_SEMANTIC=0)"
+    else:
+        semantic = ("semantic off (keyword-only; "
+                    "pip install 'tether-memory[semantic]')")
+    return f"# tether: {semantic} | sync {_sync_mode}"
 
 
 @mcp.resource("tether://status")
