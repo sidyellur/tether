@@ -536,3 +536,71 @@ def test_mcp_recall_excerpts_then_fetches_whole(tmp_path):
                 assert "truncated" not in whole[0]
 
     asyncio.run(run())
+
+
+def _hermetic_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
+    monkeypatch.delenv("TETHER_SYNC_URL", raising=False)
+    monkeypatch.delenv("TETHER_SYNC_TOKEN", raising=False)
+    monkeypatch.delenv("TETHER_PROJECT", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+
+
+def test_memory_index_footer_says_semantic_off_when_no_embedder(monkeypatch, tmp_path):
+    """Degrade-never hides a missing [semantic] extra perfectly: every recall
+    silently runs keyword-only and nothing an agent reads says so. The boot
+    index is the one resource auto-loaded each session, so it carries a
+    one-line footer stating what is actually active - derived from whether an
+    embedder object loaded, not from config."""
+    from tether import server
+
+    _hermetic_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("TETHER_SEMANTIC", raising=False)
+    monkeypatch.setattr("tether.embed.get_embedder", lambda *a, **k: None)  # extra missing
+    server._store = None
+    try:
+        index = server.memory_index()
+        footer = index.splitlines()[-1]
+        assert footer.startswith("# tether: semantic off")
+        assert "tether-memory[semantic]" in footer     # says how to fix it
+        assert "sync local" in footer
+        assert index.splitlines()[0] == "(no memories yet)"  # footer, not header
+    finally:
+        server._store = None
+
+
+def test_memory_index_footer_distinguishes_config_off_from_extra_missing(monkeypatch, tmp_path):
+    from tether import server
+
+    _hermetic_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")
+    server._store = None
+    try:
+        footer = server.memory_index().splitlines()[-1]
+        assert footer.startswith("# tether: semantic off (TETHER_SEMANTIC=0)")
+    finally:
+        server._store = None
+
+
+def test_memory_index_footer_names_the_loaded_model(monkeypatch, tmp_path):
+    from tether import server
+
+    class Fake:
+        name = "fake/model-1"
+        dims = 4
+
+        def embed(self, texts):
+            import numpy as np
+            return np.zeros((len(texts), self.dims), dtype=np.float32)
+
+    _hermetic_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("TETHER_SEMANTIC", raising=False)
+    monkeypatch.setattr("tether.embed.get_embedder", lambda *a, **k: Fake())
+    server._store = None
+    try:
+        server.remember("project", "t", "b")
+        lines = server.memory_index().splitlines()
+        assert lines[0] == "[project] #1 t"
+        assert lines[-1] == "# tether: semantic on (fake/model-1) | sync local"
+    finally:
+        server._store = None

@@ -22,7 +22,7 @@ agent more useful when present, and never breaks the agent's work when degraded.
 
 ## Status
 
-**v0.6.0.** The core (four memory verbs + boot index + FTS5) shipped in v0.1;
+**v0.6.1.** The core (four memory verbs + boot index + FTS5) shipped in v0.1;
 since then recall has grown a semantic arm, consolidation, an associative usage
 graph, a self-organizing store, and opt-in crystallization — each additive and
 each degrading cleanly to plain keyword recall. Every feature below is
@@ -139,7 +139,12 @@ export TETHER_SYNC_TOKEN='<your-auth-token>'
 ```
 
 If the backend is unreachable, tether logs `sync offline` and keeps working
-against the local file; writes converge when it comes back.
+against the local file. Sync is a single-primary design: every write goes to
+the hosted primary and replicas only pull, so a device that was merely
+offline catches up (including tombstones from `forget`) on its next pull and
+can never resurrect a memory another device forgot. The one gap: writes made
+*while degraded* land only in that device's local file and are not merged
+back later (#99 tracks reconciliation).
 
 Writes push immediately. Reads also pull, debounced to at most once every
 `TETHER_SYNC_READ_INTERVAL` seconds (default 30) — so a device that only
