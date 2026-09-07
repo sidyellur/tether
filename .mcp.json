@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tether": {
+      "command": "uvx",
+      "args": ["--from", "tether-memory[semantic]", "tether-memory"]
+    }
+  }
+}
