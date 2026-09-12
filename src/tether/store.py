@@ -918,15 +918,46 @@ class Store:
         shared = (self._embedding_matrix()
                   if emb is not None and self._graph.enabled else None)
         self._graph.on_remember(mid, emb, matrix=shared)
+        dropped_crystallizes = []
         if self._crystallize and crystallizes:
-            self._graph.on_crystallize(mid, crystallizes)
+            valid, dropped_crystallizes = self._valid_crystallize_sources(
+                mid, crystallizes)
+            if valid:
+                self._graph.on_crystallize(mid, valid)
         self._conn.commit()
         self._sync()
         self._maybe_forget()
         result = {"id": mid, "action": action}
         if dropped_links:
             result["dropped_links"] = dropped_links
+        if dropped_crystallizes:
+            result["dropped_crystallizes"] = dropped_crystallizes
         return result
+
+    def _valid_crystallize_sources(self, mid, crystallizes) -> tuple:
+        """Filter `crystallizes` down to ids `on_crystallize` may safely wire:
+        real ints (bool excluded - it's an int subclass), not the principle's
+        own id, and a CURRENT row in `memories`. SQLite's column affinity
+        would otherwise silently store a non-integer in the INTEGER src/dst
+        columns of `edges` (#106). Returns (valid_ids, dropped_values) - the
+        second list is the original values, so a bad type is reported back
+        instead of vanishing quietly."""
+        candidates, dropped = [], []
+        for x in crystallizes:
+            if isinstance(x, int) and not isinstance(x, bool) and x != mid:
+                candidates.append(x)
+            else:
+                dropped.append(x)
+        if candidates:
+            ph = ",".join("?" for _ in candidates)
+            existing = {r[0] for r in self._conn.execute(
+                f"SELECT id FROM memories WHERE id IN ({ph}) "
+                f"AND valid_to IS NULL", candidates).fetchall()}
+        else:
+            existing = set()
+        valid = [x for x in candidates if x in existing]
+        dropped += [x for x in candidates if x not in existing]
+        return valid, dropped
 
     def _memories_seq(self):
         """The last id AUTOINCREMENT handed out for `memories` (None before the

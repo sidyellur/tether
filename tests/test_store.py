@@ -1017,6 +1017,44 @@ def test_remember_crystallizes_ignored_when_disabled():
         "SELECT COUNT(*) FROM edges WHERE kind='crystallized'").fetchone()[0] == 0
 
 
+def test_remember_crystallizes_drops_invalid_ids(tmp_path):
+    """#106: non-int values, this memory's own id, and ids that don't resolve
+    to a current row must never reach on_crystallize (SQLite's column
+    affinity would silently store them in the INTEGER edges columns).
+    Only the valid existing id produces an edge; everything else is reported
+    back in dropped_crystallizes."""
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True)
+    s.migrate()
+    a = s.remember("project", "auth outage", "login 500s under load")["id"]
+
+    result = s.remember(
+        "reference", "principle: fail fast on saturation",
+        "cap the pool and time out",
+        crystallizes=["not-an-int", 999999, True, a])
+
+    rows = conn.execute(
+        "SELECT src, dst FROM edges WHERE kind='crystallized'").fetchall()
+    assert rows == [(result["id"], a)]
+    assert set(result["dropped_crystallizes"]) == {"not-an-int", 999999, True}
+    assert len(result["dropped_crystallizes"]) == 3
+
+
+def test_remember_crystallizes_no_dropped_key_when_all_valid():
+    """dropped_crystallizes should only appear when something was actually
+    dropped - a clean call keeps the return dict's shape unchanged."""
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              assoc=True, crystallize=True)
+    s.migrate()
+    a = s.remember("project", "x", "y")["id"]
+    result = s.remember("reference", "p", "z", crystallizes=[a])
+    assert "dropped_crystallizes" not in result
+
+
 def test_crystallization_candidates_empty_when_disabled():
     pytest.importorskip("numpy")
     conn = sqlite3.connect(":memory:")
