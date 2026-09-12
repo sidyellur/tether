@@ -92,6 +92,15 @@ class Graph:
         # pass different kind-tuples and each needs its own cached answer.
         self._degree_sig = None
         self._degree_cache = None
+        # #112 follow-up: bumped by Store._commit() on every commit, via
+        # _touch(). Replaces MAX(updated_at) for detecting this process's own
+        # writes in _degree_signature - a wall-clock string comparison can tie
+        # (see Store._store_signature's docstring for the #68-shaped bug this
+        # caused on Windows), a monotonic counter can't.
+        self._write_seq = 0
+
+    def _touch(self) -> None:
+        self._write_seq += 1
 
     def migrate(self) -> None:
         self._conn.executescript(_SCHEMA)
@@ -260,15 +269,20 @@ class Graph:
 
     def _degree_signature(self):
         """Cheap fingerprint of "could degree_map()'s answer have changed?":
-        edge count/newest-update plus the current-memory count. Not `PRAGMA
+        this process's own write counter (see _touch()), plus edge count and
+        current-memory count for a foreign connection's writes. Not `PRAGMA
         data_version` - see Store._store_signature's comment on the same
         choice - degree_map() must see this process's own on_link/on_remember/
         touch_session/unprime writes on the very next call, and data_version
-        only reflects OTHER connections' commits."""
-        return self._conn.execute(
+        only reflects OTHER connections' commits.
+
+        Used MAX(updated_at) instead of _write_seq originally, but that's a
+        wall-clock comparison that can tie within one clock tick (see
+        Store._store_signature's docstring) - swapped for the same reason."""
+        row = self._conn.execute(
             "SELECT (SELECT COUNT(*) FROM edges), "
-            "(SELECT COALESCE(MAX(updated_at), '') FROM edges), "
             "(SELECT COUNT(*) FROM memories WHERE valid_to IS NULL)").fetchone()
+        return (self._write_seq, *row)
 
     def degree_map(self, kinds=("explicit", "hebbian", "crystallized")) -> dict:
         """Behavioral weighted degree for every current memory (semantic edges

@@ -890,7 +890,7 @@ def test_boot_index_reflects_restore():
 def test_boot_index_rescans_after_link():
     # link() only touches `edges`, not `memories` - the rendered index text
     # is unaffected, but the cache must still notice via the signature's
-    # edges count/updated_at sub-selects rather than serving the old string.
+    # edges count and _write_seq rather than serving the old string.
     s = make_store()
     a = s.remember("user", "A", "body a")["id"]
     b = s.remember("user", "B", "body b")["id"]
@@ -905,6 +905,38 @@ def test_boot_index_rescans_after_link():
     finally:
         s._conn.set_trace_callback(None)
     assert len(scans) == 1, "boot_index did not rescan after link() changed edges"
+
+
+def test_boot_index_rescans_even_when_every_write_shares_one_timestamp(monkeypatch):
+    """#68-shaped regression guard: the signature used to lean on
+    MAX(updated_at), a wall-clock string comparison. Windows' datetime.now()
+    has ~15.6ms resolution before Python 3.13, so two writes issued inside
+    one clock tick share a timestamp - remember(), remember(), link() done
+    fast enough on such a platform left MAX(updated_at) unchanged and the
+    cache silently served a stale boot index (reproduced here by freezing
+    _now() to one fixed value for every call, the worst case of that tie).
+    _write_seq, a monotonic in-process counter, can't tie the way a
+    timestamp can."""
+    from tether import store as store_module
+
+    monkeypatch.setattr(store_module, "_now",
+                        lambda: "2026-01-01T00:00:00.000000+00:00")
+    s = make_store()
+    a = s.remember("user", "A", "body a")["id"]
+    b = s.remember("user", "B", "body b")["id"]
+    s.boot_index()
+    scans = []
+    s._conn.set_trace_callback(
+        lambda sql: scans.append(sql)
+        if "id, type, title, updated_at, tags FROM memories" in sql else None)
+    try:
+        s.link(a, b)
+        s.boot_index()
+    finally:
+        s._conn.set_trace_callback(None)
+    assert len(scans) == 1, (
+        "boot_index served a stale cache when every write shared one "
+        "timestamp (the Windows coarse-clock tie #68 already hit once)")
 
 
 def test_boot_index_second_connection_write_is_noticed(tmp_path):
