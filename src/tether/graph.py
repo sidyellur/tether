@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
+CREATE INDEX IF NOT EXISTS idx_edges_updated ON edges(updated_at);
 CREATE TABLE IF NOT EXISTS session_members (
     session_id  TEXT NOT NULL,
     memory_id   INTEGER NOT NULL,
@@ -84,6 +85,13 @@ class Graph:
         # session bucket per-process so concurrent unrelated callers sharing
         # the same underlying DB don't get bucketed into one session (#53).
         self._process_id = uuid.uuid4().hex[:12]
+        # #112: degree_map() reads every explicit/hebbian/crystallized edge
+        # plus every current memory id - called from boot_index() (once the
+        # store is above boot_index_cap) and from every forgetting sweep.
+        # Memoized on a cheap signature keyed by `kinds` too, since callers
+        # pass different kind-tuples and each needs its own cached answer.
+        self._degree_sig = None
+        self._degree_cache = None
 
     def migrate(self) -> None:
         self._conn.executescript(_SCHEMA)
@@ -250,28 +258,53 @@ class Graph:
         except Exception:
             return
 
+    def _degree_signature(self):
+        """Cheap fingerprint of "could degree_map()'s answer have changed?":
+        edge count/newest-update plus the current-memory count. Not `PRAGMA
+        data_version` - see Store._store_signature's comment on the same
+        choice - degree_map() must see this process's own on_link/on_remember/
+        touch_session/unprime writes on the very next call, and data_version
+        only reflects OTHER connections' commits."""
+        return self._conn.execute(
+            "SELECT (SELECT COUNT(*) FROM edges), "
+            "(SELECT COALESCE(MAX(updated_at), '') FROM edges), "
+            "(SELECT COUNT(*) FROM memories WHERE valid_to IS NULL)").fetchone()
+
     def degree_map(self, kinds=("explicit", "hebbian", "crystallized")) -> dict:
         """Behavioral weighted degree for every current memory (semantic edges
         excluded by default). Emits explicit 0.0 for isolated current nodes -
         forgetting needs the degree-0 set, which a pure edge-scan can't produce.
-        Only edges between two current nodes count. Never raises."""
+        Only edges between two current nodes count. Never raises.
+
+        Memoized (#112) on a cheap change signature; `kinds` is part of the
+        cache key since callers (boot_index's curation vs. the forgetting
+        sweep) may pass different kind-tuples."""
         try:
-            current = {r[0] for r in self._conn.execute(
-                "SELECT id FROM memories WHERE valid_to IS NULL").fetchall()}
-            deg = {mid: 0.0 for mid in current}
-            if not kinds:
-                return deg
-            ph = ",".join("?" for _ in kinds)
-            rows = self._conn.execute(
-                f"SELECT src, dst, weight FROM edges WHERE kind IN ({ph})",
-                tuple(kinds)).fetchall()
-            for src, dst, w in rows:
-                if src in current and dst in current:
-                    deg[src] += w
-                    deg[dst] += w
+            sig = (self._degree_signature(), kinds)
+            if self._degree_cache is not None and sig == self._degree_sig:
+                return self._degree_cache
+            deg = self._degree_map_impl(kinds)
+            self._degree_sig = sig
+            self._degree_cache = deg
             return deg
         except Exception:
             return {}
+
+    def _degree_map_impl(self, kinds) -> dict:
+        current = {r[0] for r in self._conn.execute(
+            "SELECT id FROM memories WHERE valid_to IS NULL").fetchall()}
+        deg = {mid: 0.0 for mid in current}
+        if not kinds:
+            return deg
+        ph = ",".join("?" for _ in kinds)
+        rows = self._conn.execute(
+            f"SELECT src, dst, weight FROM edges WHERE kind IN ({ph})",
+            tuple(kinds)).fetchall()
+        for src, dst, w in rows:
+            if src in current and dst in current:
+                deg[src] += w
+                deg[dst] += w
+        return deg
 
     def _neighbors(self, node, type=None):
         rows = self._conn.execute(

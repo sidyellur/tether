@@ -339,6 +339,82 @@ def test_degree_map_ignores_edges_to_noncurrent():
     assert g.degree_map() == {1: 0.0}           # node 2 not current; its edge doesn't count
 
 
+# --- #112: degree_map() is cached on a change signature ---------------------
+
+def test_degree_map_does_not_rescan_without_changes():
+    g = make_graph()
+    for i in (1, 2, 3):
+        _mem(g._conn, i)
+    g._upsert_edge(1, 2, "hebbian", 1.0, "t", mode="max")
+    d1 = g.degree_map()
+    scans = []
+    g._conn.set_trace_callback(
+        lambda sql: scans.append(sql)
+        if ("SELECT id FROM memories WHERE valid_to IS NULL" in sql
+            or "SELECT src, dst, weight FROM edges" in sql) else None)
+    try:
+        d2 = g.degree_map()
+    finally:
+        g._conn.set_trace_callback(None)
+    assert scans == [], f"second degree_map() call re-scanned: {scans}"
+    assert d2 == d1
+
+
+def test_degree_map_reflects_on_link():
+    g = make_graph()
+    for i in (1, 2):
+        _mem(g._conn, i)
+    assert g.degree_map() == {1: 0.0, 2: 0.0}
+    g.on_link(1, 2)
+    deg = g.degree_map()
+    assert deg[1] > 0 and deg[2] > 0
+
+
+def test_degree_map_reflects_on_remember():
+    pytest.importorskip("numpy")
+    g = make_graph()
+    e = FakeEmbedder()
+    a = _pack(e.embed("I drive my car"))
+    b = _pack(e.embed("driving the automobile"))
+    _seed_memory(g._conn, 1, "user", "A", "car", a)
+    _seed_memory(g._conn, 2, "user", "B", "auto", b)
+    assert g.degree_map(kinds=("semantic",)) == {1: 0.0, 2: 0.0}
+    g.on_remember(2, b)
+    deg = g.degree_map(kinds=("semantic",))
+    assert deg[1] > 0 and deg[2] > 0
+
+
+def test_degree_map_reflects_archive_and_unprime():
+    # unprime() itself only touches session_members and never the edges or
+    # memories tables degree_map reads - it's always paired (forget, sweep,
+    # consolidation) with a memories.valid_to change, which IS part of the
+    # signature. Exercise that real pairing: archive a node, unprime it, and
+    # confirm degree_map() stops counting it (and its edge) as current.
+    g = make_graph()
+    for i in (1, 2):
+        _mem(g._conn, i)
+    g._upsert_edge(1, 2, "hebbian", 1.0, "t", mode="max")
+    before = g.degree_map()
+    assert set(before) == {1, 2} and before[1] == before[2] == 1.0
+    g._conn.execute("UPDATE memories SET valid_to='t' WHERE id=2")
+    g.unprime(2)
+    after = g.degree_map()
+    assert set(after) == {1}             # archived node dropped from the current set
+    assert after[1] == 0.0               # its edge to the now-noncurrent node no longer counts
+
+
+def test_degree_map_caches_separately_per_kinds():
+    g = make_graph()
+    for i in (1, 2):
+        _mem(g._conn, i)
+    g._upsert_edge(1, 2, "semantic", 0.9, "t", mode="max")
+    g._upsert_edge(1, 2, "hebbian", 0.5, "t", mode="max")
+    behavioral = g.degree_map()                          # default kinds
+    with_semantic = g.degree_map(kinds=("semantic", "hebbian"))
+    assert behavioral[1] == 0.5                           # semantic excluded
+    assert with_semantic[1] == 1.4                        # both counted
+
+
 # Tests for crystallized edge kind and config (Task 1)
 def _graph():
     conn = sqlite3.connect(":memory:")

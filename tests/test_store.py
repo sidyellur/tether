@@ -842,6 +842,91 @@ def test_boot_index_still_capped_when_graph_disabled():
     assert [f"#{mid}" in ln for mid, ln in zip(newest_four, lines)] == [True] * 4
 
 
+# --- #112: boot_index() is cached on a store-change signature --------------
+
+def test_boot_index_does_not_rescan_without_writes():
+    s = make_store()
+    s.remember("user", "A", "body a")
+    s.boot_index()
+    scans = []
+    s._conn.set_trace_callback(
+        lambda sql: scans.append(sql)
+        if "id, type, title, updated_at, tags FROM memories" in sql else None)
+    try:
+        again = s.boot_index()
+    finally:
+        s._conn.set_trace_callback(None)
+    assert scans == [], f"second boot_index() call re-scanned memories: {scans}"
+    assert again == s._boot_cache
+
+
+def test_boot_index_reflects_remember():
+    s = make_store()
+    s.remember("user", "A", "body a")
+    idx1 = s.boot_index()
+    assert "A" in idx1
+    s.remember("user", "B", "body b")
+    idx2 = s.boot_index()
+    assert "B" in idx2 and idx2 != idx1
+
+
+def test_boot_index_reflects_forget():
+    s = make_store()
+    mid = s.remember("user", "A", "body a")["id"]
+    assert "A" in s.boot_index()
+    s.forget(mid)
+    assert s.boot_index() == "(no memories yet)"
+
+
+def test_boot_index_reflects_restore():
+    s = make_store()
+    mid = s.remember("user", "A", "body a")["id"]
+    s.forget(mid)
+    assert s.boot_index() == "(no memories yet)"
+    s.restore(mid)
+    assert "A" in s.boot_index()
+
+
+def test_boot_index_rescans_after_link():
+    # link() only touches `edges`, not `memories` - the rendered index text
+    # is unaffected, but the cache must still notice via the signature's
+    # edges count/updated_at sub-selects rather than serving the old string.
+    s = make_store()
+    a = s.remember("user", "A", "body a")["id"]
+    b = s.remember("user", "B", "body b")["id"]
+    s.boot_index()
+    scans = []
+    s._conn.set_trace_callback(
+        lambda sql: scans.append(sql)
+        if "id, type, title, updated_at, tags FROM memories" in sql else None)
+    try:
+        s.link(a, b)
+        s.boot_index()
+    finally:
+        s._conn.set_trace_callback(None)
+    assert len(scans) == 1, "boot_index did not rescan after link() changed edges"
+
+
+def test_boot_index_second_connection_write_is_noticed(tmp_path):
+    """A write through a SECOND connection to the same file (simulating a
+    sync pull landing new rows) must be picked up on the next boot_index()
+    call on the first connection - unlike the embedding cache, this
+    deliberately does NOT rely on PRAGMA data_version (see
+    _store_signature's docstring); MAX(id)/MAX(updated_at) changing is what
+    catches it here."""
+    path = str(tmp_path / "m.db")
+    a = Store(sqlite3.connect(path), "a", lambda *x, **k: None, sync_read_interval=0)
+    a.migrate()
+    b = Store(sqlite3.connect(path), "b", lambda *x, **k: None, sync_read_interval=0)
+    b.migrate()
+    a.remember("user", "A", "body a")
+    idx1 = a.boot_index()
+    assert "A" in idx1 and "B" not in idx1
+    b.remember("user", "B", "body b")
+    idx2 = a.boot_index()
+    assert "B" in idx2, "a served a stale boot index after b's write via another connection"
+
+
 _OLD = "2020-01-01T00:00:00+00:00"
 
 

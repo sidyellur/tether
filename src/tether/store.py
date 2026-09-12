@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS memories (
 -- here: it needs to become a partial UNIQUE index (#41) but must degrade
 -- gracefully on a live DB that already has duplicate current rows, which
 -- plain executescript() can't express.
+CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at);
 
 -- #111: a derived index over `memories.tags` (which stays the source of
 -- truth - row shape, export format and existing tests all depend on the
@@ -514,6 +515,14 @@ class Store:
         self._crystallize = crystallize
         self._cryst_sig = None
         self._cryst_cache = []
+        # #112: boot_index() used to re-scan every current memory (and, above
+        # boot_index_cap, every behavioral edge via Graph.degree_map()) on
+        # EVERY call - and it's the auto-loaded MCP resource, so this ran at
+        # the start of every session. Memoized on a cheap change signature
+        # (_store_signature) the same way _cryst_sig/_cryst_cache memoize
+        # crystallization_candidates().
+        self._boot_sig = None
+        self._boot_cache = None
         self._graph = Graph(conn, enabled=assoc)
         # Set for real by migrate()'s _ensure_dedup_unique_index(); defaults
         # to the conservative (locking) path if migrate() is somehow skipped.
@@ -604,6 +613,33 @@ class Store:
             return self._conn.execute("PRAGMA data_version").fetchone()[0]
         except Exception:
             return None
+
+    def _store_signature(self):
+        """Cheap fingerprint of "could boot_index()'s answer have changed?"
+        (#112): current-row count/newest-update for `memories`, and
+        count/newest-update for `edges` (degree_map()'s inputs, consulted by
+        the curated index once the store is above boot_index_cap), plus the
+        highest `memories` id so a hard purge/backfill that doesn't move
+        updated_at still bumps the signature. All five sub-selects are index
+        or single-row lookups - MAX(id) hits the rowid index, the two
+        MAX(updated_at) hit idx_memories_updated/idx_edges_updated, and both
+        COUNT(*) are on tables sized for exactly this kind of scan.
+
+        Deliberately NOT `PRAGMA data_version` (see _data_version above):
+        that pragma only advances when ANOTHER connection commits to the
+        file, so it can't see this process's own writes - which is fine for
+        the embedding-cache use above (row-level writes there keep the cache
+        current themselves, and data_version only needs to catch outside
+        interference) but wrong here, where boot_index must reflect this
+        process's own remember()/forget()/link() calls on the very next
+        call.
+        """
+        return self._conn.execute(
+            "SELECT (SELECT COUNT(*) FROM memories WHERE valid_to IS NULL), "
+            "(SELECT COALESCE(MAX(updated_at), '') FROM memories), "
+            "(SELECT COUNT(*) FROM edges), "
+            "(SELECT COALESCE(MAX(updated_at), '') FROM edges), "
+            "(SELECT COALESCE(MAX(id), 0) FROM memories)").fetchone()
 
     def _cache_put(self, mid, emb, type_) -> None:
         """Reflect one row's current embedding in the cache (#81): replace it
@@ -1914,6 +1950,20 @@ class Store:
     @_locked
     def boot_index(self) -> str:
         self._maybe_sync_for_read()      # #62: the session-start read pulls too
+        # #112: this is the auto-loaded MCP resource, so it used to re-scan
+        # every current memory (and, above boot_index_cap, every behavioral
+        # edge) at the start of EVERY session. Memoized on a cheap change
+        # signature - self._project is fixed for the life of the process, so
+        # it doesn't need to be part of the cache key.
+        sig = self._store_signature()
+        if sig == self._boot_sig:
+            return self._boot_cache
+        result = self._boot_index_impl()
+        self._boot_sig = sig
+        self._boot_cache = result
+        return result
+
+    def _boot_index_impl(self) -> str:
         rows = self._conn.execute(
             "SELECT id, type, title, updated_at, tags FROM memories "
             "WHERE valid_to IS NULL ORDER BY updated_at DESC, id DESC"
