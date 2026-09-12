@@ -1190,55 +1190,73 @@ class Store:
         incoming_links = _dedupe_links(links)
         emb = self._embed_or_none(title, body)
 
-        if self._has_unique_dedup_index:
-            # The partial unique index (#41) makes the upsert itself the
-            # source of truth: a probe SELECT here is only an optimization
-            # (to decide "created" vs "updated" and whether to run the
-            # consolidate check), never a correctness requirement, because
-            # the INSERT below uses ON CONFLICT to resolve atomically even
-            # if another connection created/removed the row in between.
-            existing = self._conn.execute(
-                "SELECT id, links FROM memories "
-                "WHERE type=? AND title_norm=? AND valid_to IS NULL",
-                (type, norm)).fetchone()
-            mid, action = self._upsert_via_conflict(
-                type, title, norm, body, tags_s, incoming_links, now, emb, existing)
-        else:
-            # No DB-level guarantee available - a live DB already had
-            # duplicate current rows and blocked the unique index at
-            # migrate() time (#41). Fall back to bracketing the probe SELECT
-            # and the INSERT/UPDATE in a single BEGIN IMMEDIATE transaction
-            # so no other writer can interleave between them.
+        # The partial unique index (#41) makes the upsert itself the source
+        # of truth: this probe SELECT is only an optimization (to decide
+        # "created" vs "updated", whether to run the consolidate check, and
+        # - below - which ids are already linked), never a correctness
+        # requirement for the row itself, because the INSERT uses ON
+        # CONFLICT to resolve atomically even if another connection
+        # created/removed the row in between. The fallback path (no unique
+        # index available - #41's degraded mode) brackets this same probe
+        # and the INSERT/UPDATE in one BEGIN IMMEDIATE instead.
+        if not self._has_unique_dedup_index:
             self._conn.execute("BEGIN IMMEDIATE")
-            existing = self._conn.execute(
-                "SELECT id, links FROM memories "
-                "WHERE type=? AND title_norm=? AND valid_to IS NULL",
-                (type, norm)).fetchone()
-            mid, action = self._upsert_locked(
-                type, title, norm, body, tags_s, incoming_links, now, emb, existing)
+        existing = self._conn.execute(
+            "SELECT id, links FROM memories "
+            "WHERE type=? AND title_norm=? AND valid_to IS NULL",
+            (type, norm)).fetchone()
 
-        # #103: `links=` used to be a dumb JSON write - the upsert above
-        # already unioned incoming_links into `mid`'s own column, but that
-        # left the *other* side untouched and no explicit edge existed until
-        # the next migrate() replayed the JSON. Wire it the same way link()
-        # does: validate, patch the other row's links, and create the edge
-        # now, in this same transaction. A bad id must not abort the
-        # remember - it's dropped and reported instead, since a hallucinated
-        # link id is a poor reason to lose the memory the caller just saved.
+        # #103 / #130: validate `links=` BEFORE the upsert, not after. The
+        # upsert SQL writes its links argument straight into `mid`'s OWN
+        # `links` column (unioned via SQL on the ON-CONFLICT path, merged via
+        # _merge_links on the locked path) - so passing raw `incoming_links`
+        # through and only validating afterward (the pre-#130 shape) meant a
+        # nonexistent id was reported in `dropped_links` for the caller to
+        # see, yet still ended up persisted in `mid`'s own column regardless.
+        # Filtering here means only ids that (a) resolve to a real memory and
+        # (b) aren't `mid` itself ever reach the upsert or the OTHER side's
+        # wiring below - the same exclusions the old post-upsert loop applied
+        # to the wiring, now applied before anything is written at all.
+        # `existing[0]` gives us `mid` for the self-link check even before
+        # the upsert on an UPDATE; on a CREATE, `mid` doesn't exist as a
+        # resolvable id yet, so a self-link there is already impossible to
+        # pass validation and needs no separate check.
         dropped_links = []
-        if incoming_links:
+        valid_links = []
+        self_id = existing[0] if existing is not None else None
+        for other in incoming_links:
+            if other == self_id:
+                continue
+            try:
+                self._links_of(other)
+            except ValueError:
+                dropped_links.append(other)
+                continue
+            valid_links.append(other)
+
+        if self._has_unique_dedup_index:
+            mid, action = self._upsert_via_conflict(
+                type, title, norm, body, tags_s, valid_links, now, emb, existing)
+        else:
+            mid, action = self._upsert_locked(
+                type, title, norm, body, tags_s, valid_links, now, emb, existing)
+
+        # Wire the OTHER side (union into its links, create the edge) - the
+        # same way link() does, now in this same transaction rather than
+        # waiting for the next migrate() to replay the JSON. `valid_links` is
+        # already validated, so no id here can be dropped at this point;
+        # `other == mid` stays as a defensive no-op (unreachable in practice,
+        # since a self-link was already excluded above using `existing[0]`
+        # on update, and is unvalidatable - hence never in valid_links - on
+        # create, where `mid` doesn't exist until the upsert just above).
+        if valid_links:
             # `existing` (the pre-upsert probe row) tells us which ids were
             # already linked before this call, purely to skip re-doing work
             # that's already been done - on_link/the union SQL are idempotent,
             # so getting this wrong costs nothing but a redundant write.
             already_linked = set(json.loads(existing[1])) if existing else set()
-            for other in incoming_links:
+            for other in valid_links:
                 if other == mid or other in already_linked:
-                    continue
-                try:
-                    self._links_of(other)
-                except ValueError:
-                    dropped_links.append(other)
                     continue
                 self._conn.execute(self._LINK_UNION_SQL, (mid, now, other))
                 self._graph.on_link(mid, other)

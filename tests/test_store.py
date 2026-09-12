@@ -1828,6 +1828,11 @@ def test_remember_concurrent_new_title_unions_links_not_last_writer_wins(
     db_path = tmp_path / "memory.db"
     s1 = _file_store(db_path)
     s2 = _file_store(db_path)
+    # #130: link ids must resolve to a real memory now (validated before the
+    # upsert), so the two link TARGETS have to actually exist - unlike
+    # pre-#130, when `links=` was unvalidated and any int would do.
+    x = s1.remember("user", "X", "x")["id"]
+    y = s1.remember("user", "Y", "y")["id"]
 
     barrier = threading.Barrier(2)
     orig = Store._upsert_via_conflict
@@ -1843,8 +1848,8 @@ def test_remember_concurrent_new_title_unions_links_not_last_writer_wins(
     def call(store, key, links):
         results[key] = store.remember("user", "Race Title", f"body {key}", links=links)
 
-    t1 = threading.Thread(target=call, args=(s1, "a", [1]))
-    t2 = threading.Thread(target=call, args=(s2, "b", [2]))
+    t1 = threading.Thread(target=call, args=(s1, "a", [x]))
+    t2 = threading.Thread(target=call, args=(s2, "b", [y]))
     t1.start()
     t2.start()
     t1.join(timeout=10)
@@ -1857,7 +1862,7 @@ def test_remember_concurrent_new_title_unions_links_not_last_writer_wins(
         "AND type='user' AND title_norm='race title'").fetchone()
     assert row is not None
     links = set(_json.loads(row[1]))
-    assert links == {1, 2}  # both racers' links survive - neither got dropped
+    assert links == {x, y}  # both racers' links survive - neither got dropped
 
 
 # --- #62: reads pull too, debounced ------------------------------------------
@@ -2619,6 +2624,31 @@ def test_remember_drops_and_reports_bad_link_id():
     assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0   # ...but no edge
 
 
+def test_remember_drops_a_bad_link_id_from_its_own_links_column_too():
+    """#103 / #130: the upsert used to write `links=` straight into the
+    memory's OWN `links` column before validation ran, so a bad id ended up
+    persisted there even though it was correctly reported in dropped_links
+    and correctly excluded from getting an edge. Validation now happens
+    before the upsert, so the id must be absent from `links` too - on both a
+    fresh create and a later update of the same memory."""
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+    b = s.remember("user", "B", "y")["id"]
+    r = s.remember("user", "A", "x", links=[b, 999999])
+    assert r["dropped_links"] == [999999]
+    stored = _json.loads(conn.execute(
+        "SELECT links FROM memories WHERE id=?", (r["id"],)).fetchone()[0])
+    assert stored == [b], f"a nonexistent link id was persisted: {stored}"
+
+    r2 = s.remember("user", "A", "x refined", links=[999998])   # update path
+    assert r2["dropped_links"] == [999998] and r2["id"] == r["id"]
+    stored2 = _json.loads(conn.execute(
+        "SELECT links FROM memories WHERE id=?", (r["id"],)).fetchone()[0])
+    assert stored2 == [b], f"a nonexistent link id was persisted on update: {stored2}"
+
+
 def test_migrate_backfill_skips_dangling_link_ids():
     """Legacy `links` JSON pointing at an id with no row in `memories` must not
     keep minting a dangling `explicit` edge on every future migrate()."""
@@ -2646,6 +2676,12 @@ def test_remember_self_link_is_not_wired():
     assert "dropped_links" not in r                # a real id, just not wired
     assert conn.execute(
         "SELECT COUNT(*) FROM edges WHERE src=dst").fetchone()[0] == 0
+    # #130: a self-link must not end up in the memory's own `links` column
+    # either - it's a real id (so it isn't in dropped_links), but it's still
+    # not something a memory should list itself as linked to.
+    stored = _json.loads(conn.execute(
+        "SELECT links FROM memories WHERE id=?", (a,)).fetchone()[0])
+    assert a not in stored, f"memory {a} lists itself in its own links: {stored}"
 
 
 # --- #113: the legacy `links` replay only ever needs to run once -----------
