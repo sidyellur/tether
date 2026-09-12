@@ -3108,6 +3108,41 @@ def test_backfill_does_not_lock_out_a_second_connection(tmp_path):
     assert conn2.execute(
         "SELECT value FROM meta WHERE key='probe'").fetchone()[0] == "1"
     conn2.close()
+
+
+def test_no_hit_recall_leaves_no_open_transaction():
+    """#126 (a #102 sibling): with the graph on, recall() gates on `seeds`
+    AFTER resolve_session() had already written two `meta` rows (session
+    bookkeeping) - so a query matching nothing returned [] without ever
+    reaching the _commit() at the end of the method, leaving that write's
+    transaction open on the connection indefinitely."""
+    s = make_b1_store(assoc=True)
+    s.remember("user", "Car", "I drive my car to work")
+    assert s.recall("something that matches absolutely nothing here") == []
+    assert s._conn.in_transaction is False, (
+        "a no-hit recall left an open transaction on the connection (#126)")
+
+
+def test_no_hit_recall_does_not_lock_out_a_second_connection(tmp_path):
+    """#126 end-to-end: after a no-hit query, a second connection to the same
+    file must be able to write immediately, not hit "database is locked"
+    waiting on a transaction the first connection never closed."""
+    path = str(tmp_path / "t.db")
+    conn = sqlite3.connect(path)
+    s = Store(conn, "d", lambda *a, **k: None, assoc=True)
+    s.migrate()
+    s.remember("user", "Car", "I drive my car to work")
+    assert s.recall("something that matches absolutely nothing here") == []
+
+    conn2 = sqlite3.connect(path, timeout=1)
+    try:
+        conn2.execute(
+            "INSERT INTO meta(key, value) VALUES('probe', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        conn2.commit()
+    except sqlite3.OperationalError as e:
+        pytest.fail(f"second connection could not write: {e}")
+    conn2.close()
     conn.close()
 
 
