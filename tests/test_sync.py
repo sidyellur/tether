@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 
 from tether import sync
 from tether.config import SyncConfig
@@ -153,3 +154,141 @@ def test_missing_client_still_degrades_to_local(tmp_path, monkeypatch, capsys):
     assert mode == "degraded"
     assert isinstance(conn, sqlite3.Connection)
     assert "sync offline" in capsys.readouterr().err
+
+
+# --- #109: one coalescing worker instead of a thread per sync_now() call ----
+
+def _fake_replica_client(monkeypatch, connect):
+    """Install a stand-in `libsql` module whose connect() is the given
+    callable, and make sure the mainline import path picks it up."""
+    import sys
+    import types
+
+    mod = types.ModuleType("libsql")
+    mod.connect = connect
+    monkeypatch.setitem(sys.modules, "libsql", mod)
+
+
+def test_sync_now_does_not_spawn_a_thread_per_call(tmp_path, monkeypatch):
+    """A slow/unreachable primary used to leave one thread blocked in
+    conn.sync() per sync_now() call. Now there is exactly one worker thread,
+    started lazily, regardless of how many times sync_now() is called."""
+    block_forever = threading.Event()  # never set: simulates a hung primary
+
+    class Conn:
+        def __init__(self):
+            self.calls = 0
+
+        def sync(self):
+            self.calls += 1
+            if self.calls > 1:  # first call is the initial probe; let it pass
+                block_forever.wait()
+
+        def close(self):
+            pass
+
+    conn_holder = {}
+
+    def connect(database, **kwargs):
+        c = Conn()
+        conn_holder["conn"] = c
+        return c
+
+    _fake_replica_client(monkeypatch, connect)
+
+    cfg = SyncConfig("libsql://x.turso.io", "tok")
+    _conn, sync_now, mode = sync.open_connection(tmp_path / "m.db", cfg)
+    assert mode == "replica"
+
+    baseline = threading.active_count()
+    for _ in range(50):
+        sync_now(0.05)
+    grew = threading.active_count() - baseline
+    assert grew <= 2, f"expected ~1 worker thread total, active count grew by {grew}"
+
+    block_forever.set()  # release the blocked worker so nothing lingers
+
+
+def test_sync_now_coalesces_concurrent_callers(tmp_path, monkeypatch):
+    """Two callers arriving while a sync is in flight must not trigger two
+    conn.sync() calls - they coalesce onto the one that's already running."""
+    import time
+
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    class Conn:
+        def sync(self):
+            calls["n"] += 1
+            if calls["n"] > 1:  # first call is the initial probe
+                entered.set()
+                release.wait()
+
+        def close(self):
+            pass
+
+    def connect(database, **kwargs):
+        return Conn()
+
+    _fake_replica_client(monkeypatch, connect)
+
+    cfg = SyncConfig("libsql://x.turso.io", "tok")
+    _conn, sync_now, mode = sync.open_connection(tmp_path / "m.db", cfg)
+    assert mode == "replica"
+    assert calls["n"] == 1  # the initial probe already ran
+
+    results = []
+
+    def caller():
+        sync_now(2.0)
+        results.append(True)
+
+    t1 = threading.Thread(target=caller)
+    t1.start()
+    assert entered.wait(2.0), "worker never entered the blocking sync() call"
+
+    t2 = threading.Thread(target=caller)
+    t2.start()
+    time.sleep(0.2)  # let t2 register against the same in-flight sync
+
+    release.set()
+    t1.join(2.0)
+    t2.join(2.0)
+
+    assert results == [True, True]
+    assert calls["n"] == 2  # exactly one more sync() beyond the initial probe
+
+
+def test_probe_timeout_closes_the_abandoned_connection(tmp_path, monkeypatch):
+    """#109: if the initial probe times out, the abandoned client must be
+    closed so its background retry loop stops running against the same
+    db_path the local fallback then opens."""
+    never = threading.Event()  # never set: the probe call hangs forever
+
+    class Conn:
+        def __init__(self):
+            self.closed = False
+
+        def sync(self):
+            never.wait()
+
+        def close(self):
+            self.closed = True
+
+    conn_holder = {}
+
+    def connect(database, **kwargs):
+        c = Conn()
+        conn_holder["conn"] = c
+        return c
+
+    _fake_replica_client(monkeypatch, connect)
+    monkeypatch.setattr(sync, "_INITIAL_SYNC_TIMEOUT", 0.05)
+
+    cfg = SyncConfig("libsql://x.turso.io", "tok")
+    conn, _sync_now, mode = sync.open_connection(tmp_path / "m.db", cfg)
+
+    assert mode == "degraded"
+    assert conn_holder["conn"].closed is True
+    assert isinstance(conn, sqlite3.Connection)

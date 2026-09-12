@@ -44,13 +44,28 @@ with deltas noted):
     server startup indefinitely instead of raising. So the initial probe
     below is bounded by the same background-thread + timeout pattern used
     for later syncs, and a timeout is treated as a failure.
-  - KNOWN LIMITATION (accepted for v0.1's experimental, opt-in sync layer):
-    if the initial probe times out, the abandoned libSQL connection's
-    background thread keeps retrying against the same db_path that the
-    local fallback then also opens. This is a daemon thread (never blocks
-    process exit) and, in the common failure case (persistently unreachable
-    network), it never actually writes -- so there is no realistic data
-    corruption path, but it is not a fully clean cancellation.
+  - PROBE TIMEOUT CLEANUP (#109): if the initial probe times out, `conn.close()`
+    is now called (best-effort, wrapped in try/except) before raising
+    TimeoutError, so the abandoned client stops retrying in the background
+    instead of continuing to run against the same db_path that the local
+    fallback then also opens.
+  - SYNC WORKER (#109): `sync_now` used to spawn a brand-new daemon thread on
+    every call and abandon it after joining for `timeout` seconds -- no cap on
+    live threads, no check for an in-flight sync, so a slow/unreachable
+    primary left one blocked thread per write (`tether import` of a 500-record
+    backup spawned 500 of them), all calling `.sync()` concurrently on the
+    same connection. `_open_replica` now starts exactly one daemon worker
+    thread per connection, lazily on the first `sync_now` call. The worker
+    loops on a `threading.Event` ("wake"): when set, it clears the event,
+    calls `_safe_sync(conn)`, then increments a completion counter under a
+    `threading.Condition` and notifies. `sync_now(timeout)` reads the current
+    counter, sets `wake`, and waits on the condition for the counter to move
+    past what it saw, bounded by `timeout`. Concurrent callers arriving while
+    a sync is in flight all set the same (already-set) event and wait on the
+    same condition, so at most one `.sync()` runs at a time and their
+    requests coalesce onto whichever sync finishes next. The write-path
+    contract is unchanged: every write still requests a sync and waits up to
+    `timeout` for it.
 """
 
 import sqlite3
@@ -134,15 +149,50 @@ def _open_replica(db_path, sync_cfg):
     t.start()
     t.join(_INITIAL_SYNC_TIMEOUT)
     if t.is_alive():
+        try:
+            conn.close()  # stop the abandoned client's background retries
+        except Exception:
+            pass
         raise TimeoutError(
             f"sync backend unreachable after {_INITIAL_SYNC_TIMEOUT}s: {sync_cfg.url}")
     if errors:
         raise errors[0]
 
+    # One coalescing worker per connection (#109), started lazily on the
+    # first sync_now() call, instead of a new thread per call. See the
+    # module docstring's "SYNC WORKER" note for the design.
+    wake = threading.Event()
+    condition = threading.Condition()
+    counter = 0
+    worker_started = False
+    in_flight = False
+
+    def worker():
+        nonlocal counter, in_flight
+        while True:
+            wake.wait()
+            with condition:
+                wake.clear()
+                in_flight = True
+            _safe_sync(conn)
+            with condition:
+                in_flight = False
+                counter += 1
+                condition.notify_all()
+
     def sync_now(timeout=2.0):
-        t = threading.Thread(target=_safe_sync, args=(conn,), daemon=True)
-        t.start()
-        t.join(timeout)  # bounded: a hung sync never blocks a read
+        nonlocal worker_started
+        with condition:
+            if not worker_started:
+                threading.Thread(target=worker, daemon=True).start()
+                worker_started = True
+            seen = counter
+            # A caller arriving while a sync is already running will be
+            # satisfied when it completes, so don't schedule a redundant
+            # extra round on top of it - only wake the worker when it's idle.
+            if not in_flight:
+                wake.set()
+            condition.wait_for(lambda: counter > seen, timeout=timeout)
 
     return conn, sync_now, "replica"
 
