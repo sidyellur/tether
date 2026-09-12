@@ -2616,3 +2616,152 @@ def test_import_records_leaves_store_writable_after_bad_record():
     s.import_records([{"type": "project", "title": 5, "body": None, "tags": 3}])
     r = s.remember("user", "Still works", "body")
     assert r["action"] == "created"
+
+
+# --- #101/#102: boot-time backfill must not redundantly re-wire the whole
+# semantic graph on every clean restart, and must always leave the
+# connection committed rather than sitting on an open write transaction. ---
+
+def _edge_snapshot(conn):
+    return conn.execute(
+        "SELECT src, dst, kind, weight, updated_at FROM edges "
+        "ORDER BY src, dst, kind").fetchall()
+
+
+def test_backfill_clean_restart_is_noop_and_skips_wiring(monkeypatch):
+    """#101: reopening on the same model with nothing new to embed must
+    return 0 and must not touch the semantic graph at all - not even to
+    re-upsert edges that already exist with the same weight."""
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(), assoc=True)
+    s.migrate()
+    s.remember("user", "Car", "I drive my car to work")
+    s.remember("user", "Errand", "driving the automobile downtown")
+    s.backfill_embeddings()   # first-ever call for this device: records the
+                              # model (and, since meta was unset, wipes+wires)
+    edges_before = _edge_snapshot(conn)
+    assert edges_before        # sanity: the two rows did get wired once
+
+    from tether.graph import Graph
+    calls = []
+    monkeypatch.setattr(Graph, "backfill_semantic",
+                         lambda self, *a, **k: calls.append(1))
+
+    assert s.backfill_embeddings() == 0     # clean restart: nothing to do
+    assert calls == []                      # backfill_semantic never called
+    assert _edge_snapshot(conn) == edges_before   # not a single row touched
+
+
+def test_backfill_full_rewire_when_model_changes():
+    """The wipe path (#101's exception) is unchanged: a model/dims change
+    still re-embeds and re-wires the whole store, so every current memory
+    ends up with at least one semantic edge."""
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(), assoc=True)
+    s.migrate()
+    ids = [s.remember("user", f"T{i}", "car and driving")["id"] for i in range(3)]
+    s.backfill_embeddings()   # first-ever call: records fake-3d
+
+    class OtherEmbedder:
+        name = "other-model"
+        dims = 3
+
+        def embed(self, text):
+            return FakeEmbedder().embed(text)
+
+    s2 = Store(conn, "d", lambda *a, **k: None, embedder=OtherEmbedder(), assoc=True)
+    done = s2.backfill_embeddings()
+    assert done == len(ids)    # every row re-embedded under the new model
+
+    wired = set()
+    for src, dst in conn.execute(
+            "SELECT src, dst FROM edges WHERE kind='semantic'").fetchall():
+        wired.add(src)
+        wired.add(dst)
+    assert set(ids) <= wired    # a wholesale re-wire, not just the changed rows
+
+
+def test_backfill_partial_reembed_only_wires_the_new_rows(monkeypatch):
+    """#101: a couple of rows left NULL by an interrupted previous run (no
+    model change) get embedded and wired individually - the rest of the
+    store's edges are left byte-identical, and no wholesale re-wire runs."""
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(), assoc=True)
+    s.migrate()
+    a = s.remember("user", "Car", "I drive my car to work")["id"]
+    b = s.remember("user", "Errand", "driving the automobile downtown")["id"]
+    s.backfill_embeddings()    # first-ever call: records the model, wires a<->b
+    edges_before = _edge_snapshot(conn)
+    assert edges_before        # sanity: a and b are wired
+
+    # A row written while embedding was unavailable (or an interrupted
+    # backfill): no vector, so remember() never wired it either.
+    s_noembed = Store(conn, "d", lambda *a, **k: None, assoc=True)
+    c = s_noembed.remember("user", "New", "another car note")["id"]
+    assert conn.execute(
+        "SELECT embedding FROM memories WHERE id=?", (c,)).fetchone()[0] is None
+
+    from tether.graph import Graph
+    calls = []
+    monkeypatch.setattr(Graph, "backfill_semantic",
+                         lambda self, *a, **k: calls.append(1))
+    s._invalidate_embedding_cache()
+
+    done = s.backfill_embeddings()
+    assert done == 1            # only c needed embedding
+    assert calls == []          # no wholesale re-wire
+
+    edges_ab_after = conn.execute(
+        "SELECT src, dst, kind, weight, updated_at FROM edges "
+        "WHERE kind='semantic' AND src IN (?,?) AND dst IN (?,?) "
+        "ORDER BY src, dst, kind", (a, b, a, b)).fetchall()
+    assert edges_ab_after == edges_before   # a<->b edge is untouched
+
+    c_wired = conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='semantic' AND (src=? OR dst=?)",
+        (c, c)).fetchone()[0]
+    assert c_wired >= 1          # c itself got wired in
+
+
+def test_backfill_leaves_no_open_transaction(tmp_path):
+    """#102: whichever wiring branch ran, the connection must be committed -
+    never left sitting mid-transaction holding the WAL write lock."""
+    path = str(tmp_path / "t.db")
+    conn = sqlite3.connect(path)
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(), assoc=True)
+    s.migrate()
+    s.remember("user", "Car", "I drive my car to work")
+    s.backfill_embeddings()             # wipe branch (first-ever call)
+    assert conn.in_transaction is False
+
+    s.backfill_embeddings()             # clean-restart no-op branch
+    assert conn.in_transaction is False
+    conn.close()
+
+
+def test_backfill_does_not_lock_out_a_second_connection(tmp_path):
+    """#102 end-to-end: after the startup sequence a second process opening
+    the same DB file must be able to write immediately, not hit "database is
+    locked" waiting on a transaction the first process never closed."""
+    path = str(tmp_path / "t.db")
+    conn = sqlite3.connect(path)
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(), assoc=True)
+    s.migrate()
+    s.remember("user", "Car", "I drive my car to work")
+    s.backfill_embeddings()
+    s.backfill_embeddings()             # the boot-restart no-op path
+
+    conn2 = sqlite3.connect(path, timeout=1)
+    try:
+        conn2.execute(
+            "INSERT INTO meta(key, value) VALUES('probe', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        conn2.commit()
+    except sqlite3.OperationalError as e:
+        pytest.fail(f"second connection could not write: {e}")
+    assert conn2.execute(
+        "SELECT value FROM meta WHERE key='probe'").fetchone()[0] == "1"
+    conn2.close()
+    conn.close()
