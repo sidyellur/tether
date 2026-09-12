@@ -366,6 +366,12 @@ def test_degree_map_reflects_on_link():
         _mem(g._conn, i)
     assert g.degree_map() == {1: 0.0, 2: 0.0}
     g.on_link(1, 2)
+    g._touch()   # #128: in real usage Store._commit() always does this right
+                 # after on_link() (see link()); degree_map()'s signature no
+                 # longer sees an own-connection write on its own (that's
+                 # PRAGMA data_version's job, and it only reflects OTHER
+                 # connections - see _degree_signature), so a direct on_link()
+                 # call in a test has to pair it explicitly, same as Store does.
     deg = g.degree_map()
     assert deg[1] > 0 and deg[2] > 0
 
@@ -380,6 +386,7 @@ def test_degree_map_reflects_on_remember():
     _seed_memory(g._conn, 2, "user", "B", "auto", b)
     assert g.degree_map(kinds=("semantic",)) == {1: 0.0, 2: 0.0}
     g.on_remember(2, b)
+    g._touch()   # #128: see test_degree_map_reflects_on_link
     deg = g.degree_map(kinds=("semantic",))
     assert deg[1] > 0 and deg[2] > 0
 
@@ -398,9 +405,37 @@ def test_degree_map_reflects_archive_and_unprime():
     assert set(before) == {1, 2} and before[1] == before[2] == 1.0
     g._conn.execute("UPDATE memories SET valid_to='t' WHERE id=2")
     g.unprime(2)
+    g._touch()   # #128: see test_degree_map_reflects_on_link
     after = g.degree_map()
     assert set(after) == {1}             # archived node dropped from the current set
     assert after[1] == 0.0               # its edge to the now-noncurrent node no longer counts
+
+
+def test_degree_map_notices_a_foreign_edge_weight_update(tmp_path):
+    """#128: a foreign connection bumping an EXISTING edge's weight (the
+    on_link/touch_session upsert shape, mode='max'/'add') changes neither the
+    edge count nor the current-memory count, so the pre-#128 signature never
+    noticed it and `ga` served the old (lower) degree forever. PRAGMA
+    data_version catches an UPDATE from another connection directly."""
+    path = str(tmp_path / "g.db")
+    conn_a = sqlite3.connect(path)
+    ga = Graph(conn_a, enabled=True)
+    ga.migrate()
+    _mem(conn_a, 1)
+    _mem(conn_a, 2)
+    ga._upsert_edge(1, 2, "hebbian", 1.0, "t", mode="max")
+    conn_a.commit()
+    before = ga.degree_map()
+    assert before[1] == 1.0
+
+    conn_b = sqlite3.connect(path)
+    gb = Graph(conn_b, enabled=True)
+    gb._upsert_edge(1, 2, "hebbian", 5.0, "t2", mode="max")   # UPDATEs the row
+    conn_b.commit()
+
+    after = ga.degree_map()
+    assert after[1] == 5.0, (
+        "ga served a stale degree_map after gb's UPDATE-only edge write (#128)")
 
 
 def test_degree_map_caches_separately_per_kinds():
