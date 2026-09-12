@@ -38,6 +38,52 @@ CREATE TABLE IF NOT EXISTS memories (
 -- here: it needs to become a partial UNIQUE index (#41) but must degrade
 -- gracefully on a live DB that already has duplicate current rows, which
 -- plain executescript() can't express.
+
+-- #111: a derived index over `memories.tags` (which stays the source of
+-- truth - row shape, export format and existing tests all depend on the
+-- comma-joined string). Kept in sync by the triggers in _TAGS_TRIGGER_SCHEMA
+-- below, so tag-filtered recall can use an indexed lookup instead of pulling
+-- every current row's tags into Python and filtering there.
+CREATE TABLE IF NOT EXISTS memory_tags (
+    memory_id INTEGER NOT NULL,
+    tag       TEXT NOT NULL,
+    PRIMARY KEY (memory_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);
+"""
+
+# #111: keeps memory_tags in sync with memories.tags on every write path
+# (remember()'s upsert, import_records, restore(), the CLI) without any of
+# them having to know memory_tags exists. The json_each trick below turns
+# "a,b,c" into the JSON array ["a","b","c"] by wrapping it in quotes and
+# swapping the comma separators for `","` - so a literal double-quote inside
+# a tag would break the quoting (and could smuggle extra "tags" into the
+# array). _tags_to_str() strips embedded double-quotes from every tag at
+# write time specifically to keep this safe; see the comment there.
+#
+# A soft-delete (forget()) only ever touches valid_to, never tags, so it
+# does not fire memories_tags_au and a forgotten row's memory_tags entries
+# are left in place - restore() then needs no memory_tags work of its own.
+# _recall_by_tags (like every other reader) already joins through
+# `valid_to IS NULL`, so an archived row's leftover memory_tags rows are
+# naturally invisible until restore() clears valid_to again. Only a real
+# DELETE (purge(), or a superseded row process never issues) should drop
+# them, which memories_tags_ad handles.
+_TAGS_TRIGGER_SCHEMA = """
+CREATE TRIGGER IF NOT EXISTS memories_tags_ai AFTER INSERT ON memories BEGIN
+    INSERT OR IGNORE INTO memory_tags(memory_id, tag)
+    SELECT new.id, trim(value) FROM json_each('["' || replace(new.tags, ',', '","') || '"]')
+    WHERE trim(value) != '';
+END;
+CREATE TRIGGER IF NOT EXISTS memories_tags_au AFTER UPDATE OF tags ON memories BEGIN
+    DELETE FROM memory_tags WHERE memory_id = old.id;
+    INSERT OR IGNORE INTO memory_tags(memory_id, tag)
+    SELECT new.id, trim(value) FROM json_each('["' || replace(new.tags, ',', '","') || '"]')
+    WHERE trim(value) != '';
+END;
+CREATE TRIGGER IF NOT EXISTS memories_tags_ad AFTER DELETE ON memories BEGIN
+    DELETE FROM memory_tags WHERE memory_id = old.id;
+END;
 """
 
 # The FTS5 tokenizer is a property of the virtual table (#90). `porter`
@@ -89,13 +135,24 @@ def _norm(title: str) -> str:
 
 
 def _tags_to_str(tags) -> str:
+    """Normalize tags into the stored comma-joined string.
+
+    #111: strips embedded double-quote characters from every tag (in
+    addition to the pre-existing whitespace stripping) because
+    memory_tags_ai/au (_TAGS_TRIGGER_SCHEMA) turn this string into a JSON
+    array by wrapping it in quotes and replacing "," with '","' - a literal
+    `"` inside a tag would break that quoting (and could inject a bogus
+    extra tag into memory_tags). Stripping rather than rejecting keeps
+    remember() from raising over a cosmetic character in a tag.
+    """
     if not tags:
         return ""
     if isinstance(tags, str):
         parts = tags.split(",")
     else:
         parts = list(tags)
-    return ",".join(t.strip() for t in parts if t and t.strip())
+    cleaned = (t.strip().replace('"', '') for t in parts if t and t.strip())
+    return ",".join(t for t in cleaned if t)
 
 
 def _parse_tags(tags) -> list:
@@ -649,7 +706,9 @@ class Store:
             fts_existed = False
         self._conn.execute(_fts_schema(self._stemming))
         self._conn.executescript(_TRIGGER_SCHEMA)
+        self._conn.executescript(_TAGS_TRIGGER_SCHEMA)
         self._conn.executescript(_META_SCHEMA)
+        self._backfill_memory_tags()
         self._ensure_embedding_column()
         if not fts_existed:
             # FTS5 external-content tables don't auto-index pre-existing rows
@@ -679,6 +738,25 @@ class Store:
                         pairs.append((rid, other))
             self._graph.backfill_explicit(pairs)
         self._conn.commit()
+
+    def _backfill_memory_tags(self) -> None:
+        """One-time backfill of memory_tags (#111) for a DB that already has
+        `memories` rows predating this table - the triggers only fire on
+        writes going forward, so pre-existing rows would otherwise never get
+        an entry. Gated on memory_tags being empty (never overwrites/repeats)
+        and memories being non-empty (nothing to backfill from a fresh DB, so
+        `migrate()` doesn't pay this scan on every first-ever run either).
+        Uses the same JSON-array trick as the triggers, correlated per row."""
+        empty_and_populated = self._conn.execute(
+            "SELECT NOT EXISTS (SELECT 1 FROM memory_tags LIMIT 1) "
+            "AND EXISTS (SELECT 1 FROM memories LIMIT 1)").fetchone()[0]
+        if not empty_and_populated:
+            return
+        self._conn.execute(
+            "INSERT OR IGNORE INTO memory_tags(memory_id, tag) "
+            "SELECT m.id, trim(je.value) FROM memories m, "
+            "json_each('[\"' || replace(m.tags, ',', '\",\"') || '\"]') je "
+            "WHERE trim(je.value) != ''")
 
     def _table_exists(self, name) -> bool:
         return self._conn.execute(
@@ -1289,16 +1367,10 @@ class Store:
                  for r in rows}
         return [by_id[i] for i in ids if i in by_id]
 
-    def _seed_scores(self, query, type, tags_out=None) -> dict:
+    def _seed_scores(self, query, type) -> dict:
         """The v0.2 hybrid recall scoring (FTS5 + semantic RRF, gentle recency,
         optional decay) as a {id: score} map - the seeds an associative walk
         starts from.
-
-        When `self._project` is set, the same-project bonus below already
-        fetches every seed's tags. `tags_out`, if given, is populated with
-        that {id: tags} map (over the same id set `scores` ends up keyed by)
-        so a caller doing its own tag filtering right after (recall()'s tag
-        filter) can reuse it instead of re-querying the same ids (#107).
         """
         fts_ids = self._fts_ids(query, type)
         vec_ids = self._vector_ids(query, type)
@@ -1310,15 +1382,14 @@ class Store:
         recency = _rrf_scores([self._recency_order(list(scores))])
         for mid, s in recency.items():
             scores[mid] += _RECENCY_WEIGHT * s
-        # #92: same-project hits edge out otherwise-equal hits from elsewhere
+        # #92/#111: same-project hits edge out otherwise-equal hits from
+        # elsewhere - an indexed memory_tags lookup scoped to just the seed
+        # ids, rather than pulling every seed's raw tags into Python.
         if self._project:
-            tag = _project_tag(self._project)
-            tags_by_id = self._tags_of_many(list(scores))
-            if tags_out is not None:
-                tags_out.update(tags_by_id)
-            for mid, tags_s in tags_by_id.items():
-                if _tags_match(tags_s, [tag]):
-                    scores[mid] += _PROJECT_BONUS
+            matching = self._ids_matching_tags(
+                list(scores), [_project_tag(self._project)])
+            for mid in matching:
+                scores[mid] += _PROJECT_BONUS
         # optional exponential time-decay
         if self._decay_half_life_days:
             now = _now()
@@ -1328,27 +1399,49 @@ class Store:
                     _age_days(updated[mid], now), self._decay_half_life_days)
         return scores
 
-    def _tags_of_many(self, ids) -> dict:
+    def _ids_matching_tags(self, ids, tag_list) -> set:
+        """Subset of `ids` whose stored tags are a superset of `tag_list`
+        (#111), via an indexed lookup against memory_tags scoped to just
+        these candidate ids - the query-shaped replacement for pulling every
+        candidate's tags into Python with _tags_of_many + _tags_match.
+        Duplicate tags in `tag_list` are deduped first so repeating a
+        required tag can't inflate the count below and produce a false
+        exclusion (memory_tags has at most one row per (memory_id, tag))."""
         if not ids:
-            return {}
-        ph = ",".join("?" for _ in ids)
-        return {r[0]: r[1] for r in self._conn.execute(
-            f"SELECT id, tags FROM memories WHERE id IN ({ph})", ids).fetchall()}
+            return set()
+        required = list(dict.fromkeys(tag_list))
+        if not required:
+            return set(ids)
+        id_ph = ",".join("?" for _ in ids)
+        tag_ph = ",".join("?" for _ in required)
+        rows = self._conn.execute(
+            f"SELECT memory_id FROM memory_tags WHERE memory_id IN ({id_ph}) "
+            f"AND tag IN ({tag_ph}) GROUP BY memory_id HAVING COUNT(*) = ?",
+            [*ids, *required, len(required)]).fetchall()
+        return {r[0] for r in rows}
 
     def _recall_by_tags(self, type, tag_list, limit) -> list:
         """Exact-match tag retrieval, bypassing ranked search and the
         associative graph entirely: every current memory whose tags are a
         superset of `tag_list`, newest first within `limit` - deterministic,
-        not subject to FTS/semantic ranking dropping a real match (#50)."""
-        sql = "SELECT id, tags FROM memories WHERE valid_to IS NULL"
-        params = []
+        not subject to FTS/semantic ranking dropping a real match (#50).
+
+        #111: uses the memory_tags index instead of pulling (id, tags) for
+        every current row and filtering in Python - this used to be a full
+        table scan on every tag-only recall call."""
+        required = list(dict.fromkeys(tag_list))
+        tag_ph = ",".join("?" for _ in required)
+        sql = ("SELECT m.id FROM memories m WHERE m.valid_to IS NULL "
+               "AND (SELECT COUNT(*) FROM memory_tags t "
+               f"WHERE t.memory_id = m.id AND t.tag IN ({tag_ph})) = ?")
+        params = [*required, len(required)]
         if type is not None:
-            sql += " AND type = ?"
+            sql += " AND m.type = ?"
             params.append(type)
-        sql += " ORDER BY updated_at DESC, id DESC"
-        rows = self._conn.execute(sql, params).fetchall()
-        ids = [mid for mid, tags_s in rows if _tags_match(tags_s, tag_list)]
-        return self._hydrate(ids[:limit])
+        sql += " ORDER BY m.updated_at DESC, m.id DESC LIMIT ?"
+        params.append(limit)
+        ids = [r[0] for r in self._conn.execute(sql, params).fetchall()]
+        return self._hydrate(ids)
 
     @_locked
     def get(self, id) -> dict:
@@ -1387,15 +1480,13 @@ class Store:
                 return []
             return self._excerpt_hits(
                 self._recall_by_tags(type, tag_list, limit), query, full)
-        tags_out = {}
-        seeds = self._seed_scores(query, type, tags_out=tags_out)
+        seeds = self._seed_scores(query, type)
         if tag_list:
-            # #107: when a project is set, _seed_scores already fetched every
-            # seed's tags for the same-project bonus - reuse that dict rather
-            # than re-querying the same ids here.
-            tags_by_id = tags_out if self._project else self._tags_of_many(list(seeds))
-            seeds = {mid: s for mid, s in seeds.items()
-                     if _tags_match(tags_by_id.get(mid, ""), tag_list)}
+            # #111: an indexed memory_tags lookup scoped to just the seed
+            # ids, replacing the old _tags_of_many + _tags_match combination
+            # (which pulled every seed's raw tags into Python to filter).
+            matching = self._ids_matching_tags(list(seeds), tag_list)
+            seeds = {mid: s for mid, s in seeds.items() if mid in matching}
         if not self._graph.enabled:
             if not seeds:
                 return []
@@ -1433,9 +1524,10 @@ class Store:
         if tag_list:
             # a tag filter must hold for the whole result, not just the seed
             # tier - otherwise associative spread could hand back a hit the
-            # filter was supposed to exclude.
-            tail_tags = self._tags_of_many(tail)
-            tail = [m for m in tail if _tags_match(tail_tags.get(m, ""), tag_list)]
+            # filter was supposed to exclude. #111: indexed lookup scoped to
+            # just the tail ids, in place of _tags_of_many + _tags_match.
+            matching_tail = self._ids_matching_tags(tail, tag_list)
+            tail = [m for m in tail if m in matching_tail]
         order = (head + tail)[:limit]
         # B1: learn from what the query was ABOUT (the direct-hit head), not
         # from everything the recall returned. Spread- and priming-surfaced

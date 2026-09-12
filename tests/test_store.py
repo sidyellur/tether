@@ -1245,6 +1245,88 @@ def test_recall_tags_filters_spread_reached_tail_too():
     assert a in filtered_ids and b not in filtered_ids
 
 
+def test_tags_whitespace_normalizes_the_same_old_and_new_path():
+    """#111: a tag with surrounding whitespace must normalize identically
+    whether checked via the old comma-string path (_tags_match) or the new
+    indexed memory_tags table."""
+    s = make_store()
+    mid = s.remember("user", "A", "note", tags=" infra ,  proj:tether  ")["id"]
+    stored_tags = s._conn.execute(
+        "SELECT tags FROM memories WHERE id=?", (mid,)).fetchone()[0]
+    from tether.store import _tags_match
+    assert _tags_match(stored_tags, ["infra", "proj:tether"])
+    # memory_tags rows must be trimmed the same way, not "  infra  " verbatim
+    rows = {r[0] for r in s._conn.execute(
+        "SELECT tag FROM memory_tags WHERE memory_id=?", (mid,)).fetchall()}
+    assert rows == {"infra", "proj:tether"}
+    hits = s.recall("note", tags="infra,proj:tether")
+    assert [h["id"] for h in hits] == [mid]
+
+
+def test_restore_makes_memory_reappear_in_tag_recall():
+    """#111: memory_tags rows for a soft-deleted (forgotten) row must persist
+    (naturally hidden by valid_to IS NULL) and still be queryable once
+    restore() clears valid_to again."""
+    s = make_store()
+    mid = s.remember("user", "A", "note", tags="infra")["id"]
+    s.forget(mid)
+    assert s.recall("", tags="infra") == []
+    # the memory_tags row is still there, just invisible via valid_to
+    tags_still_indexed = s._conn.execute(
+        "SELECT 1 FROM memory_tags WHERE memory_id=? AND tag='infra'",
+        (mid,)).fetchone()
+    assert tags_still_indexed is not None
+    s.restore(mid)
+    hits = s.recall("", tags="infra")
+    assert [h["id"] for h in hits] == [mid]
+
+
+def test_import_records_rows_are_tag_searchable():
+    s = make_store()
+    result = s.import_records([
+        {"id": 1, "type": "user", "title": "A", "body": "x", "tags": "infra"},
+        {"id": 2, "type": "user", "title": "B", "body": "y", "tags": "other"},
+    ])
+    assert result["created"] == 2
+    hits = s.recall("", tags="infra")
+    assert [h["title"] for h in hits] == ["A"]
+
+
+def test_migrate_backfills_memory_tags_for_a_pre_existing_db():
+    """Simulate a DB that predates memory_tags: rows already exist with tags,
+    the table gets dropped (as if it never existed), then migrate() must
+    repopulate it from the existing rows on the next run."""
+    s = make_store()
+    a = s.remember("user", "A", "x", tags="infra,proj:tether")["id"]
+    b = s.remember("project", "B", "y", tags="proj:tether")["id"]
+    s._conn.execute("DROP TABLE memory_tags")
+    s._conn.commit()
+    s.migrate()
+    rows = {(r[0], r[1]) for r in s._conn.execute(
+        "SELECT memory_id, tag FROM memory_tags").fetchall()}
+    assert rows == {(a, "infra"), (a, "proj:tether"), (b, "proj:tether")}
+    hits = s.recall("", tags="proj:tether")
+    assert {h["id"] for h in hits} == {a, b}
+
+
+def test_tag_with_embedded_double_quote_is_handled_without_breaking():
+    """#111: memory_tags is maintained via triggers that JSON-quote the
+    tags string, which breaks if a tag contains a literal double-quote.
+    _tags_to_str() strips embedded double-quotes at write time to avoid
+    that, so remember() must not raise and the stripped tag must still be
+    searchable."""
+    s = make_store()
+    mid = s.remember("user", "A", "note", tags='weird"tag,plain')["id"]
+    stored_tags = s._conn.execute(
+        "SELECT tags FROM memories WHERE id=?", (mid,)).fetchone()[0]
+    assert '"' not in stored_tags
+    assert "weirdtag" in stored_tags.split(",")
+    hits = s.recall("", tags="weirdtag")
+    assert [h["id"] for h in hits] == [mid]
+    hits2 = s.recall("", tags="plain")
+    assert [h["id"] for h in hits2] == [mid]
+
+
 def test_crystallized_hub_does_not_bury_direct_hit():
     # #25 back-door: a max-fan-out principle must not outrank a query's own hit.
     pytest.importorskip("numpy")
