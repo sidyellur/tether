@@ -2369,3 +2369,75 @@ def test_action_survives_recall_inserting_rows_between_writes():
         s.recall("T1")                       # session_members / edges / meta inserts
     created = s.remember("user", "T-new", "b")
     assert created["action"] == "created" and created["id"] not in ids
+
+
+# --- #104: a failed write must not leave the connection poisoned ------------
+
+class _RaiseOnceConn:
+    """Proxy around a sqlite3.Connection: the FIRST statement whose SQL starts
+    with `prefix` raises `exc` instead of running; every other statement,
+    including that same INSERT on a later call, behaves normally. A plain
+    instance-attribute monkeypatch of `.execute` doesn't work here -
+    sqlite3.Connection is a C type whose `execute` is read-only per instance -
+    so this wraps the connection instead."""
+
+    def __init__(self, real, prefix, exc):
+        self._real = real
+        self._prefix = prefix
+        self._exc = exc
+        self._fired = False
+
+    def execute(self, sql, *args, **kwargs):
+        if not self._fired and sql.lstrip().upper().startswith(self._prefix):
+            self._fired = True
+            raise self._exc
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _rig_insert_into_memories_to_fail_once(s, exc):
+    s._conn = _RaiseOnceConn(s._conn, "INSERT INTO MEMORIES", exc)
+
+
+def test_failed_remember_rolls_back_and_store_stays_writable():
+    s = make_store()
+    _rig_insert_into_memories_to_fail_once(s, sqlite3.IntegrityError("boom"))
+    with pytest.raises(sqlite3.IntegrityError):
+        s.remember("user", "Bad write", "body")
+    assert s._conn.in_transaction is False, (
+        "a failed write left an open transaction on the connection (#104)")
+    r = s.remember("user", "Bad write", "body")
+    assert r["action"] == "created"
+
+
+def test_failed_remember_rolls_back_begin_immediate_fallback_path():
+    """Same failure, but forced through the BEGIN IMMEDIATE-guarded
+    _upsert_locked fallback used when the DB lacks the unique dedup index."""
+    s = make_store()
+    s._has_unique_dedup_index = False
+    _rig_insert_into_memories_to_fail_once(s, sqlite3.IntegrityError("boom"))
+    with pytest.raises(sqlite3.IntegrityError):
+        s.remember("user", "Bad write", "body")
+    assert s._conn.in_transaction is False
+
+    # Must not raise "cannot start a transaction within a transaction".
+    r = s.remember("user", "Bad write", "body")
+    assert r["action"] == "created"
+
+
+def test_import_records_skips_bad_record_and_keeps_store_writable():
+    out = make_store().import_records([
+        {"type": "project", "title": 5, "body": None, "tags": 3},
+        {"type": "project", "title": "ok title", "body": "b"},
+    ])
+    assert out["skipped"] == 1
+    assert out["created"] == 1
+
+
+def test_import_records_leaves_store_writable_after_bad_record():
+    s = make_store()
+    s.import_records([{"type": "project", "title": 5, "body": None, "tags": 3}])
+    r = s.remember("user", "Still works", "body")
+    assert r["action"] == "created"

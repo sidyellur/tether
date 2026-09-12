@@ -610,11 +610,27 @@ class Store:
         except Exception:
             self._last_sync_at = now    # don't retry-storm a broken backend
 
+    def _rollback_quietly(self) -> None:
+        """Best-effort rollback of whatever partial transaction a failed write
+        left open on the current connection (#104). Every public write method
+        runs under `_locked`, so only one caller is ever mid-write on this
+        Store at a time - this can never discard another caller's in-flight
+        work, only the failed call's own half-finished statements. Never
+        raises: a connection with nothing to roll back (or already closed) is
+        not itself a problem worth surfacing over the original error."""
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
+
     def _write_with_replica_fallback(self, fn):
-        """Run a write; on failure, degrade to local once and retry."""
+        """Run a write; on failure, roll back the half-finished transaction so
+        the connection isn't left poisoned for the next call (#104), then
+        degrade to local once and retry, or re-raise."""
         try:
             return fn()
         except Exception:
+            self._rollback_quietly()
             if not self._degrade_to_local():
                 raise
             return fn()
@@ -1478,14 +1494,43 @@ class Store:
             try:
                 type_ = rec["type"]
                 title = rec["title"]
-                body = rec.get("body", "")
             except (TypeError, KeyError):
                 skipped += 1
                 continue
-            if type_ not in VALID_TYPES or not str(title).strip():
+            # #104: coerce rather than trust the shape of imported data. A
+            # non-string title used to sail past this guard (str(title).strip()
+            # was only PROBED here, never assigned) and then blow up inside
+            # remember()'s _norm() with an AttributeError, mid-transaction.
+            if title is None:
+                title = ""
+            elif not isinstance(title, str):
+                title = str(title)
+            if type_ not in VALID_TYPES or not title.strip():
                 skipped += 1
                 continue
-            res = self.remember(type_, title, body, tags=rec.get("tags", ""))
+            # A `"body": null` value passes a `rec.get("body", "")` probe (the
+            # key IS present) and then hits the `body NOT NULL` column
+            # constraint inside remember(). Collapse only None/missing here -
+            # any other falsy-but-valid text (e.g. "") is left alone.
+            body = rec.get("body")
+            if body is None:
+                body = ""
+            # A non-string, non-list-of-strings `tags` value raises TypeError
+            # inside _tags_to_str() mid-transaction; catch it up front instead.
+            tags = rec.get("tags", "")
+            if tags and not isinstance(tags, str) and not (
+                    isinstance(tags, list)
+                    and all(isinstance(t, str) for t in tags)):
+                skipped += 1
+                continue
+            try:
+                res = self.remember(type_, title, body, tags=tags)
+            except Exception:
+                # One bad record must not abort the whole import; the rollback
+                # in _write_with_replica_fallback (#104) guarantees the store
+                # is still writable for the next record in this loop.
+                skipped += 1
+                continue
             if rec.get("id") is not None:
                 id_map[rec["id"]] = res["id"]
             if res["action"] == "created":
