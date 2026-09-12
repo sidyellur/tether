@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS memories (
 -- here: it needs to become a partial UNIQUE index (#41) but must degrade
 -- gracefully on a live DB that already has duplicate current rows, which
 -- plain executescript() can't express.
+CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at);
 
 -- #111: a derived index over `memories.tags` (which stays the source of
 -- truth - row shape, export format and existing tests all depend on the
@@ -514,6 +515,26 @@ class Store:
         self._crystallize = crystallize
         self._cryst_sig = None
         self._cryst_cache = []
+        # #112: boot_index() used to re-scan every current memory (and, above
+        # boot_index_cap, every behavioral edge via Graph.degree_map()) on
+        # EVERY call - and it's the auto-loaded MCP resource, so this ran at
+        # the start of every session. Memoized on a cheap change signature
+        # (_store_signature) the same way _cryst_sig/_cryst_cache memoize
+        # crystallization_candidates().
+        self._boot_sig = None
+        self._boot_cache = None
+        # #112 follow-up: an in-process write counter, bumped once per commit
+        # (see _commit()). The signature used to lean on MAX(updated_at)
+        # string comparison to detect a same-process write; that's exactly
+        # the wall-clock-resolution trap #68 already hit once (Windows'
+        # sub-millisecond datetime.now() granularity before Python 3.13 means
+        # two writes issued inside one clock tick share a timestamp), and a
+        # remember() immediately followed by a link() inside one tick made
+        # the signature compare equal, silently serving a stale boot index.
+        # A monotonic same-process counter can't tie, so it replaces
+        # updated_at for detecting THIS process's own writes; the DB-side
+        # counts/max-id remain for noticing a foreign connection's writes.
+        self._write_seq = 0
         self._graph = Graph(conn, enabled=assoc)
         # Set for real by migrate()'s _ensure_dedup_unique_index(); defaults
         # to the conservative (locking) path if migrate() is somehow skipped.
@@ -604,6 +625,48 @@ class Store:
             return self._conn.execute("PRAGMA data_version").fetchone()[0]
         except Exception:
             return None
+
+    def _commit(self) -> None:
+        """The one place Store commits (#112 follow-up). Bumps the in-process
+        write counters that boot_index()/degree_map() key their caches on, so
+        every commit - remember/link/forget/restore/purge/dismiss_cluster,
+        recall()'s associative learning, migrate(), backfill_embeddings() -
+        invalidates them uniformly. Cheaper and more robust than re-deriving
+        "did anything change" from table contents: it can't tie the way a
+        wall-clock timestamp can (see _store_signature)."""
+        self._conn.commit()
+        self._write_seq += 1
+        self._graph._touch()
+
+    def _store_signature(self):
+        """Cheap fingerprint of "could boot_index()'s answer have changed?"
+        (#112): this process's own write counter, plus current-row count and
+        highest id for `memories`, and count for `edges` (degree_map()'s
+        inputs, consulted by the curated index once the store is above
+        boot_index_cap) - so a foreign connection's write (a sync pull, a
+        second process) is still noticed via the count/max-id changing, even
+        though it doesn't bump this process's own counter.
+
+        Originally used MAX(updated_at) instead of _write_seq to detect this
+        process's own writes, but that's a wall-clock string comparison -
+        exactly the trap #68 already hit once (Windows' datetime.now() has
+        ~15.6ms resolution before Python 3.13, so a remember() immediately
+        followed by a link() inside one clock tick shares a timestamp). Two
+        such writes made the signature compare equal and served a stale boot
+        index. _write_seq can't tie, so it replaces updated_at for the
+        same-process case; MAX(updated_at) added nothing the count/max-id
+        checks didn't already cover for the foreign-connection case, so it's
+        dropped rather than kept alongside.
+
+        Deliberately NOT `PRAGMA data_version` (see _data_version above):
+        that pragma only advances when ANOTHER connection commits to the
+        file, so it can't see this process's own writes on its own.
+        """
+        row = self._conn.execute(
+            "SELECT (SELECT COUNT(*) FROM memories WHERE valid_to IS NULL), "
+            "(SELECT COUNT(*) FROM edges), "
+            "(SELECT COALESCE(MAX(id), 0) FROM memories)").fetchone()
+        return (self._write_seq, *row)
 
     def _cache_put(self, mid, emb, type_) -> None:
         """Reflect one row's current embedding in the cache (#81): replace it
@@ -837,7 +900,7 @@ class Store:
                     if other in valid_ids:
                         pairs.append((rid, other))
             self._graph.backfill_explicit(pairs)
-        self._conn.commit()
+        self._commit()
 
     def _backfill_memory_tags(self) -> None:
         """One-time backfill of memory_tags (#111) for a DB that already has
@@ -1010,7 +1073,7 @@ class Store:
                 self._conn.execute("UPDATE memories SET embedding=NULL")
                 self._meta_set(model_key, self._embedder.name)
                 self._meta_set(dims_key, self._embedder.dims)
-                self._conn.commit()
+                self._commit()
             done = 0
             embedded = []   # (mid, blob) for rows actually embedded this run
             while True:
@@ -1024,7 +1087,7 @@ class Store:
                     if blob is None:
                         # embedder broke mid-run: stop, leave the rest for later
                         self._invalidate_embedding_cache()
-                        self._conn.commit()
+                        self._commit()
                         return done
                     self._conn.execute(
                         "UPDATE memories SET embedding=? WHERE id=?", (blob, mid))
@@ -1036,7 +1099,7 @@ class Store:
                     self._cache_put(mid, blob, type_)
                     embedded.append((mid, blob))
                     done += 1
-                self._conn.commit()
+                self._commit()
             if wiped:
                 # Vectors just changed wholesale, so anything cached is stale
                 # and every current memory needs re-wiring.
@@ -1050,7 +1113,7 @@ class Store:
                 for mid, blob in embedded:
                     self._graph.on_remember(mid, blob, matrix=shared)
             # else: wiped is False and done == 0 - nothing changed, nothing to wire.
-            self._conn.commit()
+            self._commit()
             return done
         except Exception:
             return 0
@@ -1142,7 +1205,7 @@ class Store:
                 mid, crystallizes)
             if valid:
                 self._graph.on_crystallize(mid, valid)
-        self._conn.commit()
+        self._commit()
         self._sync()
         self._maybe_forget()
         result = {"id": mid, "action": action}
@@ -1311,11 +1374,11 @@ class Store:
             n = int(self._meta_get("forget_counter") or 0) + 1
             if n >= self._forget_interval:
                 self._meta_set("forget_counter", 0)
-                self._conn.commit()
+                self._commit()
                 self._run_forgetting_sweep()
             else:
                 self._meta_set("forget_counter", n)
-                self._conn.commit()
+                self._commit()
         except Exception:
             return
 
@@ -1330,12 +1393,12 @@ class Store:
             n = int(self._meta_get("session_sweep_counter") or 0) + 1
             if n >= self._session_sweep_interval:
                 self._meta_set("session_sweep_counter", 0)
-                self._conn.commit()
+                self._commit()
                 self._graph.sweep_stale_session_members()
-                self._conn.commit()
+                self._commit()
             else:
                 self._meta_set("session_sweep_counter", n)
-                self._conn.commit()
+                self._commit()
         except Exception:
             return
 
@@ -1370,7 +1433,7 @@ class Store:
                 self._cache_drop(mid)
                 archived += 1
             if archived:
-                self._conn.commit()
+                self._commit()
             return archived
         except Exception:
             return 0
@@ -1642,7 +1705,7 @@ class Store:
         # flip it at runtime via monkeypatch.
         learn_ids = head if graph.HEBBIAN_LEARN_FROM_HEAD else order
         self._graph.touch_session(sid, learn_ids)
-        self._conn.commit()
+        self._commit()
         self._maybe_sweep_sessions()
         hits = self._hydrate(order)
         for h in hits:
@@ -1706,7 +1769,7 @@ class Store:
         self._conn.execute(self._LINK_UNION_SQL, (id_b, now, id_a))
         self._conn.execute(self._LINK_UNION_SQL, (id_a, now, id_b))
         self._graph.on_link(id_a, id_b)
-        self._conn.commit()
+        self._commit()
         self._sync()
         return {"linked": [id_a, id_b]}
 
@@ -1743,7 +1806,7 @@ class Store:
         if cur.rowcount > 0:
             self._graph.unprime(id)          # #42: don't let it linger as primed context
             self._cache_drop(id)
-        self._conn.commit()
+        self._commit()
         self._sync()
         return {"forgotten": id, "existed": cur.rowcount > 0}
 
@@ -1787,7 +1850,7 @@ class Store:
         emb, = self._conn.execute(
             "SELECT embedding FROM memories WHERE id=?", (id,)).fetchone()
         self._cache_put(id, emb, type_)      # back in the current set (#81)
-        self._conn.commit()
+        self._commit()
         self._sync()
         return {"restored": id, "existed": True, "action": "restored"}
 
@@ -1889,7 +1952,7 @@ class Store:
         cur = self._conn.execute("DELETE FROM memories WHERE id=?", (id,))
         self._graph.on_forget(id)
         self._cache_drop(id)
-        self._conn.commit()
+        self._commit()
         self._sync()
         return {"purged": id, "existed": cur.rowcount > 0}
 
@@ -1914,6 +1977,20 @@ class Store:
     @_locked
     def boot_index(self) -> str:
         self._maybe_sync_for_read()      # #62: the session-start read pulls too
+        # #112: this is the auto-loaded MCP resource, so it used to re-scan
+        # every current memory (and, above boot_index_cap, every behavioral
+        # edge) at the start of EVERY session. Memoized on a cheap change
+        # signature - self._project is fixed for the life of the process, so
+        # it doesn't need to be part of the cache key.
+        sig = self._store_signature()
+        if sig == self._boot_sig:
+            return self._boot_cache
+        result = self._boot_index_impl()
+        self._boot_sig = sig
+        self._boot_cache = result
+        return result
+
+    def _boot_index_impl(self) -> str:
         rows = self._conn.execute(
             "SELECT id, type, title, updated_at, tags FROM memories "
             "WHERE valid_to IS NULL ORDER BY updated_at DESC, id DESC"
