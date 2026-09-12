@@ -3007,6 +3007,80 @@ def test_failed_remember_rolls_back_begin_immediate_fallback_path():
     assert r["action"] == "created"
 
 
+class _RaiseOnCommitConn:
+    """Proxy around a sqlite3.Connection whose `.commit()` raises once, after
+    the transaction's statements (the INSERT, `_cache_put`, ...) have already
+    run - unlike `_RaiseOnceConn` above, which stops the triggering statement
+    from running at all. Lets a test fail exactly where `_commit()` itself
+    fails, with everything upstream of it already applied in-process."""
+
+    def __init__(self, real, exc):
+        self._real = real
+        self._exc = exc
+        self._fired = False
+
+    def commit(self):
+        if not self._fired:
+            self._fired = True
+            raise self._exc
+        return self._real.commit()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_failed_remember_does_not_leave_a_phantom_embedding_cache_row():
+    """#104/#81: _cache_put patches the embedding cache the moment the
+    upsert's INSERT runs, inside the same transaction - well before
+    _commit(). If _commit() itself then fails, _rollback_quietly() undoes the
+    INSERT in the database, but nothing tells the embedding cache the row it
+    was just handed no longer exists on disk. The cache must never keep
+    serving a row for an id the write never actually committed."""
+    s = make_semantic_store()
+    s.remember("user", "Real one", "an actual committed row")
+    s._embedding_matrix()  # warm the cache so cache_put has something to patch
+    conn = s._conn
+    s._conn = _RaiseOnCommitConn(conn, sqlite3.OperationalError("boom"))
+    with pytest.raises(sqlite3.OperationalError):
+        s.remember("user", "Ghost", "never actually committed")
+    s._conn = conn
+
+    ids, mat, types = s._embedding_matrix()
+    live_ids = {r[0] for r in conn.execute(
+        "SELECT id FROM memories WHERE valid_to IS NULL").fetchall()}
+    assert set(ids) == live_ids, (
+        "embedding cache kept a row for an id the rolled-back write never "
+        "actually committed (#104/#81)")
+
+
+def test_locked_wrapper_clears_pending_sync_even_when_the_method_raises(monkeypatch):
+    """#105: `_sync()` / `_maybe_sync_for_read()` only ever RECORD a pending
+    sync (`self._pending_sync` / `_pending_sync_safe`) for `_locked`'s
+    wrapper to drain once the lock is released - they never touch the
+    network themselves. If the wrapped method raises AFTER recording one,
+    the pre-fix wrapper skipped straight past the code that both clears the
+    flags and performs the deferred wait: the flag stays set, that call's
+    own sync never happens, and the NEXT unrelated `_locked` call drains it
+    instead - using a timeout/safety flag that belongs to a call it has
+    nothing to do with."""
+    s = make_semantic_store()
+    s.remember("user", "Something", "body")
+    calls = []
+    s._sync_now = lambda timeout=2.0: calls.append(timeout)
+
+    def _sync_then_raise(*a, **k):
+        s._sync(timeout=1.5)   # what _maybe_sync_for_read()/write paths do
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(s, "_seed_scores", _sync_then_raise)
+    with pytest.raises(RuntimeError):
+        s.recall("Something")
+    assert s._pending_sync is None, (
+        "a failed call left _pending_sync set for an unrelated later call "
+        "to drain (#105)")
+    assert calls, "the failed call's own deferred sync was never performed (#105)"
+
+
 def test_import_records_skips_bad_record_and_keeps_store_writable():
     out = make_store().import_records([
         {"type": "project", "title": 5, "body": None, "tags": 3},
@@ -3323,8 +3397,11 @@ def test_import_records_does_one_deferred_sync_not_one_per_inner_call():
 def test_locked_exception_partway_through_releases_lock_and_resets_depth():
     """A wrapped method that does some work (queuing a sync) and then raises
     must still unwind cleanly: the lock released and _lock_depth back to 0,
-    with no exception escaping from the depth bookkeeping itself. The sync
-    queued before the failure must not fire for this failed call."""
+    with no exception escaping from the depth bookkeeping itself. #105
+    follow-up: the sync queued before the failure must still fire for this
+    same failed call - not get silently dropped (leaving _pending_sync set
+    for some later, unrelated call to drain instead, using a timeout/safety
+    flag that was never its own)."""
     from tether.store import _locked
 
     calls = []
@@ -3345,7 +3422,9 @@ def test_locked_exception_partway_through_releases_lock_and_resets_depth():
         partial_then_raise(s)
 
     assert s._lock_depth == 0
-    assert calls == [], "sync queued before the exception must not have fired"
+    assert calls == [2.0], (
+        "sync queued before the exception should still fire for this call, "
+        "not leak into a later unrelated call's drain (#105)")
 
     # Prove the lock is actually free - not left held by the failed call -
     # both directly and via another thread's call not blocking.
