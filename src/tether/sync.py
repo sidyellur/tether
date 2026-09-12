@@ -55,17 +55,38 @@ with deltas noted):
     primary left one blocked thread per write (`tether import` of a 500-record
     backup spawned 500 of them), all calling `.sync()` concurrently on the
     same connection. `_open_replica` now starts exactly one daemon worker
-    thread per connection, lazily on the first `sync_now` call. The worker
-    loops on a `threading.Event` ("wake"): when set, it clears the event,
-    calls `_safe_sync(conn)`, then increments a completion counter under a
-    `threading.Condition` and notifies. `sync_now(timeout)` reads the current
-    counter, sets `wake`, and waits on the condition for the counter to move
-    past what it saw, bounded by `timeout`. Concurrent callers arriving while
-    a sync is in flight all set the same (already-set) event and wait on the
-    same condition, so at most one `.sync()` runs at a time and their
-    requests coalesce onto whichever sync finishes next. The write-path
-    contract is unchanged: every write still requests a sync and waits up to
-    `timeout` for it.
+    thread per connection, lazily on the first `sync_now` call.
+
+    #132 (a follow-up on #109 itself): the first version of the
+    worker coalesced a caller arriving WHILE a sync was already in flight
+    onto that in-flight round unconditionally - correct when the caller's
+    request predates the round it joins, wrong when it doesn't. A write
+    that commits AFTER a sync has already started reading/pushing isn't
+    necessarily reflected by that round, so a `sync_now()` called right
+    after such a write, finding `in_flight` True, would return "done" as
+    soon as the ALREADY-RUNNING round finished - without ever causing a
+    round that started at-or-after its own request. No follow-up was ever
+    scheduled, so that write's data was never guaranteed synced by the
+    call meant to guarantee it - silently contradicting the write-path
+    contract this docstring already promised ("every write still requests
+    a sync and waits ... for it").
+
+    Fixed with a generation counter (`requested`, bumped once per
+    `sync_now()` call) instead of a plain in-flight flag. The worker
+    snapshots `requested` into `started_serving` the instant it begins a
+    round - which is exactly the set of calls that round can causally
+    satisfy, since none of their writes could have raced ahead of a
+    snapshot taken after they were counted - and advances the completion
+    counter to that snapshot when the round finishes, so a caller only
+    returns once a round has started NO EARLIER than its own request. If
+    more requests land while a round is running, the worker immediately
+    starts another round for them the moment the current one finishes,
+    rather than waiting for a fresh caller to show up and re-trigger it.
+    Callers whose requests land together, before any round has yet
+    snapshotted them, still coalesce onto that one shared round - the
+    efficiency property #109 exists for is unaffected; what changes is
+    only the case where a request genuinely arrives after a round is
+    already under way.
 """
 
 import sqlite3
@@ -158,41 +179,47 @@ def _open_replica(db_path, sync_cfg):
     if errors:
         raise errors[0]
 
-    # One coalescing worker per connection (#109), started lazily on the
-    # first sync_now() call, instead of a new thread per call. See the
-    # module docstring's "SYNC WORKER" note for the design.
+    # One coalescing worker per connection (#109/#132), started lazily on the
+    # first sync_now() call, instead of a new thread per call. See the module
+    # docstring's "SYNC WORKER" note for the design and why a plain in-flight
+    # flag (the #109 original) isn't enough on its own.
     wake = threading.Event()
     condition = threading.Condition()
-    counter = 0
+    counter = 0          # rounds completed, as a generation number
+    requested = 0         # sync_now() calls made, as a generation number
     worker_started = False
-    in_flight = False
 
     def worker():
-        nonlocal counter, in_flight
+        nonlocal counter, requested
         while True:
             wake.wait()
             with condition:
                 wake.clear()
-                in_flight = True
+                # Everything requested up to THIS instant is what this round
+                # can causally satisfy - a request that lands after this
+                # snapshot raced in too late to be reflected by the sync
+                # that's about to run.
+                started_serving = requested
             _safe_sync(conn)
             with condition:
-                in_flight = False
-                counter += 1
+                counter = started_serving
+                if requested > counter:
+                    # Something new landed while this round was running - go
+                    # again immediately rather than waiting for another
+                    # caller to show up and re-trigger it.
+                    wake.set()
                 condition.notify_all()
 
     def sync_now(timeout=2.0):
-        nonlocal worker_started
+        nonlocal worker_started, requested
         with condition:
             if not worker_started:
                 threading.Thread(target=worker, daemon=True).start()
                 worker_started = True
-            seen = counter
-            # A caller arriving while a sync is already running will be
-            # satisfied when it completes, so don't schedule a redundant
-            # extra round on top of it - only wake the worker when it's idle.
-            if not in_flight:
-                wake.set()
-            condition.wait_for(lambda: counter > seen, timeout=timeout)
+            requested += 1
+            target = requested
+            wake.set()
+            condition.wait_for(lambda: counter >= target, timeout=timeout)
 
     return conn, sync_now, "replica"
 
