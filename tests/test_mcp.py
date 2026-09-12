@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 
 import pytest
@@ -355,7 +356,7 @@ def test_mcp_status_resource(tmp_path):
                 assert data["sync_mode"] == "local"
                 assert data["memory_count"] == 1
                 assert data["edge_count"] == 0
-                assert data["db_path"] == str(tmp_path / "mem.db")
+                assert "db_path" not in data  # #106: agent has no use for it
 
     asyncio.run(run())
 
@@ -385,7 +386,7 @@ def test_status_resource_reports_semantic_and_sync_config(monkeypatch, tmp_path)
         assert data["embedding_model"] == "fake-3d"
         assert data["sync_mode"] == "local"
         assert data["memory_count"] == 0
-        assert data["db_path"] == str(tmp_path / "m.db")
+        assert "db_path" not in data  # #106: agent has no use for it
     finally:
         server._store = None
         server._sync_mode = None
@@ -602,5 +603,64 @@ def test_memory_index_footer_names_the_loaded_model(monkeypatch, tmp_path):
         lines = server.memory_index().splitlines()
         assert lines[0] == "[project] #1 t"
         assert lines[-1] == "# tether: semantic on (fake/model-1) | sync local"
+    finally:
+        server._store = None
+
+
+def test_remember_masks_raw_exception_text(monkeypatch, tmp_path):
+    """#106: an incidental exception (sqlite/libsql internals, OS errors, ...)
+    must never reach the agent verbatim - it can carry absolute file paths
+    and SQL fragments. The tool should mask it with a generic message and log
+    the real one to stderr instead."""
+    from tether import server
+
+    _hermetic_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")
+    server._store = None
+
+    def boom(self, *a, **k):
+        raise sqlite3.OperationalError(
+            "unable to open database file /home/someuser/secret/memory.db")
+
+    from tether.store import Store
+    monkeypatch.setattr(Store, "remember", boom)
+    try:
+        result = server.remember("user", "t", "b")
+        assert "error" in result
+        assert "/home/someuser" not in result["error"]
+        assert "database file" not in result["error"]
+        assert "OperationalError" in result["error"]
+    finally:
+        server._store = None
+
+
+def test_remember_passes_through_deliberate_valueerror(monkeypatch, tmp_path):
+    """#106: Store raises ValueError specifically for agent-facing messages
+    (bad type, bad id, disabled feature, ...) - those must come through
+    unmasked, verbatim."""
+    from tether import server
+
+    _hermetic_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")
+    server._store = None
+    try:
+        result = server.remember("bogus", "t", "b")
+        assert "error" in result
+        assert "type must be one of" in result["error"]
+        assert "bogus" in result["error"]
+    finally:
+        server._store = None
+
+
+def test_status_resource_has_no_db_path_key(monkeypatch, tmp_path):
+    """#106: the agent has no legitimate use for the absolute DB path."""
+    from tether import server
+
+    _hermetic_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")
+    server._store = None
+    try:
+        data = json.loads(server.status())
+        assert "db_path" not in data
     finally:
         server._store = None

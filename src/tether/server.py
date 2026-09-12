@@ -12,6 +12,7 @@ Run it as an MCP stdio server:
 """
 
 import json
+import sys
 import threading
 
 try:
@@ -28,6 +29,23 @@ from .store import Store
 from .sync import open_connection
 
 mcp = MCPServer("tether")
+
+
+def _err(e: Exception) -> dict:
+    """Turn a caught exception into an agent-facing {"error": ...} dict.
+
+    `Store` raises `ValueError` specifically for messages meant to reach the
+    agent (bad type, bad id, a disabled feature, the restore() id-clash
+    message) - those are safe, and useful, to pass through verbatim. Anything
+    else (sqlite/libsql internals, OS errors, ...) can carry absolute file
+    paths or SQL fragments that have no business reaching the model, so it is
+    logged to stderr for the operator and replaced with a generic message.
+    """
+    if isinstance(e, ValueError):
+        return {"error": str(e)}
+    sys.stderr.write(f"tether: {type(e).__name__}: {e}\n")
+    return {"error": f"{type(e).__name__}: operation failed; see server log"}
+
 
 _store = None
 _sync_mode = None
@@ -123,17 +141,21 @@ def remember(type: str, title: str, body: str,
             is a poor reason to lose the memory itself.
         crystallizes: optional list of source memory ids this memory abstracts;
             links it over them as a crystallized principle (needs TETHER_CRYSTALLIZE).
+            Non-integer values, this memory's own id, and ids that don't
+            resolve to a current memory are silently dropped and reported
+            back rather than applied.
 
     Returns {"id", "action"} where action is "created", "updated", or (with
     TETHER_CONSOLIDATE on) "consolidated" - a near-duplicate was superseded.
     Also includes "dropped_links": [...] when one or more `links` ids didn't
-    resolve to an existing memory.
+    resolve to an existing memory, and "dropped_crystallizes" (the invalid
+    values from `crystallizes`) when anything there was dropped.
     """
     try:
         return _get_store().remember(type, title, body, tags=tags, links=links,
                                      crystallizes=crystallizes)
     except Exception as e:
-        return {"error": str(e)}
+        return _err(e)
 
 
 @mcp.tool()
@@ -188,7 +210,7 @@ def recall(query: str = "", type: str | None = None, limit: int = 20,
             query, type=type, limit=limit, budget=budget, session=session,
             tags=tags, full=full)}
     except Exception as e:
-        return {"error": str(e)}
+        return _err(e)
 
 
 @mcp.tool()
@@ -197,7 +219,7 @@ def link(id_a: int, id_b: int) -> dict:
     try:
         return _get_store().link(id_a, id_b)
     except Exception as e:
-        return {"error": str(e)}
+        return _err(e)
 
 
 def dismiss_cluster(id_a: int, id_b: int) -> dict:
@@ -210,7 +232,7 @@ def dismiss_cluster(id_a: int, id_b: int) -> dict:
     try:
         return _get_store().dismiss_cluster(id_a, id_b)
     except Exception as e:
-        return {"error": str(e)}
+        return _err(e)
 
 
 @mcp.tool()
@@ -223,7 +245,7 @@ def forget(id: int) -> dict:
     try:
         return _get_store().forget(id)
     except Exception as e:
-        return {"error": str(e)}
+        return _err(e)
 
 
 @mcp.resource("tether://memory-index")
@@ -240,7 +262,7 @@ def memory_index() -> str:
         store = _get_store()
         return f"{store.boot_index()}\n{_status_line(store)}"
     except Exception as e:
-        return f"(memory index unavailable: {e})"
+        return f"(memory index unavailable: {_err(e)['error']})"
 
 
 def _status_line(store: Store) -> str:
@@ -280,10 +302,9 @@ def status() -> str:
             "project": store._project,
             "memory_count": memory_count,
             "edge_count": edge_count,
-            "db_path": str(config.db_path()),
         })
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return json.dumps(_err(e))
 
 
 def crystallization() -> str:
@@ -296,7 +317,7 @@ def crystallization() -> str:
     try:
         return json.dumps({"candidates": _get_store().crystallization_candidates()})
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return json.dumps(_err(e))
 
 
 def _register_crystallization_surface() -> bool:
