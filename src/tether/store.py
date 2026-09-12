@@ -1704,9 +1704,25 @@ class Store:
             # (which pulled every seed's raw tags into Python to filter).
             matching = self._ids_matching_tags(list(seeds), tag_list)
             seeds = {mid: s for mid, s in seeds.items() if mid in matching}
+        # #124 follow-up (#126): gate on `seeds` here, before anything below
+        # can write. resolve_session() below always writes two `meta` rows
+        # (session bookkeeping) whether or not this recall matches anything;
+        # this used to gate AFTER that write instead of before it, so a
+        # no-hit query left that write's transaction open - never committed,
+        # since the early return skipped the _commit() at the end of this
+        # method - holding the WAL write lock until some unrelated later
+        # call happened to commit or roll back. Nothing between here and
+        # that write path needs `seeds` to be non-empty: the graph-disabled
+        # branch below has its own trivial empty-seeds result, and the
+        # associative path's `sid`/`activated`/session_activation() are only
+        # needed to build the result this same emptiness would discard - so
+        # hoisting the check costs nothing and closes the leak. (a query
+        # with no real hits must still never surface a session's primed
+        # context on its own - #46 - which this preserves: the check is on
+        # `seeds` before priming exists at all, not after.)
+        if not seeds:
+            return []
         if not self._graph.enabled:
-            if not seeds:
-                return []
             order = [mid for mid, _ in sorted(
                 seeds.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
             return self._excerpt_hits(
@@ -1720,10 +1736,6 @@ class Store:
         activated = dict(seeds)
         for mid, a in self._graph.session_activation(sid).items():
             activated[mid] = activated.get(mid, 0.0) + _PRIMING_WEIGHT * a
-        # gate on `seeds`, not the union with primed `activated` - a query with
-        # no real hits must not surface a session's primed context (#46).
-        if not seeds:
-            return []
         activation, receipts = self._graph.spread(activated, budget, type)
         # protect-head / re-rank-tail. The #15 seed floor bounds `seeds` to
         # genuinely-relevant hits, so the head is the real direct matches. Lock
