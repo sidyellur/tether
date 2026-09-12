@@ -57,10 +57,22 @@ CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);
 # (remember()'s upsert, import_records, restore(), the CLI) without any of
 # them having to know memory_tags exists. The json_each trick below turns
 # "a,b,c" into the JSON array ["a","b","c"] by wrapping it in quotes and
-# swapping the comma separators for `","` - so a literal double-quote inside
-# a tag would break the quoting (and could smuggle extra "tags" into the
-# array). _tags_to_str() strips embedded double-quotes from every tag at
-# write time specifically to keep this safe; see the comment there.
+# swapping the comma separators for `","`.
+#
+# #124: `"`, `\`, tab, newline and CR are all unsafe inside that wrapped
+# string - a `"` breaks the quoting outright, and the other three make the
+# wrapped text invalid JSON, which raised `malformed JSON` straight out of
+# whatever write fired the trigger. _tags_to_str/_sanitize_tag strip all
+# five from every tag at write time (see _TAG_UNSAFE_CHARS) so a value built
+# through remember() is always safe - but _tags_json_array_sql() ALSO
+# sanitizes inline, in SQL, because two things write `memories.tags` without
+# going through _tags_to_str: a raw import/hand-edit of the DB file, and any
+# row that predates this fix. Backfilling those (_backfill_memory_tags) must
+# not crash on tags that were never sanitized - see #124's issue for the
+# concrete case: opening any pre-existing DB with one bad tag made the
+# server fail to start entirely. One shared SQL fragment, used by both the
+# triggers and the backfill, keeps the two from drifting apart the way the
+# Python (_sanitize_tag) and SQL (this file, pre-#124) sides once did.
 #
 # A soft-delete (forget()) only ever touches valid_to, never tags, so it
 # does not fire memories_tags_au and a forgotten row's memory_tags entries
@@ -70,16 +82,27 @@ CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);
 # naturally invisible until restore() clears valid_to again. Only a real
 # DELETE (purge(), or a superseded row process never issues) should drop
 # them, which memories_tags_ad handles.
-_TAGS_TRIGGER_SCHEMA = """
+def _tags_json_array_sql(tags_expr: str) -> str:
+    """SQL expression turning a `memories.tags`-shaped column/value into the
+    JSON array json_each() can walk, sanitizing inline first (see above)."""
+    sanitized = tags_expr
+    for ch, esc in (('"', ''), ('\\', ''), ('char(9)', ''),
+                    ('char(10)', ''), ('char(13)', '')):
+        lit = f"'{ch}'" if ch in ('"', "\\") else ch
+        sanitized = f"replace({sanitized}, {lit}, '{esc}')"
+    return f"""'["' || replace({sanitized}, ',', '","') || '"]'"""
+
+
+_TAGS_TRIGGER_SCHEMA = f"""
 CREATE TRIGGER IF NOT EXISTS memories_tags_ai AFTER INSERT ON memories BEGIN
     INSERT OR IGNORE INTO memory_tags(memory_id, tag)
-    SELECT new.id, trim(value) FROM json_each('["' || replace(new.tags, ',', '","') || '"]')
+    SELECT new.id, trim(value) FROM json_each({_tags_json_array_sql("new.tags")})
     WHERE trim(value) != '';
 END;
 CREATE TRIGGER IF NOT EXISTS memories_tags_au AFTER UPDATE OF tags ON memories BEGIN
     DELETE FROM memory_tags WHERE memory_id = old.id;
     INSERT OR IGNORE INTO memory_tags(memory_id, tag)
-    SELECT new.id, trim(value) FROM json_each('["' || replace(new.tags, ',', '","') || '"]')
+    SELECT new.id, trim(value) FROM json_each({_tags_json_array_sql("new.tags")})
     WHERE trim(value) != '';
 END;
 CREATE TRIGGER IF NOT EXISTS memories_tags_ad AFTER DELETE ON memories BEGIN
@@ -135,24 +158,33 @@ def _norm(title: str) -> str:
     return re.sub(r"\s+", " ", title.strip().lower())
 
 
-def _tags_to_str(tags) -> str:
-    """Normalize tags into the stored comma-joined string.
+# #111 / #124: every character memories_tags_ai/au's json_each() trick can't
+# survive unescaped: `"` breaks the quoting outright, `\` makes the wrapped
+# string invalid JSON (SQLite's json_each then raises `malformed JSON` -
+# which propagated out of remember() and, worse, out of migrate() when a
+# pre-existing row already had one), and a raw control character (tab,
+# newline, CR) is invalid inside a JSON string per spec even though SQLite's
+# parser tolerates some of them inconsistently. _tags_to_str strips all four
+# rather than rejecting, so a cosmetic character in a tag never raises.
+_TAG_UNSAFE_CHARS = ('"', "\\", "\t", "\n", "\r")
 
-    #111: strips embedded double-quote characters from every tag (in
-    addition to the pre-existing whitespace stripping) because
-    memory_tags_ai/au (_TAGS_TRIGGER_SCHEMA) turn this string into a JSON
-    array by wrapping it in quotes and replacing "," with '","' - a literal
-    `"` inside a tag would break that quoting (and could inject a bogus
-    extra tag into memory_tags). Stripping rather than rejecting keeps
-    remember() from raising over a cosmetic character in a tag.
-    """
+
+def _sanitize_tag(t: str) -> str:
+    for ch in _TAG_UNSAFE_CHARS:
+        t = t.replace(ch, "")
+    return t.strip()
+
+
+def _tags_to_str(tags) -> str:
+    """Normalize tags into the stored comma-joined string. See
+    _TAG_UNSAFE_CHARS for why these particular characters are stripped."""
     if not tags:
         return ""
     if isinstance(tags, str):
         parts = tags.split(",")
     else:
         parts = list(tags)
-    cleaned = (t.strip().replace('"', '') for t in parts if t and t.strip())
+    cleaned = (_sanitize_tag(t) for t in parts if t and t.strip())
     return ",".join(t for t in cleaned if t)
 
 
@@ -917,8 +949,21 @@ class Store:
         writes going forward, so pre-existing rows would otherwise never get
         an entry. Gated on memory_tags being empty (never overwrites/repeats)
         and memories being non-empty (nothing to backfill from a fresh DB, so
-        `migrate()` doesn't pay this scan on every first-ever run either).
-        Uses the same JSON-array trick as the triggers, correlated per row."""
+        `migrate()` doesn't pay this scan on every first-ever run either, and
+        - concurrency-tested - stays a single round-trip statement rather
+        than a Python read-then-write that widens the window for a
+        concurrent migrate() on another connection to contend with it).
+
+        Uses the same sanitize-then-JSON-array SQL as the triggers
+        (_tags_json_array_sql), NOT raw _parse_tags-in-Python splitting: a
+        PRE-EXISTING row's tags can contain a `\\`, tab, newline or CR that
+        was never rejected before this backfill's own sanitizing shipped (or
+        by any version before #111, or by a raw import) - #124 was exactly
+        this handed unsanitized to json_each(), raising `malformed JSON` out
+        of a one-time backfill that runs unconditionally inside migrate(), so
+        opening ANY existing DB with one bad tag made the whole server fail
+        to start.
+        """
         empty_and_populated = self._conn.execute(
             "SELECT NOT EXISTS (SELECT 1 FROM memory_tags LIMIT 1) "
             "AND EXISTS (SELECT 1 FROM memories LIMIT 1)").fetchone()[0]
@@ -927,7 +972,7 @@ class Store:
         self._conn.execute(
             "INSERT OR IGNORE INTO memory_tags(memory_id, tag) "
             "SELECT m.id, trim(je.value) FROM memories m, "
-            "json_each('[\"' || replace(m.tags, ',', '\",\"') || '\"]') je "
+            f"json_each({_tags_json_array_sql('m.tags')}) je "
             "WHERE trim(je.value) != ''")
 
     def _table_exists(self, name) -> bool:

@@ -1444,6 +1444,57 @@ def test_tag_with_embedded_double_quote_is_handled_without_breaking():
     assert [h["id"] for h in hits2] == [mid]
 
 
+def test_tag_with_backslash_or_control_chars_is_handled_without_breaking(tmp_path):
+    """#124: memories_tags_ai/au build a JSON array by wrapping the raw tags
+    string in quotes - a literal backslash makes that string invalid JSON
+    (`\\U` etc. isn't a valid JSON escape), so SQLite's json_each() raised
+    `malformed JSON` straight out of remember(). A raw tab/newline/CR is
+    likewise invalid unescaped inside a JSON string. All four must be
+    stripped, not raised over, exactly like the pre-existing double-quote
+    case - and the trigger must not raise on the INSERT/UPDATE that follows.
+    """
+    for tags in (r"C:\Users\sid,plain", "path\twith\ttabs,plain",
+                 "line\nbreak,plain", "carriage\rreturn,plain"):
+        s = make_store()                    # isolate: each case gets its own store
+        mid = s.remember("user", f"T {tags!r}", "note", tags=tags)["id"]
+        stored = s._conn.execute(
+            "SELECT tags FROM memories WHERE id=?", (mid,)).fetchone()[0]
+        assert not any(c in stored for c in ("\\", "\t", "\n", "\r")), tags
+        assert "plain" in stored.split(",")
+        assert [h["id"] for h in s.recall("", tags="plain")] == [mid]
+        # re-remembering (the UPDATE trigger path) must not raise either
+        s.remember("user", f"T {tags!r}", "refined note", tags=tags)
+
+
+def test_migrate_does_not_crash_on_legacy_tags_with_unsafe_characters(tmp_path):
+    """#124: a DB written before memory_tags/its triggers existed (or by a
+    raw import, or hand-edited) can already have a `tags` value containing a
+    backslash/tab/newline that _tags_to_str never used to strip - there was
+    no trigger yet to reject or sanitize it at write time. On first upgrade,
+    _backfill_memory_tags runs unconditionally inside migrate() over every
+    existing row, so it must not crash the whole server on that legacy data -
+    and must still index whatever tags it can extract from it."""
+    from tether.store import _TABLE_SCHEMA
+
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(_TABLE_SCHEMA)      # bare `memories` table, no tags
+    now = "2026-01-01T00:00:00+00:00"      # trigger/memory_tags yet (pre-#111)
+    conn.execute(
+        "INSERT INTO memories(type, title, title_norm, body, tags, links, "
+        "created_at, updated_at, device_id) "
+        "VALUES ('user','Legacy','legacy','note',?, '[]', ?, ?, '')",
+        (r"bad\path,plain", now, now))
+    conn.commit()
+    conn.close()                           # fully reopen, as a real restart would
+
+    conn2 = sqlite3.connect(path)
+    s2 = Store(conn2, "d", lambda *a, **k: None)
+    s2.migrate()                           # must not raise (first-ever migrate)
+    hits = s2.recall("", tags="plain")
+    assert [h["title"] for h in hits] == ["Legacy"]
+
+
 def test_crystallized_hub_does_not_bury_direct_hit():
     # #25 back-door: a max-fan-out principle must not outrank a query's own hit.
     pytest.importorskip("numpy")
