@@ -1086,14 +1086,15 @@ class Store:
                 return None
             q = np.frombuffer(emb, dtype="<f4")
             sims = mat @ q                       # both unit-norm, so dot == cosine
-            best_id, best_sim = None, -1.0
-            for i, mid in enumerate(ids):
-                if types[i] != type:
-                    continue
-                sim = float(sims[i])
-                if sim > best_sim:
-                    best_id, best_sim = mid, sim
-            return best_id if best_sim >= self._dedup_threshold else None
+            mask = np.asarray(types) == type
+            if not mask.any():
+                return None
+            # np.argmax returns the FIRST index attaining the max, matching the
+            # old loop's strict `sim > best_sim` (so a tie keeps the earlier,
+            # lower-id row - ids is sorted ascending).
+            masked = np.where(mask, sims, -np.inf)
+            i = int(masked.argmax())
+            return ids[i] if masked[i] >= self._dedup_threshold else None
         except Exception:
             return None
 
@@ -1132,16 +1133,16 @@ class Store:
             all_ids, mat, all_types = self._embedding_matrix()
             if mat is None:
                 return []
-            if type is not None:
-                keep = [i for i, t in enumerate(all_types) if t == type]
-                if not keep:
-                    return []
-                ids = [all_ids[i] for i in keep]
-                mat = mat[keep]
-            else:
-                ids = all_ids
             # stored vectors and q are unit-normalized, so dot == cosine
             sims = mat @ q
+            if type is not None:
+                # #107: mask out non-matching rows in the similarity vector
+                # instead of copying a filtered slice of `mat` - masked rows
+                # sit at -inf, well below `_seed_floor` (a cosine in [0,1], so
+                # -inf >= floor is always False), so they drop out of the
+                # floor filter below exactly as if they had been excluded.
+                sims = np.where(np.asarray(all_types) == type, sims, -np.inf)
+            ids = all_ids
             # #15: only genuinely-similar rows seed the walk. Rows below the
             # floor are left for the graph to reach by edge, not seeded as
             # near-tied noise. (floor 0 -> pre-#15 behavior: keep the whole store.)
@@ -1163,10 +1164,17 @@ class Store:
                  for r in rows}
         return [by_id[i] for i in ids if i in by_id]
 
-    def _seed_scores(self, query, type) -> dict:
+    def _seed_scores(self, query, type, tags_out=None) -> dict:
         """The v0.2 hybrid recall scoring (FTS5 + semantic RRF, gentle recency,
         optional decay) as a {id: score} map - the seeds an associative walk
-        starts from."""
+        starts from.
+
+        When `self._project` is set, the same-project bonus below already
+        fetches every seed's tags. `tags_out`, if given, is populated with
+        that {id: tags} map (over the same id set `scores` ends up keyed by)
+        so a caller doing its own tag filtering right after (recall()'s tag
+        filter) can reuse it instead of re-querying the same ids (#107).
+        """
         fts_ids = self._fts_ids(query, type)
         vec_ids = self._vector_ids(query, type)
         lists = [fts_ids] + ([vec_ids] if vec_ids else [])
@@ -1180,7 +1188,10 @@ class Store:
         # #92: same-project hits edge out otherwise-equal hits from elsewhere
         if self._project:
             tag = _project_tag(self._project)
-            for mid, tags_s in self._tags_of_many(list(scores)).items():
+            tags_by_id = self._tags_of_many(list(scores))
+            if tags_out is not None:
+                tags_out.update(tags_by_id)
+            for mid, tags_s in tags_by_id.items():
                 if _tags_match(tags_s, [tag]):
                     scores[mid] += _PROJECT_BONUS
         # optional exponential time-decay
@@ -1251,9 +1262,13 @@ class Store:
                 return []
             return self._excerpt_hits(
                 self._recall_by_tags(type, tag_list, limit), query, full)
-        seeds = self._seed_scores(query, type)
+        tags_out = {}
+        seeds = self._seed_scores(query, type, tags_out=tags_out)
         if tag_list:
-            tags_by_id = self._tags_of_many(list(seeds))
+            # #107: when a project is set, _seed_scores already fetched every
+            # seed's tags for the same-project bonus - reuse that dict rather
+            # than re-querying the same ids here.
+            tags_by_id = tags_out if self._project else self._tags_of_many(list(seeds))
             seeds = {mid: s for mid, s in seeds.items()
                      if _tags_match(tags_by_id.get(mid, ""), tag_list)}
         if not self._graph.enabled:

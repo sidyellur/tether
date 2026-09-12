@@ -244,6 +244,33 @@ def test_touch_session_lays_hebbian_edges():
     assert w == 3                                   # pairs (1,2),(1,3),(2,3)
 
 
+def test_touch_session_ttl_delete_is_scoped_to_the_touched_session():
+    # #107: touch_session's trailing TTL delete used to be
+    # `DELETE FROM session_members WHERE activation < ?` with no session_id
+    # filter, so touching ONE session swept every session's decayed rows.
+    # Only the touched session's rows can have newly crossed the TTL in this
+    # call, so the delete must be scoped to it.
+    from tether.graph import SESSION_TTL_ACTIVATION
+    g = make_graph()
+    now = _now()
+    # session A already has a row below the TTL threshold (as if it decayed
+    # there on an earlier touch_session call).
+    g._conn.execute(
+        "INSERT INTO session_members VALUES('A', 1, ?, ?)",
+        (SESSION_TTL_ACTIVATION - 0.01, now))
+    # session B has a row below the TTL threshold too, but B is never touched
+    # in this test - an unscoped global delete would remove it anyway.
+    g._conn.execute(
+        "INSERT INTO session_members VALUES('B', 2, ?, ?)",
+        (SESSION_TTL_ACTIVATION - 0.01, now))
+    g.touch_session("A", [])                        # only A is touched
+    remaining = {(r[0], r[1]) for r in g._conn.execute(
+        "SELECT session_id, memory_id FROM session_members").fetchall()}
+    assert remaining == {("B", 2)}, (
+        "touch_session('A', ...) deleted a row belonging to session B - "
+        "the TTL delete is not scoped to the touched session")
+
+
 def test_touch_session_bump_is_rank_weighted_not_uniform():
     # B1 root cause: a uniform bump over the whole returned list makes
     # activation carry no information (mass ties -> memory_id tie-break decides

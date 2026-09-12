@@ -395,8 +395,8 @@ class Graph:
                     self._upsert_edge(active[i], active[j], "hebbian",
                                       HEBBIAN_INCREMENT, now, mode="add")
             self._conn.execute(
-                "DELETE FROM session_members WHERE activation < ?",
-                (SESSION_TTL_ACTIVATION,))
+                "DELETE FROM session_members WHERE session_id=? AND activation < ?",
+                (session_id, SESSION_TTL_ACTIVATION))
         except Exception:
             return
 

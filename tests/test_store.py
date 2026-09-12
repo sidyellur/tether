@@ -1797,6 +1797,31 @@ def test_type_filter_is_honored_through_the_cache():
     assert types <= {"project"}, f"type filter leaked: {types}"
 
 
+def test_vector_ids_typed_matches_untyped_filtered_in_python():
+    """#107: the typed path now masks the full similarity vector instead of
+    copying a filtered slice of the matrix. Cross-check it against the naive
+    reference - filter the untyped call's result down to the target type in
+    Python - rather than eyeballing the optimized path."""
+    s = _cache_store(seed_floor=0.0)   # keep every embedded row as a candidate
+    for t, title, body in [
+            ("user", "Car", "I drive my automobile to work"),
+            ("project", "Vehicles", "a project about driving a car"),
+            ("user", "Pizza", "I eat pizza at every meal"),
+            ("reference", "Driving", "driving a vehicle safely"),
+            ("project", "Cooking", "cooking food is a meal skill"),
+            ("user", "Tests", "pytest runs the python tests")]:
+        s.remember(t, title, body)
+
+    type_of = {r[0]: r[1] for r in s._conn.execute(
+        "SELECT id, type FROM memories").fetchall()}
+    for query in ("vehicle", "food", "code", "automobile meal", "car"):
+        untyped = s._vector_ids(query, None)
+        for type_ in ("user", "project", "reference"):
+            typed = s._vector_ids(query, type_)
+            expected = [i for i in untyped if type_of[i] == type_]
+            assert typed == expected, f"{query!r}/{type_!r}: {typed} != {expected}"
+
+
 def test_consolidation_swaps_the_superseded_row_in_the_cache():
     s = _cache_store(consolidate=True, dedup_threshold=0.9)
     old = s.remember("user", "Car", "I drive my automobile")["id"]
@@ -1805,6 +1830,31 @@ def test_consolidation_swaps_the_superseded_row_in_the_cache():
     assert r["action"] == "consolidated"
     ids, _mat, _types = s._emb_cache
     assert r["id"] in ids and old not in ids
+
+
+def test_find_near_duplicate_tie_keeps_lower_id():
+    """#107: _find_near_duplicate was vectorized with np.argmax, replacing a
+    Python loop whose strict `sim > best_sim` kept the FIRST (lowest-id) row
+    on an exact tie. np.argmax also returns the first occurrence of the max,
+    but this proves it rather than assumes it: two same-type memories with
+    numerically identical embeddings, both above the dedup threshold, must
+    resolve to the lower id."""
+    s = _cache_store(dedup_threshold=0.9)
+    first = s.remember("user", "A", "car")["id"]     # embeds to axis0 (1,0,0)
+    second = s.remember("user", "B", "car")["id"]    # identical embedding
+    assert first < second
+    q = s._embed_or_none("Q", "car")                 # same (1,0,0) vector again
+    assert s._find_near_duplicate("user", q) == first
+
+
+def test_find_near_duplicate_respects_type_and_threshold():
+    s = _cache_store(dedup_threshold=0.9)
+    s.remember("user", "A", "car")
+    s.remember("project", "B", "car")                # same vector, different type
+    q = s._embed_or_none("Q", "car")
+    assert s._find_near_duplicate("reference", q) is None   # no rows of this type
+    far = s._embed_or_none("Q", "pizza food")         # orthogonal axis -> sim ~ 0
+    assert s._find_near_duplicate("user", far) is None       # below threshold
 
 
 # --- #81: the cache is maintained incrementally, not dropped per write ------
@@ -2116,6 +2166,25 @@ def test_recall_project_bonus_never_beats_a_clearly_better_match():
                         tags="proj:other")["id"]
     hits = s.recall("pytest test suite CI", budget=0)
     assert hits[0]["id"] == theirs
+
+
+def test_recall_project_bonus_and_tag_filter_together():
+    """#107: _seed_scores' same-project bonus and recall()'s tag filter both
+    fetch tags for the seed set; the reuse must not change results. Same
+    matches and same order as the equal-match project-bonus case above, with
+    a tag filter active in the same call."""
+    s = make_project_store()
+    ours = s.remember("project", "Ours", "pytest runs the suite", tags="docs")["id"]
+    theirs = s.remember("project", "Theirs", "pytest runs the suite",
+                        tags="docs,proj:other")["id"]
+    # a memory with the same tag but a different project bonus target, to
+    # prove the tag filter still applies on top of (not instead of) the bonus
+    other_tag = s.remember("project", "Unrelated", "pytest runs the suite",
+                           tags="other-tag")["id"]
+    hits = s.recall("pytest runs the suite", tags="docs", budget=0)
+    ids = [h["id"] for h in hits]
+    assert other_tag not in ids                     # tag filter still excludes it
+    assert ids[:2] == [ours, theirs]                 # project bonus still wins the tie
 
 
 # --- #38: concurrent link() must not lose updates ----------------------------
