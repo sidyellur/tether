@@ -209,9 +209,16 @@ def test_sync_now_does_not_spawn_a_thread_per_call(tmp_path, monkeypatch):
     block_forever.set()  # release the blocked worker so nothing lingers
 
 
-def test_sync_now_coalesces_concurrent_callers(tmp_path, monkeypatch):
-    """Two callers arriving while a sync is in flight must not trigger two
-    conn.sync() calls - they coalesce onto the one that's already running."""
+def test_sync_now_caller_arriving_mid_flight_gets_its_own_round(tmp_path, monkeypatch):
+    """#132: a caller whose sync_now() lands WHILE a round is already running
+    must not be satisfied by that round alone - its own request arrived too
+    late to be reflected by a sync that had already started. It must cause a
+    fresh, guaranteed round once the in-flight one finishes, rather than
+    silently being told "done" by a round that never saw its write.
+
+    Pre-#132 this coalesced onto the in-flight round for free (calls["n"]
+    stayed at 2 - exactly one more sync() beyond the initial probe) and never
+    scheduled the follow-up; that was the bug, not the fix."""
     import time
 
     entered = threading.Event()
@@ -250,14 +257,85 @@ def test_sync_now_coalesces_concurrent_callers(tmp_path, monkeypatch):
 
     t2 = threading.Thread(target=caller)
     t2.start()
-    time.sleep(0.2)  # let t2 register against the same in-flight sync
+    time.sleep(0.2)  # let t2 register while t1's round is still in flight
 
-    release.set()
+    release.set()   # release t1's round; its own sync() call unblocks...
+    # ...but t2's follow-up round immediately starts a SECOND sync() call,
+    # which also blocks on `release` (already set, so it returns at once) -
+    # give both threads a moment to actually finish.
     t1.join(2.0)
     t2.join(2.0)
 
     assert results == [True, True]
-    assert calls["n"] == 2  # exactly one more sync() beyond the initial probe
+    assert calls["n"] == 3, (
+        "t2's mid-flight request was satisfied without its own sync() round")
+
+
+def test_sync_now_requests_queued_during_a_round_still_coalesce(tmp_path, monkeypatch):
+    """The efficiency property #109 exists for is unaffected by #132: any
+    number of sync_now() calls made WHILE a round is running (a burst of
+    writes queued up behind one slow round) still coalesce onto a single
+    follow-up round - only when they land is what matters, and "during a
+    round already running" is the case the worker cannot have snapshotted
+    yet, so its NEXT snapshot naturally captures all of them together.
+    Deterministic by construction: round 1 is held open with an Event, so
+    t1/t2 are guaranteed to queue while the worker is blocked inside
+    conn.sync() and hasn't taken its next snapshot yet - unlike true
+    simultaneity, which would race the worker's own scheduling."""
+    import time
+
+    round1_entered = threading.Event()
+    release_round1 = threading.Event()
+    calls = {"n": 0}
+
+    class Conn:
+        def sync(self):
+            calls["n"] += 1
+            if calls["n"] == 2:            # round 1 (call 1 is the probe)
+                round1_entered.set()
+                release_round1.wait()
+            # round 2 (call 3): returns immediately, nothing held it back
+
+        def close(self):
+            pass
+
+    def connect(database, **kwargs):
+        return Conn()
+
+    _fake_replica_client(monkeypatch, connect)
+
+    cfg = SyncConfig("libsql://x.turso.io", "tok")
+    _conn, sync_now, mode = sync.open_connection(tmp_path / "m.db", cfg)
+    assert calls["n"] == 1
+
+    results = []
+
+    def caller():
+        sync_now(2.0)
+        results.append(True)
+
+    t0 = threading.Thread(target=caller)   # triggers round 1
+    t0.start()
+    assert round1_entered.wait(2.0), "round 1 never started"
+
+    # t1 and t2 both queue up WHILE round 1 is held open - guaranteed to land
+    # before the worker's next snapshot, since it can't take one until round
+    # 1's conn.sync() (blocked on release_round1) returns.
+    t1 = threading.Thread(target=caller)
+    t2 = threading.Thread(target=caller)
+    t1.start()
+    t2.start()
+    time.sleep(0.3)   # give both a moment to reach their wait_for() and queue up
+
+    release_round1.set()
+    t0.join(2.0)
+    t1.join(2.0)
+    t2.join(2.0)
+
+    assert results == [True, True, True]
+    assert calls["n"] == 3, (
+        f"queued-together requests triggered {calls['n'] - 2} follow-up "
+        "rounds instead of coalescing onto 1")
 
 
 def test_probe_timeout_closes_the_abandoned_connection(tmp_path, monkeypatch):
