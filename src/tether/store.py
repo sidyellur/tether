@@ -359,21 +359,37 @@ def _locked(method):
     code did (each nested `_sync()` used to fire immediately, but always
     inside the SAME outer lock, so only the last one's timeout was ever
     actually waited on in serial before the lock was released anyway).
+
+    #105 follow-up: `method` can raise AFTER already recording a pending
+    sync - a read that calls `_maybe_sync_for_read()` up front and then
+    fails further down, say. The snapshot-and-clear step used to live after
+    the `try/finally`, so an exception skipped straight past it: the flags
+    stayed set, this call's own deferred wait never ran, and the next
+    unrelated `_locked` call drained the STALE `_pending_sync` instead -
+    performing (or skipping, per its `_safe` flag) a sync wait that belongs
+    to a call it has nothing to do with. The snapshot-and-clear now happens
+    in the `finally` itself, so it runs whether or not `method` raised;
+    `exc`, captured explicitly, is re-raised only after the deferred wait
+    below has had its chance to run, preserving the original exception (and
+    its traceback) for the caller.
     """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
+        exc = None
+        pending = pending_safe = None
         with self._lock:
             self._lock_depth += 1
             try:
                 result = method(self, *args, **kwargs)
+            except Exception as e:
+                exc = e
             finally:
                 self._lock_depth -= 1
-            pending = pending_safe = None
-            if self._lock_depth == 0:
-                pending = self._pending_sync
-                pending_safe = self._pending_sync_safe
-                self._pending_sync = None
-                self._pending_sync_safe = False
+                if self._lock_depth == 0:
+                    pending = self._pending_sync
+                    pending_safe = self._pending_sync_safe
+                    self._pending_sync = None
+                    self._pending_sync_safe = False
         # Outside `with self._lock` from here on: other threads' @_locked
         # calls can now acquire the lock and do their DB work while this
         # thread waits on the network below.
@@ -390,6 +406,8 @@ def _locked(method):
                     pass
             else:
                 self._sync_now(pending)
+        if exc is not None:
+            raise exc
         return result
     return wrapper
 
@@ -867,11 +885,23 @@ class Store:
         Store at a time - this can never discard another caller's in-flight
         work, only the failed call's own half-finished statements. Never
         raises: a connection with nothing to roll back (or already closed) is
-        not itself a problem worth surfacing over the original error."""
+        not itself a problem worth surfacing over the original error.
+
+        #104 follow-up: also drops the embedding cache. `_cache_put`/
+        `_cache_drop` patch it the instant the upsert's own INSERT/UPDATE
+        runs, well before `_commit()` - so a failure anywhere between there
+        and the commit (the commit itself included) rolls back the database
+        but leaves the cache mid-write. `PRAGMA data_version` can't catch
+        this the way it catches a FOREIGN connection's write: a rollback on
+        THIS connection never bumps it, so nothing would otherwise tell
+        `_embedding_matrix()` the cache disagrees with the file. Blunt but
+        cheap - a failed write is already the rare, retried path - and the
+        next embedding read simply rebuilds from SQL."""
         try:
             self._conn.rollback()
         except Exception:
             pass
+        self._invalidate_embedding_cache()
 
     def _write_with_replica_fallback(self, fn):
         """Run a write; on failure, roll back the half-finished transaction so
