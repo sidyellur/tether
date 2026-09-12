@@ -884,7 +884,13 @@ class Store:
         self._ensure_consolidation_columns()
         self._ensure_dedup_unique_index()
         self._graph.migrate()
-        if self._graph.enabled:
+        if self._graph.enabled and not self._meta_get("explicit_links_backfilled"):
+            # #113: link() (and, since #103, remember(links=...)) already wire
+            # the explicit edge at write time, so this replay only matters
+            # once - to upgrade a database that predates the associative
+            # graph. Without the meta gate below it re-scanned `memories` and
+            # re-upserted every explicit edge on every single boot.
+            #
             # #103: legacy/pre-existing rows can carry `links` JSON pointing at
             # ids that no longer (or never did) exist in `memories` - forgotten
             # by hard delete, or simply typo'd in before remember() validated
@@ -895,11 +901,14 @@ class Store:
                          self._conn.execute("SELECT id FROM memories").fetchall()}
             pairs = []
             for (rid, links_json) in self._conn.execute(
-                    "SELECT id, links FROM memories").fetchall():
+                    # archived/superseded rows' stale links shouldn't be
+                    # replayed even on this one-time backfill.
+                    "SELECT id, links FROM memories WHERE valid_to IS NULL").fetchall():
                 for other in json.loads(links_json or "[]"):
                     if other in valid_ids:
                         pairs.append((rid, other))
             self._graph.backfill_explicit(pairs)
+            self._meta_set("explicit_links_backfilled", "1")
         self._commit()
 
     def _backfill_memory_tags(self) -> None:

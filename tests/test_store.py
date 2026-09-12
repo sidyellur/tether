@@ -2572,6 +2572,100 @@ def test_remember_self_link_is_not_wired():
         "SELECT COUNT(*) FROM edges WHERE src=dst").fetchone()[0] == 0
 
 
+# --- #113: the legacy `links` replay only ever needs to run once -----------
+
+def test_migrate_backfills_legacy_links_once_and_sets_meta_flag():
+    """A database that predates the associative graph (raw `links` JSON with
+    no `edges` rows at all, and never migrated under graph-aware code) must
+    get its explicit edges replayed the first time migrate() runs under this
+    fix, and must record that it did so."""
+    from tether.store import _TABLE_SCHEMA
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(_TABLE_SCHEMA)         # schema only - migrate() never ran
+    now = "2024-01-01T00:00:00+00:00"
+    conn.execute(
+        "INSERT INTO memories(id, type, title, title_norm, body, links, "
+        "created_at, updated_at) VALUES (1, 'user', 'A', 'a', 'x', '[2]', ?, ?)",
+        (now, now))
+    conn.execute(
+        "INSERT INTO memories(id, type, title, title_norm, body, links, "
+        "created_at, updated_at) VALUES (2, 'user', 'B', 'b', 'y', '[1]', ?, ?)",
+        (now, now))
+    conn.commit()
+
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='explicit'").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT value FROM meta WHERE key='explicit_links_backfilled'"
+    ).fetchone()[0] == "1"
+
+
+def test_second_store_migrate_does_not_replay_explicit_edges(tmp_path):
+    """#113: once a database has been backfilled, a second Store opened on
+    the same file (a fresh process reopening it) must not re-scan `memories`
+    and re-insert every explicit edge on its own migrate() call."""
+    db_path = tmp_path / "memory.db"
+    s1 = _file_store(db_path, assoc=True)
+    a = s1.remember("user", "A", "body a")["id"]
+    b = s1.remember("user", "B", "body b")["id"]
+    s1.link(a, b)
+    s1._conn.close()
+
+    conn2 = sqlite3.connect(str(db_path), check_same_thread=False)
+    s2 = Store(conn2, device_id="test-device", sync_now=lambda *a, **k: None,
+               assoc=True)
+    inserts = []
+    conn2.set_trace_callback(
+        lambda sql: inserts.append(sql)
+        if "insert" in sql.lower() and "edges" in sql.lower() else None)
+    try:
+        s2.migrate()          # this Store's very first migrate() call
+    finally:
+        conn2.set_trace_callback(None)
+    assert inserts == [], f"migrate() replayed explicit edges again: {inserts}"
+    # sanity: the edge from s1.link() really is there, just not re-inserted
+    assert conn2.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='explicit'").fetchone()[0] == 1
+
+
+def test_migrate_backfill_skips_archived_source_and_dangling_target():
+    """A pre-existing database seeded before this fix landed can carry two
+    kinds of stale `links` entries that must never turn into edges even on
+    the one-time backfill: a links entry that belongs to a row which is now
+    archived (valid_to set), and a links entry on a current row that points
+    at an id with no row in `memories` at all (#103)."""
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+    a = s.remember("user", "A", "x")["id"]
+    b = s.remember("user", "B", "y")["id"]
+    c = s.remember("user", "C", "z")["id"]
+
+    # Simulate a database that predates this fix: `a` is archived but still
+    # carries a stale links entry to `b`; `c` (still current) carries a
+    # links entry to an id that was hard-deleted or typo'd in. Neither was
+    # ever replayed by a graph-aware migrate() before, so clear the meta
+    # flag that this Store's own (no-op, table-was-empty) first migrate()
+    # call already set.
+    now = "2024-01-01T00:00:00+00:00"
+    conn.execute("UPDATE memories SET valid_to=? WHERE id=?", (now, a))
+    conn.execute("UPDATE memories SET links=? WHERE id=?", (_json.dumps([b]), a))
+    conn.execute("UPDATE memories SET links=? WHERE id=?", (_json.dumps([999999]), c))
+    conn.execute("DELETE FROM meta WHERE key='explicit_links_backfilled'")
+    conn.commit()
+
+    s.migrate()
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='explicit'").fetchone()[0] == 0
+
+
 # --- #30: snippet payloads + fetch-on-demand ---------------------------------
 
 _LONG = ("Intro line about nothing much. " + "filler filler filler. " * 200
