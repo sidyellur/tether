@@ -797,7 +797,28 @@ class Store:
         what produced the stored vectors (per this device - see
         _embedding_meta_key), clear them all first so the store never mixes
         incompatible embeddings. Returns rows embedded. No-op (returns 0)
-        without an embedder; never raises."""
+        without an embedder; never raises.
+
+        Wiring the semantic graph afterward (#101/#102) is scaled to what
+        actually changed rather than always re-wiring the whole store:
+        - a wipe (model/dims changed) means every vector is new, so the
+          whole store is re-wired via backfill_semantic, same as before.
+        - no wipe but some rows were freshly embedded (e.g. a resumed/
+          interrupted prior run, or new rows written with no embedder
+          available at the time) means only THOSE rows need wiring - one
+          on_remember() per row embedded this call, not a full re-wire.
+        - no wipe and nothing embedded (the common warm-restart case) means
+          the semantic graph is already fully wired - do nothing. This is
+          what #101 was about: every boot used to pay a full backfill_semantic
+          (a matrix multiply + argsort + upserts per row) for no reason.
+
+        Whichever of the above ran, the connection is committed before
+        returning (#102) so the caller never sits holding an open write
+        transaction across the WAL - previously nothing committed after the
+        wholesale wiring call, so a second process (CLI, another server on
+        the same DB file) could hit "database is locked" until some
+        unrelated later write happened to commit.
+        """
         if self._embedder is None:
             return 0
         try:
@@ -805,20 +826,22 @@ class Store:
             dims_key = self._embedding_meta_key("embedding_dims")
             prev_model = self._meta_get(model_key)
             prev_dims = self._meta_get(dims_key)
-            if (prev_model != self._embedder.name
-                    or prev_dims != str(self._embedder.dims)):
+            wiped = (prev_model != self._embedder.name
+                     or prev_dims != str(self._embedder.dims))
+            if wiped:
                 self._conn.execute("UPDATE memories SET embedding=NULL")
                 self._meta_set(model_key, self._embedder.name)
                 self._meta_set(dims_key, self._embedder.dims)
                 self._conn.commit()
             done = 0
+            embedded = []   # (mid, blob) for rows actually embedded this run
             while True:
                 rows = self._conn.execute(
-                    "SELECT id, title, body FROM memories "
+                    "SELECT id, title, body, type FROM memories "
                     "WHERE embedding IS NULL LIMIT ?", (batch,)).fetchall()
                 if not rows:
                     break
-                for mid, title, body in rows:
+                for mid, title, body, type_ in rows:
                     blob = self._embed_or_none(title, body)
                     if blob is None:
                         # embedder broke mid-run: stop, leave the rest for later
@@ -827,12 +850,29 @@ class Store:
                         return done
                     self._conn.execute(
                         "UPDATE memories SET embedding=? WHERE id=?", (blob, mid))
+                    # Keep the incremental cache current (#81) so the
+                    # _embedding_matrix() call below (own-connection commits
+                    # don't bump PRAGMA data_version, so a pre-existing cache
+                    # wouldn't otherwise notice these rows) reflects every row
+                    # embedded this run, not just rows visible before we started.
+                    self._cache_put(mid, blob, type_)
+                    embedded.append((mid, blob))
                     done += 1
                 self._conn.commit()
-            # Vectors just changed wholesale (and the model-change branch above
-            # may have NULLed every one of them), so anything cached is stale.
-            self._invalidate_embedding_cache()
-            self._graph.backfill_semantic(matrix=self._embedding_matrix())
+            if wiped:
+                # Vectors just changed wholesale, so anything cached is stale
+                # and every current memory needs re-wiring.
+                self._invalidate_embedding_cache()
+                self._graph.backfill_semantic(matrix=self._embedding_matrix())
+            elif done > 0:
+                # Only the rows embedded this run are new; the incremental
+                # cache (_cache_put, above) already reflects them, so
+                # _embedding_matrix() here is a cache hit, not a rescan.
+                shared = self._embedding_matrix()
+                for mid, blob in embedded:
+                    self._graph.on_remember(mid, blob, matrix=shared)
+            # else: wiped is False and done == 0 - nothing changed, nothing to wire.
+            self._conn.commit()
             return done
         except Exception:
             return 0
