@@ -647,11 +647,20 @@ class Store:
         self._ensure_dedup_unique_index()
         self._graph.migrate()
         if self._graph.enabled:
+            # #103: legacy/pre-existing rows can carry `links` JSON pointing at
+            # ids that no longer (or never did) exist in `memories` - forgotten
+            # by hard delete, or simply typo'd in before remember() validated
+            # its own links argument. Filtering against the id set here, once,
+            # keeps every future migrate() from re-minting the same dangling
+            # `explicit` edges forever.
+            valid_ids = {r[0] for r in
+                         self._conn.execute("SELECT id FROM memories").fetchall()}
             pairs = []
             for (rid, links_json) in self._conn.execute(
                     "SELECT id, links FROM memories").fetchall():
                 for other in json.loads(links_json or "[]"):
-                    pairs.append((rid, other))
+                    if other in valid_ids:
+                        pairs.append((rid, other))
             self._graph.backfill_explicit(pairs)
         self._conn.commit()
 
@@ -859,6 +868,32 @@ class Store:
             mid, action = self._upsert_locked(
                 type, title, norm, body, tags_s, incoming_links, now, emb, existing)
 
+        # #103: `links=` used to be a dumb JSON write - the upsert above
+        # already unioned incoming_links into `mid`'s own column, but that
+        # left the *other* side untouched and no explicit edge existed until
+        # the next migrate() replayed the JSON. Wire it the same way link()
+        # does: validate, patch the other row's links, and create the edge
+        # now, in this same transaction. A bad id must not abort the
+        # remember - it's dropped and reported instead, since a hallucinated
+        # link id is a poor reason to lose the memory the caller just saved.
+        dropped_links = []
+        if incoming_links:
+            # `existing` (the pre-upsert probe row) tells us which ids were
+            # already linked before this call, purely to skip re-doing work
+            # that's already been done - on_link/the union SQL are idempotent,
+            # so getting this wrong costs nothing but a redundant write.
+            already_linked = set(json.loads(existing[1])) if existing else set()
+            for other in incoming_links:
+                if other == mid or other in already_linked:
+                    continue
+                try:
+                    self._links_of(other)
+                except ValueError:
+                    dropped_links.append(other)
+                    continue
+                self._conn.execute(self._LINK_UNION_SQL, (mid, now, other))
+                self._graph.on_link(mid, other)
+
         # Share one matrix across the whole write (#61). The upsert above
         # already patched this row into the cache (#81), so this is a cache
         # hit that includes `mid` - on_remember excludes `mid` itself, so the
@@ -872,7 +907,10 @@ class Store:
         self._conn.commit()
         self._sync()
         self._maybe_forget()
-        return {"id": mid, "action": action}
+        result = {"id": mid, "action": action}
+        if dropped_links:
+            result["dropped_links"] = dropped_links
+        return result
 
     def _memories_seq(self):
         """The last id AUTOINCREMENT handed out for `memories` (None before the

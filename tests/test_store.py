@@ -2198,6 +2198,74 @@ def test_link_preserves_links_added_by_remember():
     assert stored == {a, b}, f"link() dropped a pre-existing link: {stored}"
 
 
+# --- #103: remember(links=) validated and wired like link() -----------------
+
+def test_remember_links_wires_explicit_edge_without_restart():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+    a = s.remember("user", "A", "x")["id"]
+    b = s.remember("user", "B", "y")["id"]
+    s.remember("user", "A", "x2", links=[b])       # re-remember A, add link to b
+    row = conn.execute(
+        "SELECT kind, weight FROM edges WHERE (src=? AND dst=?) OR (src=? AND dst=?)",
+        (a, b, b, a)).fetchone()
+    assert row == ("explicit", 1.0)                # edge exists with no migrate() call
+
+
+def test_remember_links_is_symmetric():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+    a = s.remember("user", "A", "x")["id"]
+    b = s.remember("user", "B", "y")["id"]
+    s.remember("user", "A", "x2", links=[b])
+    b_links = _json.loads(conn.execute(
+        "SELECT links FROM memories WHERE id=?", (b,)).fetchone()[0])
+    assert a in b_links                            # link() updates both sides; so must this
+
+
+def test_remember_drops_and_reports_bad_link_id():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+    r = s.remember("user", "A", "x", links=[999999])
+    assert r["dropped_links"] == [999999]          # reported, not swallowed...
+    assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0   # ...but no edge
+
+
+def test_migrate_backfill_skips_dangling_link_ids():
+    """Legacy `links` JSON pointing at an id with no row in `memories` must not
+    keep minting a dangling `explicit` edge on every future migrate()."""
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+    a = s.remember("user", "A", "x")["id"]
+    # remember() itself validates now (#103); reach the bad JSON the way an
+    # old pre-#103 database could have gotten it - direct SQL.
+    conn.execute("UPDATE memories SET links=? WHERE id=?", ("[999999]", a))
+    conn.commit()
+    s.migrate()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='explicit'").fetchone()[0] == 0
+
+
+def test_remember_self_link_is_not_wired():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s._graph.enabled = True
+    s.migrate()
+    a = s.remember("user", "A", "x")["id"]
+    r = s.remember("user", "A", "x2", links=[a])   # links to itself
+    assert "dropped_links" not in r                # a real id, just not wired
+    assert conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE src=dst").fetchone()[0] == 0
+
+
 # --- #30: snippet payloads + fetch-on-demand ---------------------------------
 
 _LONG = ("Intro line about nothing much. " + "filler filler filler. " * 200

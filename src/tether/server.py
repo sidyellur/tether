@@ -113,14 +113,21 @@ def remember(type: str, title: str, body: str,
         title: a short label; also the dedup key within a type.
         body: the fact. For feedback/project, a "Why:" / "How to apply:" line helps.
         tags: optional comma-separated tags.
-        links: optional list of related memory ids. Merged (union) into any
-            links already on the memory, never replaces them - omitting this
-            on a refine call preserves links set earlier.
+        links: optional list of related memory ids - wired up exactly like
+            calling link() on each one: validated, unioned into both memories'
+            `links` (never replacing links set earlier, so omitting this on a
+            refine call preserves them), and an explicit graph edge is created
+            immediately, not just recorded for the next restart. An id that
+            doesn't resolve to an existing memory is dropped rather than
+            failing the whole call (see `dropped_links` below) - a bad link id
+            is a poor reason to lose the memory itself.
         crystallizes: optional list of source memory ids this memory abstracts;
             links it over them as a crystallized principle (needs TETHER_CRYSTALLIZE).
 
     Returns {"id", "action"} where action is "created", "updated", or (with
     TETHER_CONSOLIDATE on) "consolidated" - a near-duplicate was superseded.
+    Also includes "dropped_links": [...] when one or more `links` ids didn't
+    resolve to an existing memory.
     """
     try:
         return _get_store().remember(type, title, body, tags=tags, links=links,
