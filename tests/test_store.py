@@ -942,10 +942,11 @@ def test_boot_index_rescans_even_when_every_write_shares_one_timestamp(monkeypat
 def test_boot_index_second_connection_write_is_noticed(tmp_path):
     """A write through a SECOND connection to the same file (simulating a
     sync pull landing new rows) must be picked up on the next boot_index()
-    call on the first connection - unlike the embedding cache, this
-    deliberately does NOT rely on PRAGMA data_version (see
-    _store_signature's docstring); MAX(id)/MAX(updated_at) changing is what
-    catches it here."""
+    call on the first connection - via PRAGMA data_version (see
+    _store_signature's docstring; #128 switched to it from a row-count/max-id
+    SELECT, which this insert case happened to also catch - see
+    test_boot_index_notices_a_foreign_update_only_write for the case it
+    did NOT catch)."""
     path = str(tmp_path / "m.db")
     a = Store(sqlite3.connect(path), "a", lambda *x, **k: None, sync_read_interval=0)
     a.migrate()
@@ -957,6 +958,30 @@ def test_boot_index_second_connection_write_is_noticed(tmp_path):
     b.remember("user", "B", "body b")
     idx2 = a.boot_index()
     assert "B" in idx2, "a served a stale boot index after b's write via another connection"
+
+
+def test_boot_index_notices_a_foreign_update_only_write(tmp_path):
+    """#128: a foreign connection's UPDATE - re-remembering an EXISTING
+    memory with a different title, the shape of a sync pull refreshing a
+    row or a second process editing a fact - changes neither the current-row
+    count nor the highest id, so the pre-#128 signature (row count + max id)
+    never noticed it and `a` served the old title forever. PRAGMA
+    data_version catches an UPDATE from another connection directly."""
+    path = str(tmp_path / "m.db")
+    a = Store(sqlite3.connect(path), "a", lambda *x, **k: None, sync_read_interval=0)
+    a.migrate()
+    b = Store(sqlite3.connect(path), "b", lambda *x, **k: None, sync_read_interval=0)
+    b.migrate()
+    a.remember("user", "Old title", "body")
+    idx1 = a.boot_index()
+    assert "Old title" in idx1
+    # same dedup key (case/whitespace-normalized), different display title ->
+    # UPDATEs the existing row rather than inserting a new one
+    r = b.remember("user", "  Old Title  ", "body")
+    assert r["action"] == "updated"
+    idx2 = a.boot_index()
+    assert "Old Title" in idx2 and "Old title" not in idx2, (
+        "a served a stale boot index after b's UPDATE-only write (#128)")
 
 
 _OLD = "2020-01-01T00:00:00+00:00"

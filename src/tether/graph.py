@@ -269,20 +269,28 @@ class Graph:
 
     def _degree_signature(self):
         """Cheap fingerprint of "could degree_map()'s answer have changed?":
-        this process's own write counter (see _touch()), plus edge count and
-        current-memory count for a foreign connection's writes. Not `PRAGMA
-        data_version` - see Store._store_signature's comment on the same
-        choice - degree_map() must see this process's own on_link/on_remember/
-        touch_session/unprime writes on the very next call, and data_version
-        only reflects OTHER connections' commits.
+        `_write_seq` (this process's own on_link/on_remember/touch_session/
+        unprime writes, bumped by Store._commit()'s call to _touch() on the
+        very next call) paired with `PRAGMA data_version` (any OTHER
+        connection's commit - see Store._data_version, same pragma, same
+        connection).
+
+        #128: previously used an edge-count/current-memory-count SELECT
+        instead of data_version for the foreign-connection half - but those
+        counts don't change on an UPDATE (a foreign connection bumping an
+        existing edge's weight, or archiving a memory via valid_to without
+        also touching `edges`), so that write went undetected and
+        degree_map() kept serving a stale answer. data_version catches any
+        commit from another connection regardless of statement shape.
 
         Used MAX(updated_at) instead of _write_seq originally, but that's a
         wall-clock comparison that can tie within one clock tick (see
         Store._store_signature's docstring) - swapped for the same reason."""
-        row = self._conn.execute(
-            "SELECT (SELECT COUNT(*) FROM edges), "
-            "(SELECT COUNT(*) FROM memories WHERE valid_to IS NULL)").fetchone()
-        return (self._write_seq, *row)
+        try:
+            data_version = self._conn.execute("PRAGMA data_version").fetchone()[0]
+        except Exception:
+            data_version = None
+        return (self._write_seq, data_version)
 
     def degree_map(self, kinds=("explicit", "hebbian", "crystallized")) -> dict:
         """Behavioral weighted degree for every current memory (semantic edges

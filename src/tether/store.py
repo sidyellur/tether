@@ -672,33 +672,31 @@ class Store:
 
     def _store_signature(self):
         """Cheap fingerprint of "could boot_index()'s answer have changed?"
-        (#112): this process's own write counter, plus current-row count and
-        highest id for `memories`, and count for `edges` (degree_map()'s
-        inputs, consulted by the curated index once the store is above
-        boot_index_cap) - so a foreign connection's write (a sync pull, a
-        second process) is still noticed via the count/max-id changing, even
-        though it doesn't bump this process's own counter.
+        (#112): `_write_seq` (this process's own commits - see _commit) paired
+        with `PRAGMA data_version` (any OTHER connection's commit - see
+        _data_version). Between them every commit that could change
+        boot_index()'s answer is caught, with no table scan at all.
 
-        Originally used MAX(updated_at) instead of _write_seq to detect this
-        process's own writes, but that's a wall-clock string comparison -
+        #128: the #112 follow-up used a row-count/max-id SELECT instead of
+        data_version specifically to catch a foreign connection's write - but
+        those counts, and the max id, are invariant under an UPDATE. A sync
+        pull or a second process re-remembering an existing memory (changing
+        its title or tags, not creating a new row) left this signature
+        unchanged, so a stale boot index kept being served indefinitely - the
+        exact failure mode the whole cache exists to avoid. `data_version`
+        catches an UPDATE (or anything else) from another connection
+        directly, so it doesn't share that blind spot; see the two-connection
+        tests for both the original (insert) and this (update-only) case.
+
+        Originally used MAX(updated_at) instead of _write_seq for the
+        same-process case, but that's a wall-clock string comparison -
         exactly the trap #68 already hit once (Windows' datetime.now() has
         ~15.6ms resolution before Python 3.13, so a remember() immediately
-        followed by a link() inside one clock tick shares a timestamp). Two
-        such writes made the signature compare equal and served a stale boot
-        index. _write_seq can't tie, so it replaces updated_at for the
-        same-process case; MAX(updated_at) added nothing the count/max-id
-        checks didn't already cover for the foreign-connection case, so it's
-        dropped rather than kept alongside.
-
-        Deliberately NOT `PRAGMA data_version` (see _data_version above):
-        that pragma only advances when ANOTHER connection commits to the
-        file, so it can't see this process's own writes on its own.
+        followed by a link() inside one clock tick shares a timestamp, and
+        two such writes made a MAX(updated_at)-based signature compare equal).
+        `_write_seq`, a monotonic in-process counter, can't tie that way.
         """
-        row = self._conn.execute(
-            "SELECT (SELECT COUNT(*) FROM memories WHERE valid_to IS NULL), "
-            "(SELECT COUNT(*) FROM edges), "
-            "(SELECT COALESCE(MAX(id), 0) FROM memories)").fetchone()
-        return (self._write_seq, *row)
+        return (self._write_seq, self._data_version())
 
     def _cache_put(self, mid, emb, type_) -> None:
         """Reflect one row's current embedding in the cache (#81): replace it
