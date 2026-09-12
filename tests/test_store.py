@@ -2847,3 +2847,186 @@ def test_backfill_does_not_lock_out_a_second_connection(tmp_path):
         "SELECT value FROM meta WHERE key='probe'").fetchone()[0] == "1"
     conn2.close()
     conn.close()
+
+
+# --- #105: the sync network wait happens after the lock is released ---------
+
+def test_write_sync_wait_does_not_block_other_threads_db_work():
+    """The core #105 fix: a slow/unreachable backend must not serialize every
+    thread's DB work behind one thread's network wait. Thread A's write hits
+    a sync_now that blocks on an Event; while A is stuck there, thread B's
+    recall() (sync_read_interval=0, so B never tries to sync itself) must
+    still return promptly - proving B's DB work was never queued up behind
+    A's still-pending network call."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_sync_now(timeout=2.0):
+        entered.set()
+        release.wait(timeout=5)
+
+    s = Store(conn, "d", blocking_sync_now, sync_read_interval=0)
+    s.migrate()
+
+    def writer():
+        s.remember("user", "A", "body a")
+
+    t = threading.Thread(target=writer)
+    t.start()
+    assert entered.wait(timeout=5), "writer never reached its sync wait"
+
+    # Thread A is now blocked inside blocking_sync_now, holding no lock
+    # (#105 moved that wait outside `_lock`). Thread B must not be serialized
+    # behind it.
+    done = threading.Event()
+    result = {}
+
+    def reader():
+        result["hits"] = s.recall("nothing")
+        done.set()
+
+    r = threading.Thread(target=reader)
+    r.start()
+    assert done.wait(timeout=2), (
+        "recall() was blocked behind the write's sync wait - the lock is "
+        "still being held across the network call")
+    assert not release.is_set(), (
+        "test bug: B finished only because we released A first")
+    assert result["hits"] == []
+
+    release.set()
+    t.join(5)
+    r.join(5)
+    assert not t.is_alive() and not r.is_alive()
+
+
+def test_sync_still_invoked_once_per_write_in_the_normal_case():
+    """Non-blocking case: the write-sync / read-debounce (_last_sync_at)
+    contract is unchanged by the refactor - one sync per write, not zero and
+    not duplicated."""
+    calls = []
+
+    def fast_sync_now(timeout=2.0):
+        calls.append(timeout)
+
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", fast_sync_now, sync_read_interval=0)
+    s.migrate()
+
+    s.remember("user", "A", "body a")
+    assert len(calls) == 1
+    assert s._last_sync_at is not None
+
+    s.remember("user", "B", "body b")
+    assert len(calls) == 2
+
+    s.link(1, 2)
+    assert len(calls) == 3
+
+    s.forget(1)
+    assert len(calls) == 4
+
+
+def test_import_records_does_one_deferred_sync_not_one_per_inner_call():
+    """Re-entrancy: import_records calls remember()/link(), both already
+    @_locked. Only the OUTERMOST call may perform the deferred sync wait -
+    not once per inner remember()/link() call - and the nesting must not
+    deadlock or raise from the depth bookkeeping."""
+    calls = []
+
+    def counting_sync_now(timeout=2.0):
+        calls.append(timeout)
+
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", counting_sync_now, sync_read_interval=0)
+    s.migrate()
+
+    out = s.import_records([
+        {"id": 1, "type": "user", "title": "A", "body": "a", "links": [2]},
+        {"id": 2, "type": "user", "title": "B", "body": "b"},
+        {"id": 3, "type": "user", "title": "C", "body": "c"},
+    ])
+    assert out["created"] == 3
+    assert out["linked"] == 1  # remember() x3 + link() x1 = 4 nested @_locked
+    # calls, all inside ONE outermost import_records call.
+    assert len(calls) == 1, (
+        f"expected exactly one deferred sync for the whole import, got "
+        f"{len(calls)}")
+    assert s._lock_depth == 0
+
+    # The lock must be genuinely free afterward, not left held by a
+    # miscounted re-entrant acquire.
+    acquired = s._lock.acquire(blocking=False)
+    assert acquired
+    s._lock.release()
+
+
+def test_locked_exception_partway_through_releases_lock_and_resets_depth():
+    """A wrapped method that does some work (queuing a sync) and then raises
+    must still unwind cleanly: the lock released and _lock_depth back to 0,
+    with no exception escaping from the depth bookkeeping itself. The sync
+    queued before the failure must not fire for this failed call."""
+    from tether.store import _locked
+
+    calls = []
+
+    def fake_sync_now(timeout=2.0):
+        calls.append(timeout)
+
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    s = Store(conn, "d", fake_sync_now, sync_read_interval=0)
+    s.migrate()
+
+    @_locked
+    def partial_then_raise(self):
+        self._sync()   # simulate work that got far enough to queue a sync
+        raise RuntimeError("boom partway through")
+
+    with pytest.raises(RuntimeError, match="boom partway through"):
+        partial_then_raise(s)
+
+    assert s._lock_depth == 0
+    assert calls == [], "sync queued before the exception must not have fired"
+
+    # Prove the lock is actually free - not left held by the failed call -
+    # both directly and via another thread's call not blocking.
+    acquired = s._lock.acquire(blocking=False)
+    assert acquired
+    s._lock.release()
+
+    done = threading.Event()
+
+    def other():
+        s.recall("anything")
+        done.set()
+
+    th = threading.Thread(target=other)
+    th.start()
+    assert done.wait(timeout=2), "lock was left held after the exception"
+    th.join()
+
+
+def test_read_sync_failure_still_never_breaks_the_read_after_refactor():
+    """#62's contract must survive #105: the deferred wait for a read-
+    triggered sync is still swallowed even though it now runs after the lock
+    is released, not inline inside _maybe_sync_for_read. A row is inserted
+    via raw SQL (bypassing remember()/its write-path sync, which is NOT
+    swallowed - a write-sync failure has always been allowed to propagate,
+    unchanged by this refactor) so only the read path's own deferred sync is
+    exercised here."""
+    def boom(timeout=2.0):
+        raise RuntimeError("backend on fire")
+
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", boom, sync_read_interval=30)
+    s.migrate()
+    conn.execute(
+        "INSERT INTO memories(type,title,title_norm,body,tags,links,"
+        "created_at,updated_at,device_id,valid_from) "
+        "VALUES('user','A','a','findable','','[]','2026-01-01','2026-01-01','d','2026-01-01')")
+    conn.commit()
+    s._last_sync_at = None
+    hits = s.recall("findable")
+    assert [h["title"] for h in hits] == ["A"]
+    assert s.boot_index() != ""

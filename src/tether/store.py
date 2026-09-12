@@ -280,7 +280,9 @@ _SEED_FLOOR = 0.35
 
 
 def _locked(method):
-    """Serialize a public Store method under the store's lock (#83).
+    """Serialize a public Store method's DB work under the store's lock
+    (#83), but let any sync network wait it queues up happen AFTER the lock
+    is released (#105).
 
     The mcp SDK runs sync tool functions on worker threads, one per inbound
     request, and an agent issues tool calls in parallel - so two calls can
@@ -292,13 +294,70 @@ def _locked(method):
     4-thread stress this produced "cannot start a transaction within a
     transaction", "cannot commit - no transaction is active" and dozens of
     creates misreported as updates per run. One re-entrant lock around each
-    public entry point makes every call atomic; re-entrant because
+    public entry point's DB work makes every call atomic; re-entrant because
     import_records calls remember()/link().
+
+    #105: every write ends with `self._sync()`, and every read starts with
+    `self._maybe_sync_for_read()`, either of which can block for up to a
+    couple of seconds on the replica's network round-trip. Holding `_lock`
+    across that wait serialized ALL threads' DB work (sub-millisecond)
+    behind ONE thread's network wait. Neither `_sync()` nor
+    `_maybe_sync_for_read()` now waits on the network directly - they just
+    record `self._pending_sync = timeout` (see `_sync`). This wrapper drains
+    that: it runs `method` under the lock as before, then - once the lock is
+    released - performs the deferred `_sync_now(pending)` wait, if one was
+    queued.
+
+    `_locked` is re-entrant (import_records calls remember()/link(), both
+    already `@_locked`), and only the OUTERMOST call may perform the
+    deferred wait: an inner call draining it would (a) wait on the network
+    while the outer call still holds the lock, defeating the point, and (b)
+    fire once per inner call instead of once for the whole outer operation.
+    `self._lock_depth` (a plain int, touched only by whichever thread
+    currently holds `self._lock` - RLock makes that always exactly the one
+    thread already inside this wrapper, so no extra synchronization is
+    needed) counts nesting: it's incremented on entry and decremented in a
+    `finally` so an exception from `method` can't leak it, and only the call
+    that brings it back to 0 reads and clears `self._pending_sync` and goes
+    on to drain it. Inner calls each overwrite `self._pending_sync` with
+    their own timeout (last write wins) and leave it for the outermost call
+    to drain - so a multi-record import_records does ONE deferred sync wait,
+    not one per remember()/link() inside it, exactly like the un-refactored
+    code did (each nested `_sync()` used to fire immediately, but always
+    inside the SAME outer lock, so only the last one's timeout was ever
+    actually waited on in serial before the lock was released anyway).
     """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         with self._lock:
-            return method(self, *args, **kwargs)
+            self._lock_depth += 1
+            try:
+                result = method(self, *args, **kwargs)
+            finally:
+                self._lock_depth -= 1
+            pending = pending_safe = None
+            if self._lock_depth == 0:
+                pending = self._pending_sync
+                pending_safe = self._pending_sync_safe
+                self._pending_sync = None
+                self._pending_sync_safe = False
+        # Outside `with self._lock` from here on: other threads' @_locked
+        # calls can now acquire the lock and do their DB work while this
+        # thread waits on the network below.
+        if pending is not None:
+            if pending_safe:
+                # #62's read contract: an unreachable backend must not turn a
+                # read into an error. `_sync_now` in production never raises
+                # (sync.py swallows every failure itself) - this only matters
+                # for a test double, but preserves the pre-#105 guarantee
+                # exactly.
+                try:
+                    self._sync_now(pending)
+                except Exception:
+                    pass
+            else:
+                self._sync_now(pending)
+        return result
     return wrapper
 
 
@@ -406,10 +465,31 @@ class Store:
         # Drives the auto `proj:<name>` tag on remember, the "# This project"
         # slice of the boot index, and the same-project recall bonus.
         self._project = project or None
-        # #83: every public method runs under this (see _locked). Held across
-        # the whole call, including a write-path sync, so a call is atomic
-        # from the agent's point of view.
+        # #83: every public method's DB work runs under this (see _locked),
+        # making a call atomic from the agent's point of view. #105: it is
+        # NOT held across a write-path sync or read-path pull any more -
+        # those are deferred (see _pending_sync) and waited on after the
+        # lock is released.
         self._lock = threading.RLock()
+        # #105: set by _sync()/_maybe_sync_for_read() while `self._lock` is
+        # held, to mean "the outermost @_locked wrapper should wait on
+        # _sync_now(this timeout) after releasing the lock". Only ever
+        # touched by the thread currently inside _locked's wrapper (RLock
+        # guarantees that's a single thread at a time), so no separate
+        # synchronization is needed. None means no sync is due.
+        self._pending_sync = None
+        # #105: paired with _pending_sync. True when the pending sync was
+        # queued by _maybe_sync_for_read (a read must never raise because the
+        # backend is unreachable - the #62 contract), False when queued by a
+        # write's _sync() (whose failure has always been allowed to surface,
+        # same as before this refactor). Only meaningful while _pending_sync
+        # is not None.
+        self._pending_sync_safe = False
+        # #105: re-entrancy depth for _locked (import_records calls
+        # remember()/link()). Only the call that brings this back to 0
+        # drains _pending_sync. Same single-thread-at-a-time guarantee as
+        # above.
+        self._lock_depth = 0
         self._device_id = device_id
         self._sync_now = sync_now
         self._embedder = embedder
@@ -643,18 +723,41 @@ class Store:
         except Exception:
             return ([], None, [])
 
-    def _sync(self, timeout=2.0) -> None:
+    def _sync(self, timeout=2.0, _safe=False) -> None:
         """Every sync goes through here so the read-path debounce (#62) sees
-        writes too - a chatty writer shouldn't also pull on every read."""
+        writes too - a chatty writer shouldn't also pull on every read.
+
+        #105: this used to call `self._sync_now(timeout)` right here, while
+        still holding `self._lock` (every caller is a `@_locked` method) -
+        blocking every OTHER thread's DB work behind this one's network
+        round-trip. It now just records the timeout for `_locked`'s wrapper
+        to wait on after the lock is released (see `_locked`); the actual
+        wait happens exactly once, for the outermost call, wherever this
+        `_sync()` call sits in the nesting. `_last_sync_at` is still stamped
+        immediately (not deferred) so the read debounce below always sees an
+        up-to-date "last sync requested" time regardless of when the network
+        wait itself eventually runs.
+
+        `_safe` is internal (set only by `_maybe_sync_for_read` below): it
+        marks the deferred wait as one that must never raise, preserving the
+        #62 guarantee that a read never breaks just because the sync backend
+        is unreachable. A write's plain `_sync()` call leaves it False, same
+        as the pre-#105 behavior of a write-path sync failure propagating.
+        """
         self._last_sync_at = time.monotonic()
-        self._sync_now(timeout)
+        self._pending_sync = timeout
+        self._pending_sync_safe = _safe
 
     def _maybe_sync_for_read(self) -> None:
         """Pull before a read, at most once per _sync_read_interval seconds.
 
-        Bounded by _READ_SYNC_TIMEOUT rather than the write default, and never
-        allowed to raise: a read must still serve local data when the backend
-        is unreachable - exactly what it would have served before this existed.
+        Bounded by _READ_SYNC_TIMEOUT rather than the write default. #105:
+        marks the pull pending via `_sync()` rather than waiting on it here,
+        so this never blocks OTHER threads' DB work on the network - only
+        the calling thread, after its own `@_locked` call unwinds, actually
+        waits (preserving the read-waits-for-its-own-pull contract from
+        #62). Marked `_safe` so that eventual wait can never turn a read
+        into an error, exactly as the try/except right here used to.
         """
         if not self._sync_read_interval:
             return
@@ -662,10 +765,7 @@ class Store:
         if (self._last_sync_at is not None
                 and now - self._last_sync_at < self._sync_read_interval):
             return
-        try:
-            self._sync(timeout=_READ_SYNC_TIMEOUT)
-        except Exception:
-            self._last_sync_at = now    # don't retry-storm a broken backend
+        self._sync(timeout=_READ_SYNC_TIMEOUT, _safe=True)
 
     def _rollback_quietly(self) -> None:
         """Best-effort rollback of whatever partial transaction a failed write
