@@ -3467,3 +3467,123 @@ def test_read_sync_failure_still_never_breaks_the_read_after_refactor():
     hits = s.recall("findable")
     assert [h["title"] for h in hits] == ["A"]
     assert s.boot_index() != ""
+
+
+# ---------------------------------------------------------------------------
+# #108: the embedding cache must notice rows a replica pull landed even when
+# PRAGMA data_version can't tell us (unsupported on the client, or the pull
+# is applied through our own connection so it never bumps).
+# ---------------------------------------------------------------------------
+
+def _replica_store_with_pull(tmp_path, monkeypatch, data_version, db_path=True):
+    """A file-backed semantic Store whose `sync_now` stands in for a replica
+    pull: each call inserts one fully-formed embedded row ("automobile", the
+    vehicle axis - only ever findable semantically) through a SECOND sqlite3
+    connection to the same file, exactly the way a pull lands rows the
+    incremental cache never saw. `_data_version` is pinned to `data_version`
+    to simulate the pragma being useless. Returns (store, pull_count)."""
+    from tether.store import _pack
+    path = tmp_path / "m.db"
+    pulled = [0]
+
+    def sync_now(timeout=2.0):
+        pulled[0] += 1
+        other = sqlite3.connect(str(path))
+        other.execute("PRAGMA busy_timeout=5000")
+        other.execute(
+            "INSERT INTO memories(type,title,title_norm,body,tags,links,"
+            "created_at,updated_at,device_id,embedding,valid_from) "
+            "VALUES('user',?,?,'my automobile','','[]',"
+            "'2026-01-02','2026-01-02','other-device',?,'2026-01-02')",
+            (f"Pulled {pulled[0]}", f"pulled {pulled[0]}",
+             _pack(FakeEmbedder().embed("my automobile"))))
+        other.commit()
+        other.close()
+
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    s = Store(conn, "this-device", sync_now, embedder=FakeEmbedder(),
+              sync_read_interval=0, db_path=(path if db_path else None))
+    s.migrate()
+    monkeypatch.setattr(s, "_data_version", lambda: data_version)
+    return s, pulled
+
+
+@pytest.mark.parametrize("data_version", [None, 7],
+                         ids=["pragma-unsupported", "pragma-never-bumps"])
+def test_semantic_recall_sees_rows_landed_by_a_replica_pull(
+        tmp_path, monkeypatch, data_version):
+    pytest.importorskip("numpy")
+    s, pulled = _replica_store_with_pull(tmp_path, monkeypatch, data_version)
+    # Populates the cache (kNN wiring reads the matrix), then - after the
+    # lock is released - runs the fake pull, which lands the foreign row.
+    s.remember("project", "Lunch", "pizza and food for the team")
+    assert pulled[0] == 1
+    assert s._fts_ids("car") == []          # nothing keyword-matches 'car'
+    hits = s.recall("car")                  # vehicle axis: semantic only
+    assert [h["title"] for h in hits] == ["Pulled 1"], (
+        "a memory pulled from another device must reach the semantic arm "
+        "without a restart (#108)")
+    # And it keeps working on later pulls, not just the first.
+    s.remember("project", "Snack", "cooking a meal")
+    assert pulled[0] == 2
+    assert {h["title"] for h in s.recall("car")} == {"Pulled 1", "Pulled 2"}
+
+
+def test_pull_that_landed_nothing_new_keeps_the_cache(tmp_path, monkeypatch):
+    """The signature check is a rebuild GATE, not a rebuild trigger: a sync
+    that pulled no embedded rows leaves the incrementally-maintained cache
+    in place (a rebuild per sync would put #81's O(N)-per-write back)."""
+    pytest.importorskip("numpy")
+    s, _ = _replica_store_with_pull(tmp_path, monkeypatch, None)
+    s._sync_now = lambda timeout=2.0: None   # a pull with nothing to pull
+    s.remember("user", "Commute", "car and driving")
+    ids, mat, _ = s._embedding_matrix()
+    assert s._synced_since_build is True
+    ids2, mat2, _ = s._embedding_matrix()
+    assert s._synced_since_build is False
+    assert mat2 is mat and ids2 == ids      # same object: no rebuild happened
+
+
+def test_local_only_store_never_pays_the_signature_check(tmp_path, monkeypatch):
+    """db_path=None (the local default): sync_now is a no-op there, so the
+    post-sync flag must never be set and no signature query runs on reads."""
+    pytest.importorskip("numpy")
+    s, pulled = _replica_store_with_pull(tmp_path, monkeypatch, None, db_path=False)
+    calls = [0]
+    real_sig = s._emb_rows_signature
+
+    def spy():
+        calls[0] += 1
+        return real_sig()
+    monkeypatch.setattr(s, "_emb_rows_signature", spy)
+    s.remember("user", "Commute", "car and driving")
+    assert pulled[0] == 1                   # the fake sync still ran ...
+    assert s._synced_since_build is False   # ... but was not treated as a pull
+    s._embedding_matrix()                   # build (one signature read, at build time)
+    built = calls[0]
+    assert built == 1
+    s.recall("car")
+    s.recall("car")
+    assert calls[0] == built, "local-only reads must not query the signature"
+
+
+def test_degraded_store_does_not_arm_the_signature_check(tmp_path, monkeypatch):
+    """Once degraded to the local file there is no primary to pull from, so
+    a (no-op) sync must not arm the check either."""
+    pytest.importorskip("numpy")
+    s, _ = _replica_store_with_pull(tmp_path, monkeypatch, None)
+    s._degraded = True
+    s._sync_now = lambda timeout=2.0: None
+    s.remember("user", "Commute", "car and driving")
+    assert s._synced_since_build is False
+
+
+def test_invalidate_clears_the_row_signature():
+    s = make_semantic_store()
+    s.remember("user", "A", "car")
+    s._embedding_matrix()
+    assert s._emb_cache_sig is not None
+    s._invalidate_embedding_cache()
+    assert s._emb_cache_sig is None

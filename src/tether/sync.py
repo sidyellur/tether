@@ -87,6 +87,16 @@ with deltas noted):
     efficiency property #109 exists for is unaffected; what changes is
     only the case where a request genuinely arrives after a round is
     already under way.
+  - EMBEDDING CACHE vs. PULLED ROWS (#108): store.py's incremental embedding
+    cache used to rely on `PRAGMA data_version` alone to notice rows a
+    replica pull landed. Whether that works on the libsql client is
+    unverified either way (the pragma may be unsupported -> None -> "no
+    change"; or the replicator may apply frames through the same connection,
+    which the pragma never counts). The cache no longer depends on it for
+    pulls: after every completed `sync_now` on a replica connection the
+    Store re-checks a (count, max id, max updated_at) row signature on its
+    next matrix read and rebuilds on any drift. No backend verification is
+    needed for that to be correct.
 """
 
 import sqlite3

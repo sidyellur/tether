@@ -406,6 +406,13 @@ def _locked(method):
                     pass
             else:
                 self._sync_now(pending)
+            # #108: a pull may have landed rows the incremental embedding
+            # cache never saw; the next matrix read re-checks the row
+            # signature. Replica connections only (db_path is None on the
+            # local-only default, where sync_now is a no-op - and once
+            # degraded, the local file can't receive pulls either).
+            if self._db_path is not None and not self._degraded:
+                self._synced_since_build = True
         if exc is not None:
             raise exc
         return result
@@ -630,6 +637,35 @@ class Store:
         # the incremental path never saw - and rebuild instead of serving a
         # stale matrix. None when the pragma is unavailable (-> no check).
         self._emb_cache_version = None
+        # #108: `data_version` alone can miss rows a REPLICA PULL landed - the
+        # libsql client may not support the pragma (`_data_version()` -> None
+        # -> treated as "unchanged" forever), or the replicator may apply
+        # pulled frames through this very connection (own-connection commits
+        # never bump it). Either way a memory written on device A and pulled
+        # onto B was visible to keyword recall on B (FTS queries SQL directly)
+        # but invisible to the semantic arm, near-duplicate consolidation and
+        # kNN wiring until B restarted. So every COMPLETED sync on a replica
+        # connection sets `_synced_since_build`, and the next matrix read
+        # compares a cheap row signature against the one taken when the cache
+        # was built, rebuilding on any difference - correct regardless of
+        # which pragma failure mode (if either) a given backend has. The
+        # local-only default never sets the flag, so it pays nothing.
+        self._emb_cache_sig = None
+        self._synced_since_build = False
+
+    def _emb_rows_signature(self):
+        """(count, max id, max updated_at) over the CURRENT embedded rows
+        (#108): changes whenever a replica pull inserts, updates or tombstones
+        one. All three columns are indexed (idx_memories_updated for
+        updated_at) so this is a handful of index seeks, not a scan. Never
+        raises - None means "unknown", which the caller treats as changed."""
+        try:
+            return tuple(self._conn.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(MAX(updated_at), '') "
+                "FROM memories WHERE embedding IS NOT NULL AND valid_to IS NULL"
+            ).fetchone())
+        except Exception:
+            return None
 
     def _degrade_to_local(self) -> bool:
         """A replica write just failed (e.g. the network dropped mid-session).
@@ -667,6 +703,7 @@ class Store:
         self._emb_cache = None
         self._emb_buf = None
         self._emb_cache_version = None
+        self._emb_cache_sig = None
 
     def _data_version(self):
         """SQLite's per-connection change counter for OTHER connections'
@@ -805,6 +842,17 @@ class Store:
         committed to the file since. Never raises - callers degrade to
         keyword-only."""
         if self._emb_cache is not None:
+            # #108: a replica pull completed since this cache was built. Own
+            # writes are already applied incrementally (_cache_put/_cache_drop
+            # deliberately leave `_emb_cache_sig` alone), so only the rows a
+            # pull landed can make the signature drift - rebuild on any
+            # difference, whatever `data_version` says.
+            if self._synced_since_build:
+                self._synced_since_build = False
+                if (self._emb_cache_sig is None
+                        or self._emb_rows_signature() != self._emb_cache_sig):
+                    self._invalidate_embedding_cache()
+        if self._emb_cache is not None:
             version = self._data_version()
             if version is None or version == self._emb_cache_version:
                 return self._emb_cache
@@ -812,9 +860,11 @@ class Store:
         try:
             import numpy as np
 
-            # Read the version BEFORE the scan so a commit that lands between
-            # the two is caught on the next read rather than missed forever.
+            # Read the version (and #108's row signature) BEFORE the scan so a
+            # commit that lands between the two is caught on the next read
+            # rather than missed forever.
             version = self._data_version()
+            sig = self._emb_rows_signature()
             rows = self._conn.execute(
                 "SELECT id, embedding, type FROM memories "
                 "WHERE embedding IS NOT NULL AND valid_to IS NULL "
@@ -830,6 +880,7 @@ class Store:
                 self._emb_buf = buf
                 self._emb_cache = (ids, buf[:len(ids)], [r[2] for r in rows])
             self._emb_cache_version = version
+            self._emb_cache_sig = sig
             return self._emb_cache
         except Exception:
             return ([], None, [])
