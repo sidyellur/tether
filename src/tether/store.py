@@ -1352,7 +1352,7 @@ class Store:
             ph = ",".join("?" for _ in candidates)
             existing = {r[0] for r in self._conn.execute(
                 f"SELECT id FROM memories WHERE id IN ({ph}) "
-                f"AND valid_to IS NULL", candidates).fetchall()}
+                f"AND valid_to IS NULL", tuple(candidates)).fetchall()}
         else:
             existing = set()
         valid = [x for x in candidates if x in existing]
@@ -1598,7 +1598,7 @@ class Store:
         # rank apart, which swamps the gentle recency weight applied later)
         sql += " ORDER BY rank, m.updated_at DESC LIMIT ?"
         params.append(limit)
-        return [r[0] for r in self._conn.execute(sql, params).fetchall()]
+        return [r[0] for r in self._conn.execute(sql, tuple(params)).fetchall()]
 
     def _vector_ids(self, query, type=None, limit=200):
         """Ids ranked by cosine similarity to the query, or [] when semantic
@@ -1643,7 +1643,7 @@ class Store:
         placeholders = ",".join("?" for _ in ids)
         rows = self._conn.execute(
             f"SELECT id, type, title, body, tags, updated_at FROM memories "
-            f"WHERE id IN ({placeholders}) AND valid_to IS NULL", ids).fetchall()
+            f"WHERE id IN ({placeholders}) AND valid_to IS NULL", tuple(ids)).fetchall()
         by_id = {r[0]: {"id": r[0], "type": r[1], "title": r[2],
                         "body": r[3], "tags": r[4], "updated_at": r[5]}
                  for r in rows}
@@ -1699,7 +1699,7 @@ class Store:
         rows = self._conn.execute(
             f"SELECT memory_id FROM memory_tags WHERE memory_id IN ({id_ph}) "
             f"AND tag IN ({tag_ph}) GROUP BY memory_id HAVING COUNT(*) = ?",
-            [*ids, *required, len(required)]).fetchall()
+            (*ids, *required, len(required))).fetchall()
         return {r[0] for r in rows}
 
     def _recall_by_tags(self, type, tag_list, limit) -> list:
@@ -1729,7 +1729,7 @@ class Store:
             params.append(type)
         sql += " ORDER BY m.updated_at DESC, m.id DESC LIMIT ?"
         params.append(limit)
-        ids = [r[0] for r in self._conn.execute(sql, params).fetchall()]
+        ids = [r[0] for r in self._conn.execute(sql, tuple(params)).fetchall()]
         return self._hydrate(ids)
 
     @_locked
@@ -1861,14 +1861,14 @@ class Store:
         ph = ",".join("?" for _ in ids)
         return [r[0] for r in self._conn.execute(
             f"SELECT id FROM memories WHERE id IN ({ph}) "
-            f"ORDER BY updated_at DESC, id DESC", ids).fetchall()]
+            f"ORDER BY updated_at DESC, id DESC", tuple(ids)).fetchall()]
 
     def _updated_at_of(self, ids):
         if not ids:
             return {}
         ph = ",".join("?" for _ in ids)
         return {r[0]: r[1] for r in self._conn.execute(
-            f"SELECT id, updated_at FROM memories WHERE id IN ({ph})", ids).fetchall()}
+            f"SELECT id, updated_at FROM memories WHERE id IN ({ph})", tuple(ids)).fetchall()}
 
     def _links_of(self, mid) -> list:
         row = self._conn.execute("SELECT links FROM memories WHERE id=?", (mid,)).fetchone()

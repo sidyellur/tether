@@ -356,7 +356,7 @@ class Graph:
         if type is not None:
             sql += " AND type = ?"
             params.append(type)
-        valid = {r[0]: r[1] for r in self._conn.execute(sql, params).fetchall()}
+        valid = {r[0]: r[1] for r in self._conn.execute(sql, tuple(params)).fetchall()}
         out = []
         for nbr in sorted(agg):
             if nbr not in valid:
