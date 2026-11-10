@@ -2164,39 +2164,59 @@ class Store:
         self._boot_cache = result
         return result
 
+    _INDEX_COLS = "m.id, m.type, m.title, m.updated_at"
+
     def _boot_index_impl(self) -> str:
-        rows = self._conn.execute(
-            "SELECT id, type, title, updated_at, tags FROM memories "
-            "WHERE valid_to IS NULL ORDER BY updated_at DESC, id DESC"
-        ).fetchall()
-        if not rows:
+        """Build the index from only the rows it will print.
+
+        This used to load every current memory (id, type, title, tags) and
+        pick in Python - 34 ms at 8,000 memories, paid on the first read of
+        every session, to print 50 lines. Each part is now its own bounded
+        query: a count, the project's newest memories via the tag index, the
+        newest few of everything else via idx_memories_updated, and (when
+        curating) just the hub candidates that can make the cut.
+        """
+        total = self._conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL").fetchone()[0]
+        if not total:
             return "(no memories yet)"
         cap = self._boot_index_cap
         prefix = ""
+        shown_ids = set()
         if self._project:
             # #92: lead with this project's memories - the thing the agent is
             # most likely to need in the first message of a session - and
             # curate the rest of the store into whatever budget remains.
-            tag = _project_tag(self._project)
-            mine = [r for r in rows if _tags_match(r[4], [tag])]
-            if mine:
-                shown = mine if len(rows) <= cap else mine[:max(1, cap // 2)]
+            shown = self._conn.execute(
+                f"SELECT {self._INDEX_COLS} FROM memory_tags t "
+                "JOIN memories m ON m.id = t.memory_id "
+                "WHERE t.tag = ? AND m.valid_to IS NULL "
+                "ORDER BY m.updated_at DESC, m.id DESC LIMIT ?",
+                (_project_tag(self._project),
+                 total if total <= cap else max(1, cap // 2))).fetchall()
+            if shown:
                 shown_ids = {r[0] for r in shown}
                 prefix = "\n".join(
                     [f"# This project ({self._project})",
                      *(f"[{t}] #{i} {title}" for i, t, title, *_ in shown)])
-                rows = [r for r in rows if r[0] not in shown_ids]
                 cap = max(0, cap - len(shown))
-                if not rows:
+                if total == len(shown):
                     return prefix
                 prefix += "\n# Everything else\n"
-        if len(rows) <= cap:
+        # The newest `cap` memories outside the project slice: everything the
+        # non-curated paths print, and the recency side of the curated one.
+        rows = [r for r in self._conn.execute(
+            f"SELECT {self._INDEX_COLS} FROM memories m WHERE m.valid_to IS NULL "
+            "ORDER BY m.updated_at DESC, m.id DESC LIMIT ?",
+            (cap + len(shown_ids),)).fetchall() if r[0] not in shown_ids][:cap]
+        if total - len(shown_ids) <= cap:
             body = "\n".join(f"[{t}] #{i} {title}" for i, t, title, *_ in rows)
             return prefix + body
         body = None
         if self._graph.enabled and cap > 0:
             try:
-                body = self._curated_index(rows, self._graph.degree_map(), cap)
+                body = self._curated_index(
+                    rows, self._graph.degree_map(), cap, shown_ids)
             except Exception:
                 body = None               # curation failure -> capped fallback below
         if body is None:
@@ -2208,25 +2228,49 @@ class Store:
     def _recency_capped_index(self, rows, cap) -> str:
         return "\n".join(f"[{t}] #{i} {title}" for i, t, title, *_ in rows[:cap])
 
-    def _curated_index(self, rows, deg, cap) -> str:
-        # rows: [(id, type, title, updated_at)] newest-first
-        meta = {r[0]: (r[1], r[2]) for r in rows}        # id -> (type, title)
-        upd = {r[0]: r[3] for r in rows}                 # id -> updated_at (tie-break)
+    def _index_rows(self, ids) -> dict:
+        """{id: (id, type, title, updated_at)} for the current memories among
+        `ids`, fetched in chunks that stay under SQLite's parameter limit."""
+        ids = list(ids)
+        out = {}
+        for k in range(0, len(ids), 500):
+            chunk = ids[k:k + 500]
+            ph = ",".join("?" for _ in chunk)
+            for r in self._conn.execute(
+                    f"SELECT {self._INDEX_COLS} FROM memories m "
+                    f"WHERE m.id IN ({ph}) AND m.valid_to IS NULL",
+                    tuple(chunk)).fetchall():
+                out[r[0]] = r
+        return out
+
+    def _curated_index(self, rows, deg, cap, exclude=frozenset()) -> str:
+        # rows: the newest `cap` (id, type, title, updated_at) outside
+        # `exclude`, newest first. `exclude` is the "# This project" slice:
+        # `deg` covers every current memory, but those are already printed.
+        # (Before the guard, a project memory with any link raised KeyError
+        # in the sort key below, which the caller's except turned into a
+        # silent fall back to the recency list - so hub curation never ran
+        # for a store that used projects and links together.)
+        info = {r[0]: r for r in rows}
         newest = [r[0] for r in rows]
         reserve = max(1, cap // 4)
         recent = newest[:reserve]
         recent_set = set(recent)
-        # `deg` covers every current memory, but `rows` no longer does once
-        # the "# This project" slice has been taken out of it. Without the
-        # `mid in meta` guard, a project memory with any link raised KeyError
-        # in the sort key below, which the caller's except turned into a
-        # silent fall back to the recency list - so hub curation never ran
-        # for a store that used projects and links together.
+        want = cap - reserve
+        candidates = [mid for mid in deg
+                      if deg[mid] > 0 and mid not in exclude
+                      and mid not in recent_set]
+        if len(candidates) > want > 0:
+            # Only memories at or above the `want`-th highest degree can be
+            # picked (ties at the cutoff are settled by updated_at below), so
+            # there is no need to look up the rest.
+            floor = sorted((deg[mid] for mid in candidates), reverse=True)[want - 1]
+            candidates = [mid for mid in candidates if deg[mid] >= floor]
+        info.update(self._index_rows(mid for mid in candidates if mid not in info))
         hubs = sorted(
-            (mid for mid in deg
-             if deg[mid] > 0 and mid in meta and mid not in recent_set),
-            key=lambda mid: (deg[mid], upd[mid], mid), reverse=True,
-        )[: cap - reserve]               # degree desc, then updated_at desc, then id desc
+            (mid for mid in candidates if mid in info),
+            key=lambda mid: (deg[mid], info[mid][3], mid), reverse=True,
+        )[:max(0, want)]                 # degree desc, then updated_at desc, then id desc
         chosen = set(hubs) | recent_set
         for mid in newest:                               # fill remaining budget with recency
             if len(chosen) >= cap:
@@ -2236,7 +2280,7 @@ class Store:
                 chosen.add(mid)
 
         def line(mid):
-            t, title = meta[mid]
+            _, t, title, _ = info[mid]
             return f"[{t}] #{mid} {title}"
 
         if not hubs:
