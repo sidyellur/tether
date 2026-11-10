@@ -3594,3 +3594,122 @@ def test_boot_index_curates_hubs_when_a_project_memory_is_linked():
     load_bearing = out.split("# Load-bearing")[1].split("# Recent")[0]
     assert f"#{hub_a} Hub A" in load_bearing and f"#{hub_b} Hub B" in load_bearing
     assert out.count(f"#{mine} Project note") == 1      # shown once, in its own section
+
+
+class _CountingConn:
+    """Counts statements by kind, to pin down what a call sends to the DB."""
+
+    def __init__(self, conn):
+        self._c = conn
+        self.writes = []
+        self.reads = 0
+        self.commits = 0
+
+    def execute(self, sql, params=()):
+        if sql.lstrip().split()[0].upper() in ("INSERT", "UPDATE", "DELETE"):
+            self.writes.append(sql)
+        else:
+            self.reads += 1
+        return self._c.execute(sql, params)
+
+    def commit(self):
+        self.commits += 1
+        return self._c.commit()
+
+    def reset(self):
+        self.writes, self.reads, self.commits = [], 0, 0
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
+def _counting_store(**kw):
+    conn = _CountingConn(sqlite3.connect(":memory:"))
+    s = Store(conn, "d", lambda *a, **k: None, assoc=True, **kw)
+    s.migrate()
+    return s, conn
+
+
+def test_recall_keeps_session_bookkeeping_out_of_the_database():
+    s, conn = _counting_store()
+    s.remember("user", "Car", "I drive my car to work")
+    s.remember("user", "Bike", "I ride my bike to work")
+    s.recall("work")                                 # first recall also sweeps
+    conn.reset()
+    s.recall("work")
+    s.recall("car", session="explicit")
+    assert conn.commits == 2                         # one per recall, not two
+    assert not [w for w in conn.writes if "meta" in w]
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'assoc_%' "
+                        "OR key = 'session_sweep_counter'").fetchone()[0] == 0
+
+
+def _statement_order(conn, call):
+    """Statement kinds (plus COMMIT) a call issues, in order."""
+    order = []
+    real_execute, real_commit = conn.execute, conn.commit
+
+    def spy_execute(sql, params=()):
+        order.append(sql.lstrip().split()[0].upper())
+        return real_execute(sql, params)
+
+    def spy_commit():
+        order.append("COMMIT")
+        return real_commit()
+
+    conn.execute, conn.commit = spy_execute, spy_commit
+    try:
+        call()
+    finally:
+        del conn.execute, conn.commit
+    return order
+
+
+def _reads_inside_write_transaction(order):
+    first_write = next(i for i, k in enumerate(order)
+                       if k in ("INSERT", "UPDATE", "DELETE"))
+    return order[first_write:order.index("COMMIT", first_write)].count("SELECT")
+
+
+def test_recall_reads_before_it_writes():
+    # On a sync replica the first write opens a remote transaction and every
+    # later statement in it - reads included - goes to the primary. So the
+    # lookups (session activation, each spread expansion) must come before
+    # the learning writes, not after a bookkeeping write at the top.
+    s, conn = _counting_store()
+    for i in range(6):
+        s.remember("user", f"Note {i}", "shared topic words here")
+    s.recall("shared topic")
+    order = _statement_order(conn, lambda: s.recall("shared topic words"))
+    assert _reads_inside_write_transaction(order) <= 1   # touch_session's own
+
+
+def test_first_recall_of_a_process_sweeps_abandoned_sessions():
+    # The recall counter is per process now, and a short-lived server may
+    # never reach the interval - so the first recall sweeps.
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, assoc=True, session_sweep_interval=1000)
+    s.migrate()
+    m = s.remember("user", "T0", "body")["id"]
+    conn.execute("INSERT INTO session_members VALUES"
+                 "('abandoned', ?, 0.9, '2000-01-01T00:00:00+00:00')", (m,))
+    conn.commit()
+    s.recall("T0")
+    assert conn.execute("SELECT COUNT(*) FROM session_members "
+                        "WHERE session_id='abandoned'").fetchone()[0] == 0
+    assert conn.in_transaction is False
+
+
+def test_migrate_prunes_only_stale_legacy_session_meta():
+    from tether.store import _now
+    s = make_store()
+    rows = [("assoc_session:old", "2000-01-01T00:00:00+00:00:old"),
+            ("assoc_last_activity:old", "2000-01-01T00:00:00+00:00"),
+            ("assoc_session:live", "x:live"),
+            ("assoc_last_activity:live", _now())]
+    s._conn.executemany("INSERT INTO meta(key, value) VALUES (?, ?)", rows)
+    s._conn.commit()
+    s.migrate()
+    keys = {r[0] for r in s._conn.execute(
+        "SELECT key FROM meta WHERE key LIKE 'assoc_%'").fetchall()}
+    assert keys == {"assoc_session:live", "assoc_last_activity:live"}

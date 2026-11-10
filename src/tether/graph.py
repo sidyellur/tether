@@ -98,6 +98,10 @@ class Graph:
         # (see Store._store_signature's docstring for the #68-shaped bug this
         # caused on Windows), a monotonic counter can't.
         self._write_seq = 0
+        # The implicit recall session for this process (see resolve_session):
+        # its id and the time of the last recall.
+        self._session_id = None
+        self._last_activity = None
 
     def _touch(self) -> None:
         self._write_seq += 1
@@ -403,31 +407,38 @@ class Graph:
             r.pop("_t", None)
         return activation, receipts
 
-    def resolve_session(self, session, meta_get, meta_set) -> str:
+    def resolve_session(self, session) -> str:
+        """The session id a recall belongs to: the caller's explicit one, or
+        this process's implicit bucket, which continues until
+        SESSION_GAP_SECONDS pass without a recall.
+
+        The bucket lives in memory. It used to be two `meta` rows keyed by
+        this Graph's random `_process_id` (#53), which no other process could
+        ever read - so persisting them bought nothing, cost two writes at the
+        start of every recall, and left two rows behind per server start.
+        Worse on a sync replica: that first write opened a remote
+        transaction, after which every read in the recall (the session
+        lookup, each spread expansion) was forwarded to the primary too.
+        Only ever called under the Store's lock, so plain attributes do.
+        """
         now_iso = _now()
-        # Per-process meta keys: two Graph instances (e.g. two server
-        # processes sharing one DB) each track their own gap/continuation
-        # state instead of racing over one shared global bucket (#53).
-        session_key = f"assoc_session:{self._process_id}"
-        activity_key = f"assoc_last_activity:{self._process_id}"
         if session:
             sid = str(session)
         else:
-            last = meta_get(activity_key)
-            cur = meta_get(session_key)
             gap = None
-            if last is not None:
+            if self._last_activity is not None:
                 try:
                     gap = (datetime.fromisoformat(now_iso)
-                           - datetime.fromisoformat(last)).total_seconds()
+                           - datetime.fromisoformat(self._last_activity)).total_seconds()
                 except Exception:
                     gap = None
-            if cur and gap is not None and gap <= SESSION_GAP_SECONDS:
-                sid = cur
+            if (self._session_id and gap is not None
+                    and gap <= SESSION_GAP_SECONDS):
+                sid = self._session_id
             else:
                 sid = f"{now_iso}:{self._process_id}"
-        meta_set(session_key, sid)
-        meta_set(activity_key, now_iso)
+        self._session_id = sid
+        self._last_activity = now_iso
         return sid
 
     def session_activation(self, session_id) -> dict:
@@ -479,6 +490,14 @@ class Graph:
         try:
             cutoff = (datetime.now(timezone.utc)
                       - timedelta(seconds=horizon_seconds)).isoformat()
+            # Look before deleting: the usual answer is "nothing stale", and
+            # an indexed read costs nothing, whereas a DELETE opens a write
+            # transaction (a remote one on a sync replica) even when it
+            # matches no rows.
+            if self._conn.execute(
+                    "SELECT 1 FROM session_members WHERE updated_at < ? LIMIT 1",
+                    (cutoff,)).fetchone() is None:
+                return 0
             cur = self._conn.execute(
                 "DELETE FROM session_members WHERE updated_at < ?", (cutoff,))
             return cur.rowcount
