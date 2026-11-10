@@ -851,7 +851,7 @@ def test_boot_index_does_not_rescan_without_writes():
     scans = []
     s._conn.set_trace_callback(
         lambda sql: scans.append(sql)
-        if "id, type, title, updated_at, tags FROM memories" in sql else None)
+        if "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL" in sql else None)
     try:
         again = s.boot_index()
     finally:
@@ -898,7 +898,7 @@ def test_boot_index_rescans_after_link():
     scans = []
     s._conn.set_trace_callback(
         lambda sql: scans.append(sql)
-        if "id, type, title, updated_at, tags FROM memories" in sql else None)
+        if "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL" in sql else None)
     try:
         s.link(a, b)
         s.boot_index()
@@ -928,7 +928,7 @@ def test_boot_index_rescans_even_when_every_write_shares_one_timestamp(monkeypat
     scans = []
     s._conn.set_trace_callback(
         lambda sql: scans.append(sql)
-        if "id, type, title, updated_at, tags FROM memories" in sql else None)
+        if "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL" in sql else None)
     try:
         s.link(a, b)
         s.boot_index()
@@ -3715,3 +3715,64 @@ def test_migrate_prunes_only_stale_legacy_session_meta():
     keys = {r[0] for r in s._conn.execute(
         "SELECT key FROM meta WHERE key LIKE 'assoc_%'").fetchall()}
     assert keys == {"assoc_session:live", "assoc_last_activity:live"}
+
+
+def test_boot_index_hub_cutoff_tie_goes_to_the_most_recently_updated():
+    # cap 8 -> 2 recent + up to 6 hubs. Eight equally-linked pairs give 16 hub
+    # candidates at one degree; the six most recently updated must win, and
+    # only candidates at or above the cutoff degree are looked up at all.
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, assoc=True, boot_index_cap=8)
+    s.migrate()
+    ids = [s.remember("user", f"Hub {i}", "x")["id"] for i in range(16)]
+    for i in range(0, 16, 2):
+        s.link(ids[i], ids[i + 1])
+    for i in range(30):
+        s.remember("user", f"Filler {i}", "x")
+    out = s.boot_index()
+    hubs = out.split("# Load-bearing\n")[1].split("\n# Recent")[0].splitlines()
+    newest_six = [r[0] for r in conn.execute(
+        "SELECT id FROM memories WHERE title LIKE 'Hub %' "
+        "ORDER BY updated_at DESC, id DESC LIMIT 6").fetchall()]
+    assert [int(line.split("#")[1].split()[0]) for line in hubs] == newest_six
+    assert len(out.splitlines()) == 8 + 2            # cap lines + two headings
+
+
+def test_boot_index_reads_only_the_rows_it_prints():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, assoc=False, project="tether",
+              boot_index_cap=6)
+    s.migrate()
+    for i in range(120):
+        s.remember("project" if i % 3 == 0 else "user", f"Note {i}", "x")
+    fetched = []
+    real_execute = conn.execute
+
+    class _Spy:
+        def execute(self, sql, params=()):
+            rows = real_execute(sql, params).fetchall()
+            fetched.append(len(rows))
+            return _Rows(rows)
+
+        def __getattr__(self, name):
+            return getattr(conn, name)
+
+    class _Rows(list):
+        def fetchall(self):
+            return list(self)
+
+        def fetchone(self):
+            return self[0] if self else None
+
+    s._conn = _Spy()
+    out = s._boot_index_impl()
+    s._conn = conn
+    assert out.count("\n") + 1 == 6 + 2
+    assert max(fetched) <= 6 + 3                     # never the whole store
+
+
+def test_index_rows_chunks_past_the_parameter_limit():
+    s = make_store()
+    ids = [s.remember("user", f"N{i}", "x")["id"] for i in range(3)]
+    got = s._index_rows([*ids, *range(10_000, 11_200)])
+    assert sorted(got) == ids
