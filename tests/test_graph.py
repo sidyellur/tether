@@ -530,3 +530,50 @@ def test_on_remember_with_fewer_memories_than_k():
     g.on_remember(2, v.tobytes())
     assert g._conn.execute(
         "SELECT src, dst FROM edges WHERE kind='semantic'").fetchall() == [(1, 2)]
+
+
+def test_upsert_edges_matches_one_at_a_time_semantics():
+    g1, g2 = make_graph(), make_graph()
+    rows = [(2, 1, "hebbian", 0.5), (1, 2, "hebbian", 0.5), (3, 3, "hebbian", 0.5),
+            (4, 1, "hebbian", 0.5)]
+    for mode in ("add", "max", "add"):
+        g1._upsert_edges(rows, "t", mode=mode)
+        for a, b, kind, w in rows:
+            g2._upsert_edge(a, b, kind, w, "t", mode=mode)
+    q = "SELECT src, dst, kind, weight FROM edges ORDER BY 1, 2, 3"
+    assert g1._conn.execute(q).fetchall() == g2._conn.execute(q).fetchall()
+    assert g1._conn.execute(q).fetchall() == [(1, 2, "hebbian", 2.0), (1, 4, "hebbian", 1.0)]
+
+
+def test_upsert_edges_chunks_large_batches_and_caps_weight():
+    g = make_graph()
+    rows = [(1, i, "hebbian", 4.0) for i in range(2, 2 + 2 * g._EDGE_BATCH + 7)]
+    g._upsert_edges(rows, "t", mode="add")
+    g._upsert_edges(rows, "t", mode="add")          # 8.0 would exceed the cap
+    n, lo, hi = g._conn.execute(
+        "SELECT COUNT(*), MIN(weight), MAX(weight) FROM edges").fetchone()
+    assert n == len(rows) and lo == hi == 5.0
+    g._upsert_edges([], "t")                          # empty is a no-op, not an error
+    g.backfill_explicit([])
+
+
+def test_touch_session_writes_in_at_most_four_statements():
+    g = make_graph()
+    g.touch_session("s", [1, 2, 3, 4, 5, 6])
+    statements = []
+    g._conn.set_trace_callback(statements.append)
+    g.touch_session("s", [3, 2, 7, 1])
+    g._conn.set_trace_callback(None)
+    kinds = [st.lstrip().split()[0].upper() for st in statements]
+    writes = [k for k in kinds if k in ("INSERT", "UPDATE", "DELETE")]
+    assert len(writes) <= 4
+    first_write = next(i for i, k in enumerate(kinds) if k in ("INSERT", "UPDATE", "DELETE"))
+    assert "SELECT" not in kinds[first_write:]
+
+
+def test_touch_session_handles_a_repeated_id():
+    g = make_graph()
+    g.touch_session("s", [1, 1, 2])                   # 1 gets rank 0 AND rank 1
+    acts = dict(g._conn.execute(
+        "SELECT memory_id, activation FROM session_members WHERE session_id='s'").fetchall())
+    assert acts == {1: 1.5, 2: 0.25}

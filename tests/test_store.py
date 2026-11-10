@@ -3681,7 +3681,9 @@ def test_recall_reads_before_it_writes():
         s.remember("user", f"Note {i}", "shared topic words here")
     s.recall("shared topic")
     order = _statement_order(conn, lambda: s.recall("shared topic words"))
-    assert _reads_inside_write_transaction(order) <= 1   # touch_session's own
+    assert _reads_inside_write_transaction(order) == 0
+    writes = [k for k in order if k in ("INSERT", "UPDATE", "DELETE")]
+    assert len(writes) <= 4      # decay, bump, Hebbian pairs, (TTL delete)
 
 
 def test_first_recall_of_a_process_sweeps_abandoned_sessions():
