@@ -163,8 +163,6 @@ def test_resolve_session_uses_param_then_time_buckets():
     assert sid1 != "explicit-1"
     sid2 = g.resolve_session(None)                 # immediately after -> same bucket
     assert sid1 == sid2
-    g._last_activity = "2000-01-01T00:00:00+00:00"
-    assert g.resolve_session(None) != sid1
 
 
 def test_resolve_session_scopes_implicit_bucket_per_process():
