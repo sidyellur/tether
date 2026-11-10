@@ -133,7 +133,7 @@ CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
     INSERT INTO memories_fts(memories_fts, rowid, title, body, tags)
         VALUES ('delete', old.id, old.title, old.body, old.tags);
 END;
-CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF title, body, tags ON memories BEGIN
     INSERT INTO memories_fts(memories_fts, rowid, title, body, tags)
         VALUES ('delete', old.id, old.title, old.body, old.tags);
     INSERT INTO memories_fts(rowid, title, body, tags)
@@ -928,6 +928,7 @@ class Store:
             self._conn.execute("DROP TABLE memories_fts")
             fts_existed = False
         self._conn.execute(_fts_schema(self._stemming))
+        self._drop_unscoped_fts_update_trigger()
         self._conn.executescript(_TRIGGER_SCHEMA)
         self._conn.executescript(_TAGS_TRIGGER_SCHEMA)
         self._conn.executescript(_META_SCHEMA)
@@ -1002,6 +1003,24 @@ class Store:
             "SELECT m.id, trim(je.value) FROM memories m, "
             f"json_each({_tags_json_array_sql('m.tags')}) je "
             "WHERE trim(je.value) != ''")
+
+    def _drop_unscoped_fts_update_trigger(self) -> None:
+        """Drop a `memories_au` trigger created before it was scoped to
+        `UPDATE OF title, body, tags`, so the CREATE TRIGGER IF NOT EXISTS
+        that follows installs the scoped one (IF NOT EXISTS would otherwise
+        leave the old definition in place forever).
+
+        The unscoped trigger re-indexed a row in FTS on EVERY update of
+        `memories` - forget()'s valid_to, link()'s links, each embedding
+        written by a backfill, the wholesale `embedding=NULL` on a model
+        change - though none of those touch the three indexed columns. The
+        index content is identical either way, so nothing needs rebuilding.
+        """
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='memories_au'").fetchone()
+        if row is not None and "UPDATE OF" not in (row[0] or "").upper():
+            self._conn.execute("DROP TRIGGER memories_au")
 
     def _table_exists(self, name) -> bool:
         return self._conn.execute(
@@ -1694,9 +1713,16 @@ class Store:
         table scan on every tag-only recall call."""
         required = list(dict.fromkeys(tag_list))
         tag_ph = ",".join("?" for _ in required)
-        sql = ("SELECT m.id FROM memories m WHERE m.valid_to IS NULL "
-               "AND (SELECT COUNT(*) FROM memory_tags t "
-               f"WHERE t.memory_id = m.id AND t.tag IN ({tag_ph})) = ?")
+        # Driven FROM the tag index: the grouped subquery finds the ids
+        # carrying every required tag via idx_memory_tags_tag, and only those
+        # are joined to `memories`. The earlier shape probed memory_tags once
+        # per current memory, so it still walked the whole store - slowest of
+        # all when the tag matched nothing.
+        sql = ("SELECT m.id FROM (SELECT memory_id FROM memory_tags "
+               f"WHERE tag IN ({tag_ph}) GROUP BY memory_id "
+               "HAVING COUNT(*) = ?) x "
+               "JOIN memories m ON m.id = x.memory_id "
+               "WHERE m.valid_to IS NULL")
         params = [*required, len(required)]
         if type is not None:
             sql += " AND m.type = ?"

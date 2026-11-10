@@ -498,3 +498,39 @@ def test_dismiss_peak_is_canonical_and_readable():
     g.migrate()
     g.dismiss_peak(5, 2)                             # order-independent
     assert g.dismissed_peaks() == {(2, 5)}
+
+
+def test_on_remember_wires_exactly_the_top_k_nearest(monkeypatch):
+    # The kNN is selected (argpartition), not fully sorted: with more
+    # candidates than KNN_K it must still pick the KNN_K most similar, never
+    # the memory itself, and nothing beyond them.
+    np = pytest.importorskip("numpy")
+    from tether import graph as graph_mod
+    monkeypatch.setattr(graph_mod, "KNN_K", 3)
+    g = make_graph()
+    rng = np.random.default_rng(7)
+    vecs = rng.standard_normal((12, 16)).astype(np.float32)
+    vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+    for i, v in enumerate(vecs, start=1):
+        _seed_memory(g._conn, i, "user", f"T{i}", "b", v.tobytes())
+    mid = 5
+    g.on_remember(mid, vecs[mid - 1].tobytes())
+    sims = vecs @ vecs[mid - 1]
+    ranked = [int(i) + 1 for i in np.argsort(-sims) if int(i) + 1 != mid]
+    expected = {o for o in ranked[:3] if sims[o - 1] > 0}
+    wired = {a if b == mid else b for a, b in g._conn.execute(
+        "SELECT src, dst FROM edges WHERE kind='semantic'").fetchall()}
+    assert wired == expected
+
+
+def test_on_remember_with_fewer_memories_than_k():
+    np = pytest.importorskip("numpy")
+    g = make_graph()
+    v = np.array([1.0, 0.0], dtype=np.float32)
+    _seed_memory(g._conn, 1, "user", "only", "b", v.tobytes())
+    g.on_remember(1, v.tobytes())                  # just itself: no edge, no error
+    assert g._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+    _seed_memory(g._conn, 2, "user", "second", "b", v.tobytes())
+    g.on_remember(2, v.tobytes())
+    assert g._conn.execute(
+        "SELECT src, dst FROM edges WHERE kind='semantic'").fetchall() == [(1, 2)]
