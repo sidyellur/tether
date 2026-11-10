@@ -152,43 +152,34 @@ def test_spread_respects_type_and_validity():
     assert 3 not in act        # superseded filtered
 
 
-def _meta_pair():
-    store = {}
-    return (lambda k: store.get(k)), (lambda k, v: store.__setitem__(k, str(v)))
-
-
 def test_resolve_session_uses_param_then_time_buckets():
     g = make_graph()
-    get, set_ = _meta_pair()
-    assert g.resolve_session("explicit-1", get, set_) == "explicit-1"
-    sid1 = g.resolve_session(None, get, set_)
-    sid2 = g.resolve_session(None, get, set_)      # immediately after -> same bucket
-    assert sid1 == sid2
+    assert g.resolve_session("explicit-1") == "explicit-1"
+    # an implicit recall right after an explicit one continues that session
+    assert g.resolve_session(None) == "explicit-1"
     # simulate a long gap by rewinding last-activity far into the past
-    # (meta keys are namespaced per-process, see #53)
-    set_(f"assoc_last_activity:{g._process_id}", "2000-01-01T00:00:00+00:00")
-    sid3 = g.resolve_session(None, get, set_)
-    assert sid3 != sid1
+    g._last_activity = "2000-01-01T00:00:00+00:00"
+    sid1 = g.resolve_session(None)
+    assert sid1 != "explicit-1"
+    sid2 = g.resolve_session(None)                 # immediately after -> same bucket
+    assert sid1 == sid2
 
 
 def test_resolve_session_scopes_implicit_bucket_per_process():
     # #53: two "processes" (two Graph instances, e.g. two server startups)
-    # sharing the same underlying meta store must NOT resolve to the same
-    # implicit session id merely for recalling in the same time window.
+    # sharing the same underlying DB must NOT resolve to the same implicit
+    # session id merely for recalling in the same time window.
     conn = sqlite3.connect(":memory:")
     g1 = Graph(conn, enabled=True)
     g1.migrate()
     g2 = Graph(conn, enabled=True)
     assert g1._process_id != g2._process_id
-    store = {}
-    get = lambda k: store.get(k)
-    set_ = lambda k, v: store.__setitem__(k, str(v))
-    sid_a = g1.resolve_session(None, get, set_)
-    sid_b = g2.resolve_session(None, get, set_)      # same instant, shared meta store
+    sid_a = g1.resolve_session(None)
+    sid_b = g2.resolve_session(None)               # same instant, same DB
     assert sid_a != sid_b
     # each process still continues its own bucket on a follow-up call
-    assert g1.resolve_session(None, get, set_) == sid_a
-    assert g2.resolve_session(None, get, set_) == sid_b
+    assert g1.resolve_session(None) == sid_a
+    assert g2.resolve_session(None) == sid_b
 
 
 def test_resolve_session_explicit_session_unchanged_across_processes():
@@ -196,11 +187,16 @@ def test_resolve_session_explicit_session_unchanged_across_processes():
     g1 = Graph(conn, enabled=True)
     g1.migrate()
     g2 = Graph(conn, enabled=True)
-    store = {}
-    get = lambda k: store.get(k)
-    set_ = lambda k, v: store.__setitem__(k, str(v))
-    assert g1.resolve_session("shared", get, set_) == "shared"
-    assert g2.resolve_session("shared", get, set_) == "shared"
+    assert g1.resolve_session("shared") == "shared"
+    assert g2.resolve_session("shared") == "shared"
+
+
+def test_resolve_session_writes_nothing():
+    g = make_graph()
+    g._conn.commit()
+    g.resolve_session(None)
+    g.resolve_session("explicit")
+    assert g._conn.in_transaction is False
 
 
 def test_sweep_stale_session_members_removes_only_idle_sessions():

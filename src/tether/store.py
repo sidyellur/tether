@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import warnings
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import graph, sync
 from .graph import Graph
@@ -595,6 +595,9 @@ class Store:
         self._forget_interval = forget_interval
         self._forget_max_per_sweep = forget_max_per_sweep
         self._session_sweep_interval = session_sweep_interval
+        # Recalls since the last session sweep; starts at the interval so the
+        # first recall of the process sweeps (see _maybe_sweep_sessions).
+        self._recalls_since_sweep = session_sweep_interval
         # #62: sync_now only ran after writes, so a device that merely READS
         # never pulled other devices' updates - it saw the store as of its own
         # startup probe until it happened to write something. Reads now pull
@@ -970,7 +973,33 @@ class Store:
                         pairs.append((rid, other))
             self._graph.backfill_explicit(pairs)
             self._meta_set("explicit_links_backfilled", "1")
+        self._prune_legacy_session_meta()
         self._commit()
+
+    def _prune_legacy_session_meta(self) -> None:
+        """Remove the per-process session rows older versions left in `meta`
+        (`assoc_session:<pid>` / `assoc_last_activity:<pid>`, two per server
+        start, never deleted, and synced to every device). The session bucket
+        is in memory now (Graph.resolve_session), so nothing reads them.
+
+        Only pairs idle for longer than the session sweep horizon go: a
+        server still running an older version, here or on another synced
+        device, keeps its live bucket. Reads first, so a database with
+        nothing to prune costs no write. Never raises.
+        """
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(
+                seconds=graph.SESSION_SWEEP_HORIZON_SECONDS)).isoformat()
+            stale = [r[0] for r in self._conn.execute(
+                "SELECT key FROM meta WHERE key LIKE 'assoc_last_activity:%' "
+                "AND value < ?", (cutoff,)).fetchall()]
+            prefix = len("assoc_last_activity:")
+            for key in stale:
+                self._conn.execute(
+                    "DELETE FROM meta WHERE key IN (?, ?)",
+                    (key, "assoc_session:" + key[prefix:]))
+        except Exception:
+            return
 
     def _backfill_memory_tags(self) -> None:
         """One-time backfill of memory_tags (#111) for a DB that already has
@@ -1502,21 +1531,27 @@ class Store:
             return
 
     def _maybe_sweep_sessions(self) -> None:
-        """Amortized trigger: every session_sweep_interval recalls, sweep
-        session_members for sessions abandoned longer than the sweep horizon
-        (#48). Independent of any specific session being active. No-op when
-        the graph is disabled."""
+        """Amortized trigger: on this process's first recall, and every
+        session_sweep_interval recalls after that, sweep session_members for
+        sessions abandoned longer than the sweep horizon (#48). Independent
+        of any specific session being active. No-op when the graph is
+        disabled.
+
+        The recall counter lives in memory. It used to be a `meta` row
+        written and committed on every recall - a second commit per recall
+        for a number nothing else reads. A stdio server is a new process per
+        agent session and may never reach the interval, so the counter starts
+        "due": each process sweeps once early instead of relying on a count
+        carried over from the last one. Commits only when rows were removed.
+        """
         if not self._graph.enabled:
             return
         try:
-            n = int(self._meta_get("session_sweep_counter") or 0) + 1
-            if n >= self._session_sweep_interval:
-                self._meta_set("session_sweep_counter", 0)
-                self._commit()
-                self._graph.sweep_stale_session_members()
-                self._commit()
-            else:
-                self._meta_set("session_sweep_counter", n)
+            self._recalls_since_sweep += 1
+            if self._recalls_since_sweep < self._session_sweep_interval:
+                return
+            self._recalls_since_sweep = 0
+            if self._graph.sweep_stale_session_members():
                 self._commit()
         except Exception:
             return
@@ -1777,10 +1812,11 @@ class Store:
             matching = self._ids_matching_tags(list(seeds), tag_list)
             seeds = {mid: s for mid, s in seeds.items() if mid in matching}
         # #124 follow-up (#126): gate on `seeds` here, before anything below
-        # can write. resolve_session() below always writes two `meta` rows
-        # (session bookkeeping) whether or not this recall matches anything;
-        # this used to gate AFTER that write instead of before it, so a
-        # no-hit query left that write's transaction open - never committed,
+        # can write. resolve_session() below used to write two `meta` rows
+        # (session bookkeeping - it is in-memory now) whether or not the
+        # recall matched anything, and this used to gate AFTER that write
+        # instead of before it, so a no-hit query left that write's
+        # transaction open - never committed,
         # since the early return skipped the _commit() at the end of this
         # method - holding the WAL write lock until some unrelated later
         # call happened to commit or roll back. Nothing between here and
@@ -1802,7 +1838,7 @@ class Store:
         # associative path: seed -> prime -> spread -> two-tier rank -> learn -> receipts
         if budget is None:
             budget = self._recall_budget
-        sid = self._graph.resolve_session(session, self._meta_get, self._meta_set)
+        sid = self._graph.resolve_session(session)
         # `seeds` stays the immutable v0.2 result (the protected tier); prime a copy
         # so priming/spread never reorder the seed tier.
         activated = dict(seeds)
