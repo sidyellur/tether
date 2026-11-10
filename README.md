@@ -22,7 +22,7 @@ agent more useful when present, and never breaks the agent's work when degraded.
 
 ## Status
 
-**v0.6.1.** The core (four memory verbs + boot index + FTS5) shipped in v0.1;
+**v0.6.2.** The core (four memory verbs + boot index + FTS5) shipped in v0.1;
 since then recall has grown a semantic arm, consolidation, an associative usage
 graph, a self-organizing store, and opt-in crystallization — each additive and
 each degrading cleanly to plain keyword recall. Every feature below is
