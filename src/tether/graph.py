@@ -170,7 +170,19 @@ class Graph:
             # self-similarity is 1.0 - so it would win every kNN. _upsert_edge
             # already refuses a self-edge, but excluding it here keeps it from
             # consuming one of the k slots.
-            order = [int(i) for i in np.argsort(-sims) if ids[int(i)] != mid]
+            #
+            # Only the top KNN_K matter, so select them rather than sorting
+            # (and then walking, in Python) the whole store: argpartition
+            # pulls the KNN_K + 1 best in O(n) - one spare because `mid` may
+            # be among them - and only those few are ordered. A full argsort
+            # plus a per-row list comprehension here was ~70% of a remember()
+            # at 8k memories and made a backfill quadratic in Python work.
+            # Ties order by row index (ascending id), so the result is
+            # deterministic.
+            k = min(KNN_K + 1, len(ids))
+            top = np.argpartition(-sims, k - 1)[:k]
+            top = top[np.lexsort((top, -sims[top]))]
+            order = [int(i) for i in top if ids[int(i)] != mid]
             now = _now()
             for i in order[:KNN_K]:
                 w = float(sims[i])

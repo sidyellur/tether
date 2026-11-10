@@ -3467,3 +3467,59 @@ def test_read_sync_failure_still_never_breaks_the_read_after_refactor():
     hits = s.recall("findable")
     assert [h["title"] for h in hits] == ["A"]
     assert s.boot_index() != ""
+
+
+def _fts_update_trigger_sql(conn):
+    return conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' "
+                        "AND name='memories_au'").fetchone()[0]
+
+
+def test_fts_update_trigger_is_scoped_to_indexed_columns():
+    s = make_store()
+    assert "UPDATE OF title, body, tags" in _fts_update_trigger_sql(s._conn)
+
+
+def test_migrate_replaces_a_legacy_unscoped_fts_update_trigger():
+    s = make_store()
+    mid = s.remember("user", "Editor", "prefers vim keybindings")["id"]
+    # Put back the trigger as older versions created it.
+    s._conn.executescript("""
+        DROP TRIGGER memories_au;
+        CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, title, body, tags)
+                VALUES ('delete', old.id, old.title, old.body, old.tags);
+            INSERT INTO memories_fts(rowid, title, body, tags)
+                VALUES (new.id, new.title, new.body, new.tags);
+        END;""")
+    s.migrate()
+    assert "UPDATE OF title, body, tags" in _fts_update_trigger_sql(s._conn)
+    s.migrate()                                    # and stays put when current
+    assert "UPDATE OF title, body, tags" in _fts_update_trigger_sql(s._conn)
+    assert [h["id"] for h in s.recall("vim")] == [mid]
+
+
+def test_fts_stays_consistent_across_non_text_and_text_updates():
+    s = make_store()
+    a = s.remember("user", "Editor", "prefers vim keybindings")["id"]
+    b = s.remember("user", "Shell", "uses zsh")["id"]
+    s.link(a, b)                                   # links/updated_at only
+    s.forget(a)                                    # valid_to only
+    assert s.recall("vim") == []
+    s.restore(a)
+    assert [h["id"] for h in s.recall("vim")] == [a]
+    s.remember("user", "Editor", "switched to helix")   # text changes: re-indexed
+    assert s.recall("vim") == []
+    assert [h["id"] for h in s.recall("helix")] == [a]
+    s._conn.execute(
+        "INSERT INTO memories_fts(memories_fts, rank) VALUES('integrity-check', 1)")
+
+
+def test_tag_only_recall_requires_every_tag_and_skips_forgotten():
+    s = make_store()
+    both = s.remember("user", "Both", "x", tags="alpha,beta")["id"]
+    s.remember("user", "One", "x", tags="alpha")
+    gone = s.remember("user", "Gone", "x", tags="alpha,beta")["id"]
+    s.forget(gone)
+    assert [h["id"] for h in s.recall("", tags="alpha,beta")] == [both]
+    assert [h["id"] for h in s.recall("", tags="alpha,beta", type="project")] == []
+    assert s.recall("", tags="alpha,nope") == []

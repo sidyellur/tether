@@ -393,9 +393,9 @@ A few things that make this hold:
 Costs to expect once: the first boot after installing the `[semantic]` extra
 (or changing the model) embeds every existing memory and wires its
 neighbours, which takes a second or two per few thousand memories. The boot
-index and tag-only lookups scan the store on each call; both are fast at
-typical sizes (under 10 ms at 2,000 memories) and are the next things on the
-list to cache.
+index scans the store when it is first read; that is fast at typical sizes
+(under 10 ms at 2,000 memories) and is the next thing on the list to trim.
+Tag-only lookups go through the tag index and no longer scan.
 
 ## Benchmarks
 
