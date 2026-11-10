@@ -126,6 +126,44 @@ class Graph:
             f"ON CONFLICT(src, dst, kind) DO UPDATE SET {expr}, updated_at=excluded.updated_at",
             params)
 
+    # Rows per multi-row INSERT in _upsert_edges: 5 bound values each, kept
+    # well under SQLite's oldest default limit of 999 parameters.
+    _EDGE_BATCH = 150
+
+    def _upsert_edges(self, rows, now, mode="max") -> None:
+        """Upsert many edges in one statement per _EDGE_BATCH rows.
+
+        `rows` is an iterable of (a, b, kind, weight); each is canonicalized
+        and merged exactly as _upsert_edge would, in order (a pair repeated
+        within `rows` conflicts with its own earlier row, so "add" adds twice
+        and "max" keeps the larger, same as two separate calls).
+
+        One statement instead of one per edge matters on a sync replica,
+        where each statement inside a write transaction is its own trip to
+        the primary: a recall wires up to 28 Hebbian pairs and a remember 8
+        semantic neighbours.
+        """
+        values = []
+        for a, b, kind, weight in rows:
+            if a == b:
+                continue
+            src, dst = (a, b) if a < b else (b, a)
+            values.append((src, dst, kind, weight, now))
+        if mode == "add":
+            expr = "weight = min(?, edges.weight + excluded.weight)"
+            tail = (HEBBIAN_CAP,)
+        else:  # max
+            expr = "weight = max(edges.weight, excluded.weight)"
+            tail = ()
+        for i in range(0, len(values), self._EDGE_BATCH):
+            chunk = values[i:i + self._EDGE_BATCH]
+            self._conn.execute(
+                "INSERT INTO edges(src, dst, kind, weight, updated_at) VALUES "
+                + ",".join("(?,?,?,?,?)" for _ in chunk)
+                + f" ON CONFLICT(src, dst, kind) DO UPDATE SET {expr}, "
+                "updated_at=excluded.updated_at",
+                tuple(v for row in chunk for v in row) + tail)
+
     def on_forget(self, mid) -> None:
         try:
             self._conn.execute("DELETE FROM edges WHERE src=? OR dst=?", (mid, mid))
@@ -187,12 +225,9 @@ class Graph:
             top = np.argpartition(-sims, k - 1)[:k]
             top = top[np.lexsort((top, -sims[top]))]
             order = [int(i) for i in top if ids[int(i)] != mid]
-            now = _now()
-            for i in order[:KNN_K]:
-                w = float(sims[i])
-                if w <= 0:
-                    continue
-                self._upsert_edge(mid, ids[i], "semantic", w, now, mode="max")
+            neighbours = [(mid, ids[i], "semantic", float(sims[i]))
+                          for i in order[:KNN_K] if float(sims[i]) > 0]
+            self._upsert_edges(neighbours, _now(), mode="max")
         except Exception:
             return
 
@@ -277,9 +312,8 @@ class Graph:
         if not self.enabled:
             return
         try:
-            now = _now()
-            for a, b in pairs:
-                self._upsert_edge(a, b, "explicit", 1.0, now, mode="max")
+            self._upsert_edges(((a, b, "explicit", 1.0) for a, b in pairs),
+                               _now(), mode="max")
         except Exception:
             return
 
@@ -450,31 +484,55 @@ class Graph:
             return {}
 
     def touch_session(self, session_id, ordered_ids) -> None:
+        """Record a recall in its session: decay the working set, bump the
+        recalled ids by rank, wire the most active members to each other
+        (Hebbian), and drop members that have decayed below the TTL.
+
+        The session is read ONCE, up front, and the resulting activations
+        are worked out here rather than re-read mid-transaction; every write
+        is then a single statement. The arithmetic is the same IEEE double
+        multiply and add SQLite performs in the UPDATE/upsert below, so the
+        values (and therefore which members clear HEBBIAN_WIRE_FLOOR, in
+        what order) match what a re-read would return. That keeps a recall's
+        learning to at most four statements, none of them a read - on a sync
+        replica each statement inside the write transaction is a trip to the
+        primary, and this used to be up to 36 of them.
+        """
         try:
             now = _now()
-            self._conn.execute(
-                "UPDATE session_members SET activation = activation * ?, updated_at=? "
-                "WHERE session_id=?", (SESSION_DECAY, now, session_id))
+            activation = {r[0]: r[1] * SESSION_DECAY for r in self._conn.execute(
+                "SELECT memory_id, activation FROM session_members "
+                "WHERE session_id=?", (session_id,)).fetchall()}
+            had_members = bool(activation)
+            bumps = []
             for rank, mid in enumerate(ordered_ids):
                 bump = HEBBIAN_BUMP_DECAY ** rank
                 if bump < SESSION_TTL_ACTIVATION:
                     break  # geometric: every later rank is smaller still
+                bumps.append((session_id, mid, bump, now))
+                activation[mid] = activation.get(mid, 0.0) + bump
+            if had_members:
+                self._conn.execute(
+                    "UPDATE session_members SET activation = activation * ?, updated_at=? "
+                    "WHERE session_id=?", (SESSION_DECAY, now, session_id))
+            if bumps:
                 self._conn.execute(
                     "INSERT INTO session_members(session_id, memory_id, activation, updated_at) "
-                    "VALUES (?,?,?,?) ON CONFLICT(session_id, memory_id) "
-                    "DO UPDATE SET activation = session_members.activation + ?, updated_at=?",
-                    (session_id, mid, bump, now, bump, now))
-            active = [r[0] for r in self._conn.execute(
-                "SELECT memory_id FROM session_members WHERE session_id=? "
-                "AND activation >= ? ORDER BY activation DESC, memory_id LIMIT ?",
-                (session_id, HEBBIAN_WIRE_FLOOR, HEBBIAN_TOP_M)).fetchall()]
-            for i in range(len(active)):
-                for j in range(i + 1, len(active)):
-                    self._upsert_edge(active[i], active[j], "hebbian",
-                                      HEBBIAN_INCREMENT, now, mode="add")
-            self._conn.execute(
-                "DELETE FROM session_members WHERE session_id=? AND activation < ?",
-                (session_id, SESSION_TTL_ACTIVATION))
+                    "VALUES " + ",".join("(?,?,?,?)" for _ in bumps)
+                    + " ON CONFLICT(session_id, memory_id) DO UPDATE SET "
+                    "activation = session_members.activation + excluded.activation, "
+                    "updated_at = excluded.updated_at",
+                    tuple(v for row in bumps for v in row))
+            active = sorted((m for m, a in activation.items() if a >= HEBBIAN_WIRE_FLOOR),
+                            key=lambda m: (-activation[m], m))[:HEBBIAN_TOP_M]
+            self._upsert_edges(
+                ((active[i], active[j], "hebbian", HEBBIAN_INCREMENT)
+                 for i in range(len(active)) for j in range(i + 1, len(active))),
+                now, mode="add")
+            if any(a < SESSION_TTL_ACTIVATION for a in activation.values()):
+                self._conn.execute(
+                    "DELETE FROM session_members WHERE session_id=? AND activation < ?",
+                    (session_id, SESSION_TTL_ACTIVATION))
         except Exception:
             return
 
