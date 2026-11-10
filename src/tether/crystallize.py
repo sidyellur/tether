@@ -83,7 +83,7 @@ def _expand(members, conn, current):
 def _descriptor(conn, member_ids):
     rows = conn.execute(
         f"SELECT title, tags FROM memories WHERE id IN "
-        f"({','.join('?' for _ in member_ids)})", member_ids).fetchall()
+        f"({','.join('?' for _ in member_ids)})", tuple(member_ids)).fetchall()
     titles = "; ".join(r[0] for r in rows if r[0])
     tags = sorted({t for r in rows for t in (r[1] or "").split(",") if t})
     return titles + (f" [tags: {', '.join(tags)}]" if tags else "")
@@ -175,7 +175,7 @@ def candidates(conn, embedder=None, fallback=False):
                     "member_titles": [r[0] for r in conn.execute(
                         f"SELECT title FROM memories WHERE id IN "
                         f"({','.join('?' for _ in member_ids)}) ORDER BY id",
-                        member_ids).fetchall()],
+                        tuple(member_ids)).fetchall()],
                     "why": [(a, b, "peak") for a, b in root_peaks],
                     "descriptor": _descriptor(conn, member_ids),
                 })
@@ -196,7 +196,7 @@ def candidates(conn, embedder=None, fallback=False):
                     "member_titles": [r[0] for r in conn.execute(
                         f"SELECT title FROM memories WHERE id IN "
                         f"({','.join('?' for _ in member_ids)}) ORDER BY id",
-                        member_ids).fetchall()],
+                        tuple(member_ids)).fetchall()],
                     "why": [("semantic-density", node, "fallback")],
                     "descriptor": _descriptor(conn, member_ids),
                 })

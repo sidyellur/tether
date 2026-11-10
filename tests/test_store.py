@@ -3523,3 +3523,51 @@ def test_tag_only_recall_requires_every_tag_and_skips_forgotten():
     assert [h["id"] for h in s.recall("", tags="alpha,beta")] == [both]
     assert [h["id"] for h in s.recall("", tags="alpha,beta", type="project")] == []
     assert s.recall("", tags="alpha,nope") == []
+
+
+class _TupleOnlyConn:
+    """Stands in for the frozen libsql-experimental client, whose execute()
+    rejects any parameter container that isn't a tuple ("'list' object
+    cannot be converted to 'PyTuple'"). Mainline libsql and sqlite3 take
+    either, which is how list parameters crept in unnoticed."""
+
+    def __init__(self, conn):
+        self._c = conn
+
+    def execute(self, sql, params=()):
+        if not isinstance(params, tuple):
+            raise TypeError(
+                f"parameters must be a tuple, got {type(params).__name__}: {sql[:60]}")
+        return self._c.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
+def test_every_public_path_passes_tuple_parameters():
+    conn = _TupleOnlyConn(sqlite3.connect(":memory:"))
+    s = Store(conn, "d", lambda *a, **k: None, assoc=True, crystallize=True,
+              project="tether", decay_half_life_days=30, boot_index_cap=3,
+              forget=True, forget_interval=1)
+    s.migrate()
+    a = s.remember("project", "Test runner", "we use pytest for the suite", tags="ci")["id"]
+    b = s.remember("project", "Lint", "ruff runs before pytest", tags="ci,style")["id"]
+    c = s.remember("user", "Editor", "prefers vim", links=[a, 9999])["id"]
+    d = s.remember("reference", "Principle", "test before lint",
+                   crystallizes=[a, b, 9999])["id"]
+    s.link(a, b)
+    assert s.get(a)["id"] == a
+    assert s.recall("pytest suite")
+    assert s.recall("pytest", type="project", tags="ci", session="s1", budget=4)
+    assert s.recall("", tags="ci,style")
+    assert s.recall("pytest", full=True)
+    assert "Test runner" in s.boot_index() or "Lint" in s.boot_index()
+    assert isinstance(s.crystallization_candidates(), list)
+    from tether import crystallize
+    crystallize.candidates(conn, fallback=True)
+    s.dismiss_cluster(a, b)
+    assert s.export_all()
+    assert s.forget(c)["existed"]
+    assert s.restore(c)["action"] == "restored"
+    assert s.purge(d)["existed"]
+    assert s.import_records(s.export_all())["skipped"] == 0
