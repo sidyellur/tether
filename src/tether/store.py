@@ -2180,8 +2180,15 @@ class Store:
         reserve = max(1, cap // 4)
         recent = newest[:reserve]
         recent_set = set(recent)
+        # `deg` covers every current memory, but `rows` no longer does once
+        # the "# This project" slice has been taken out of it. Without the
+        # `mid in meta` guard, a project memory with any link raised KeyError
+        # in the sort key below, which the caller's except turned into a
+        # silent fall back to the recency list - so hub curation never ran
+        # for a store that used projects and links together.
         hubs = sorted(
-            (mid for mid in deg if deg[mid] > 0 and mid not in recent_set),
+            (mid for mid in deg
+             if deg[mid] > 0 and mid in meta and mid not in recent_set),
             key=lambda mid: (deg[mid], upd[mid], mid), reverse=True,
         )[: cap - reserve]               # degree desc, then updated_at desc, then id desc
         chosen = set(hubs) | recent_set

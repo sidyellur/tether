@@ -3571,3 +3571,26 @@ def test_every_public_path_passes_tuple_parameters():
     assert s.restore(c)["action"] == "restored"
     assert s.purge(d)["existed"]
     assert s.import_records(s.export_all())["skipped"] == 0
+
+
+def test_boot_index_curates_hubs_when_a_project_memory_is_linked():
+    # A linked memory shown under "# This project" has behavioural degree but
+    # is no longer in the rows being curated; that used to raise inside
+    # _curated_index and silently drop the "# Load-bearing" section.
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, assoc=True, project="tether",
+              boot_index_cap=8)
+    s.migrate()
+    hub_a = s.remember("user", "Hub A", "x")["id"]
+    hub_b = s.remember("user", "Hub B", "x")["id"]
+    s.link(hub_a, hub_b)
+    mine = s.remember("project", "Project note", "x")["id"]     # tagged proj:tether
+    s.link(mine, hub_a)
+    for i in range(20):                       # push the hubs out of the recent slice
+        s.remember("user", f"Filler {i}", "x")
+    out = s.boot_index()
+    assert "# This project (tether)" in out
+    assert "# Load-bearing" in out
+    load_bearing = out.split("# Load-bearing")[1].split("# Recent")[0]
+    assert f"#{hub_a} Hub A" in load_bearing and f"#{hub_b} Hub B" in load_bearing
+    assert out.count(f"#{mine} Project note") == 1      # shown once, in its own section
