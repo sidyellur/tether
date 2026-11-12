@@ -51,6 +51,22 @@ CREATE TABLE IF NOT EXISTS memory_tags (
     PRIMARY KEY (memory_id, tag)
 );
 CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);
+
+-- What an update replaced (see Store._archive_previous). Its own table, not
+-- archived rows in `memories`: there they stayed in the FTS index (lowering
+-- the rank of the very memory being refined), survived a purge, burned ids,
+-- and were re-embedded on every model change.
+CREATE TABLE IF NOT EXISTS memory_versions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id   INTEGER NOT NULL,
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    tags        TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL,
+    replaced_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_versions_memory
+    ON memory_versions(memory_id, id);
 """
 
 # #111: keeps memory_tags in sync with memories.tags on every write path
@@ -290,6 +306,17 @@ def _tags_match(stored_tags: str, required: list) -> bool:
     return all(t in stored for t in required)
 
 
+def _loads_links(text) -> list:
+    """A row's `links` column as a list; [] if it is empty or not valid JSON
+    (a hand-edited or damaged row must not make every later write to that
+    memory, or the server's startup, raise)."""
+    try:
+        value = json.loads(text or "[]")
+    except (TypeError, ValueError):
+        return []
+    return value if isinstance(value, list) else []
+
+
 def _dedupe_links(links) -> list:
     """Order-preserving de-dupe of a links list, tolerant of None (#47)."""
     seen = set()
@@ -358,6 +385,22 @@ def _unpack(blob: bytes) -> tuple:
     """Inverse of _pack: bytes -> tuple of floats."""
     return struct.unpack(f"<{len(blob) // 4}f", blob)
 
+
+# Set in `meta` when a write that would have produced graph edges happened
+# while the associative graph was disabled: a link made, or a memory
+# embedded, with nothing wired. That is every `tether import` (the CLI opens
+# the store without the graph) and any server run with TETHER_ASSOC=0. The
+# next boot WITH the graph enabled replays what was missed - links from the
+# `links` column in migrate(), semantic neighbours in backfill_embeddings()
+# - and clears the marker. Without it, restored or imported links existed in
+# the column but never in `edges`, so recall never followed them. Two
+# markers because the two replays live in different places and the semantic
+# one needs an embedder that may not be present on the same boot.
+_UNWIRED_LINKS = "graph_unwired_links"
+_UNWIRED_SEMANTIC = "graph_unwired_semantic"
+
+# How many superseded versions of one memory are kept (see _archive_previous).
+_VERSIONS_KEPT = 10
 
 _RECENCY_WEIGHT = 0.25
 _PRIMING_WEIGHT = 0.25
@@ -819,6 +862,23 @@ class Store:
         # stale matrix. None when the pragma is unavailable (-> no check).
         self._emb_cache_version = None
 
+    def _note_unwired(self, links=False, semantic=False) -> None:
+        """Record that this write skipped graph wiring because the graph is
+        disabled, so a later boot with it enabled knows to catch up (see
+        _UNWIRED_LINKS). A no-op with the graph on.
+
+        Checked in `meta` every time, inside the caller's transaction, and
+        deliberately not remembered in this process: a graph-enabled server
+        can start, replay and clear the marker while this one is still
+        running (a long `tether import`), and a rolled-back write takes its
+        marker with it. Either way the next unwired write must set it again.
+        """
+        if self._graph.enabled:
+            return
+        for wanted, key in ((links, _UNWIRED_LINKS), (semantic, _UNWIRED_SEMANTIC)):
+            if wanted and not self._meta_get(key):
+                self._meta_set(key, "1")
+
     def _use_connection(self, conn, sync_now) -> None:
         self._conn = conn
         self._graph._conn = conn
@@ -1011,6 +1071,18 @@ class Store:
                 "SELECT id, embedding, type FROM memories "
                 "WHERE embedding IS NOT NULL AND valid_to IS NULL "
                 "ORDER BY id").fetchall()
+            if rows:
+                # One vector of the wrong length (a damaged row, a blob from
+                # a different model that slipped in through sync) used to
+                # make the reshape below fail, which emptied semantic recall
+                # for the WHOLE store without a word. Skip the odd ones out.
+                sizes = {}
+                for r in rows:
+                    sizes[len(r[1])] = sizes.get(len(r[1]), 0) + 1
+                want = (getattr(self._embedder, "dims", 0) or 0) * 4
+                if want not in sizes:
+                    want = max(sizes, key=lambda n: (sizes[n], n))
+                rows = [r for r in rows if len(r[1]) == want and want % 4 == 0 and want]
             if not rows:
                 self._emb_cache = ([], None, [])
             else:
@@ -1175,7 +1247,9 @@ class Store:
         self._ensure_dedup_unique_index()
         self._clean_legacy_titles()
         self._graph.migrate()
-        if self._graph.enabled and not self._meta_get("explicit_links_backfilled"):
+        if self._graph.enabled and (
+                not self._meta_get("explicit_links_backfilled")
+                or self._meta_get(_UNWIRED_LINKS)):
             # #113: link() (and, since #103, remember(links=...)) already wire
             # the explicit edge at write time, so this replay only matters
             # once - to upgrade a database that predates the associative
@@ -1188,6 +1262,11 @@ class Store:
             # its own links argument. Filtering against the id set here, once,
             # keeps every future migrate() from re-minting the same dangling
             # `explicit` edges forever.
+            # Clear the marker BEFORE reading what to replay, not after: the
+            # delete takes the write lock, so a graph-less process linking at
+            # the same time either commits first (and is read below) or
+            # commits after us and finds the marker gone, and sets it again.
+            self._conn.execute("DELETE FROM meta WHERE key=?", (_UNWIRED_LINKS,))
             valid_ids = {r[0] for r in
                          self._conn.execute("SELECT id FROM memories").fetchall()}
             pairs = []
@@ -1195,7 +1274,7 @@ class Store:
                     # archived/superseded rows' stale links shouldn't be
                     # replayed even on this one-time backfill.
                     "SELECT id, links FROM memories WHERE valid_to IS NULL").fetchall():
-                for other in json.loads(links_json or "[]"):
+                for other in _loads_links(links_json):
                     if other in valid_ids:
                         pairs.append((rid, other))
             self._graph.backfill_explicit(pairs)
@@ -1474,11 +1553,11 @@ class Store:
             embedded = []   # (mid, blob) for rows actually embedded this run
             while True:
                 rows = self._conn.execute(
-                    "SELECT id, title, body, type FROM memories "
+                    "SELECT id, title, body, type, valid_to FROM memories "
                     "WHERE embedding IS NULL LIMIT ?", (batch,)).fetchall()
                 if not rows:
                     break
-                for mid, title, body, type_ in rows:
+                for mid, title, body, type_, valid_to in rows:
                     blob = self._embed_or_none(title, body)
                     if blob is None:
                         # embedder broke mid-run: stop, leave the rest for later
@@ -1492,13 +1571,25 @@ class Store:
                     # don't bump PRAGMA data_version, so a pre-existing cache
                     # wouldn't otherwise notice these rows) reflects every row
                     # embedded this run, not just rows visible before we started.
-                    self._cache_put(mid, blob, type_)
-                    embedded.append((mid, blob))
+                    # Archived rows (forgotten, superseded versions) get their
+                    # vector back too, but only CURRENT rows belong in the
+                    # cache and the graph: putting an archived one in made it
+                    # a semantic candidate and a neighbour until restart.
+                    if valid_to is None:
+                        self._cache_put(mid, blob, type_)
+                        embedded.append((mid, blob))
                     done += 1
                 self._commit()
-            if wiped:
-                # Vectors just changed wholesale, so anything cached is stale
-                # and every current memory needs re-wiring.
+            catch_up = bool(self._graph.enabled
+                            and self._meta_get(_UNWIRED_SEMANTIC))
+            if wiped or catch_up:
+                # Either vectors just changed wholesale, or memories were
+                # embedded while the graph was disabled (_note_unwired) and
+                # it is enabled now. Both mean every current memory needs
+                # (re-)wiring; anything cached may be stale.
+                if catch_up:        # before the scan, as in migrate()
+                    self._conn.execute(
+                        "DELETE FROM meta WHERE key=?", (_UNWIRED_SEMANTIC,))
                 self._invalidate_embedding_cache()
                 self._graph.backfill_semantic(matrix=self._embedding_matrix())
             elif done > 0:
@@ -1507,7 +1598,10 @@ class Store:
                 # _embedding_matrix() here is a cache hit, not a rescan.
                 shared = self._embedding_matrix()
                 for mid, blob in embedded:
-                    self._graph.on_remember(mid, blob, matrix=shared)
+                    # A row with no vector until now is either new or was
+                    # rewritten while no embedder was available; in the
+                    # second case its old neighbours are stale, so replace.
+                    self._graph.on_remember(mid, blob, matrix=shared, replace=True)
             # else: wiped is False and done == 0 - nothing changed, nothing to wire.
             self._commit()
             return done
@@ -1516,7 +1610,8 @@ class Store:
 
     @_locked
     def remember(self, type, title, body, tags=None, links=None,
-                 crystallizes=None, _any_title_length=False) -> dict:
+                 crystallizes=None, _any_title_length=False,
+                 _exact_tags=False) -> dict:
         # Everything about the REQUEST is checked here, before the write
         # wrapper: a bad argument is the caller's mistake and must come back
         # as a message, never be mistaken for a failed connection.
@@ -1538,17 +1633,18 @@ class Store:
             raise AgentError("crystallizes must be a list of memory ids")
         return self._write_with_replica_fallback(
             lambda: self._remember_impl(type, title, body, tags, links,
-                                        crystallizes, _any_title_length))
+                                        crystallizes, _any_title_length,
+                                        _exact_tags))
 
     def _remember_impl(self, type, title, body, tags, links, crystallizes,
-                       any_title_length=False) -> dict:
+                       any_title_length=False, exact_tags=False) -> dict:
         now = _now()
         norm = _norm(title)
         tags_s = _tags_to_str(tags)
         # #92: stamp the current project on work-related memories unless the
         # caller already said which project (any proj: tag is respected).
         if (self._project and type in _PROJECT_TAGGED_TYPES
-                and not _has_project_tag(tags_s)):
+                and not exact_tags and not _has_project_tag(tags_s)):
             tags_s = _tags_to_str([*_parse_tags(tags_s), _project_tag(self._project)])
         incoming_links = links or []
         emb = self._embed_or_none(title, body)
@@ -1565,9 +1661,13 @@ class Store:
         if not self._has_unique_dedup_index:
             self._conn.execute("BEGIN IMMEDIATE")
         existing = self._conn.execute(
-            "SELECT id, links FROM memories "
+            "SELECT id, links, title, body FROM memories "
             "WHERE type=? AND title_norm=? AND valid_to IS NULL",
             (type, norm)).fetchone()
+        # Did the text the vector is computed from change? Only then are the
+        # memory's semantic neighbours out of date.
+        text_changed = existing is not None and (
+            existing[2] != title or existing[3] != body)
 
         # #103 / #130: validate `links=` BEFORE the upsert, not after. The
         # upsert SQL writes its links argument straight into `mid`'s OWN
@@ -1616,7 +1716,8 @@ class Store:
             # already linked before this call, purely to skip re-doing work
             # that's already been done - on_link/the union SQL are idempotent,
             # so getting this wrong costs nothing but a redundant write.
-            already_linked = set(json.loads(existing[1])) if existing else set()
+            already_linked = ({x for x in _loads_links(existing[1]) if _is_id(x)}
+                              if existing else set())
             for other in valid_links:
                 if other == mid or other in already_linked:
                     continue
@@ -1630,7 +1731,17 @@ class Store:
         # cache was dropped here and every remember re-read the whole store.
         shared = (self._embedding_matrix()
                   if emb is not None and self._graph.enabled else None)
-        self._graph.on_remember(mid, emb, matrix=shared)
+        # A rewrite replaces the memory's semantic neighbours rather than
+        # adding to them: its old ones described text that is gone. Only when
+        # the text really changed AND there is a new vector to place - a
+        # tags-only update, or one with no embedder, must leave them be.
+        self._graph.on_remember(mid, emb, matrix=shared,
+                                replace=text_changed and emb is not None)
+        # With the graph off nothing above was wired: leave a marker so the
+        # next start with it on catches up (a rewrite counts even without a
+        # vector - its old neighbours are stale either way).
+        self._note_unwired(links=bool(valid_links),
+                           semantic=emb is not None or text_changed)
         dropped_crystallizes = []
         if self._crystallize and crystallizes:
             valid, dropped_crystallizes = self._valid_crystallize_sources(
@@ -1721,8 +1832,55 @@ class Store:
         """#47: union the incoming links with the row's current links rather
         than replacing - re-remembering a memory without re-passing `links`
         must never wipe links recorded by an earlier call (or by link())."""
-        existing_links = json.loads(existing_links_json or "[]")
+        existing_links = _loads_links(existing_links_json)
         return json.dumps(_dedupe_links(existing_links + incoming_links))
+
+    def _archive_previous(self, mid, title, body, tags_s, now) -> None:
+        """Keep the version an update to memory `mid` is about to overwrite.
+
+        remember() upserts in place, which used to destroy the old content
+        outright: forget() is reversible and purge is admin-only, yet any
+        re-remember of a title (matched ignoring case and spacing) erased
+        what was there with nothing to go back to. The old title, body and
+        tags are copied to `memory_versions` first; the live row keeps its
+        id, which is what links, edges and the agent's own citations refer
+        to. `tether history` lists the versions and `tether revert` puts one
+        back.
+
+        Written against the row as it is at this moment, and a no-op when
+        the update changes none of the three. The newest _VERSIONS_KEPT are
+        kept per memory.
+        """
+        cur = self._conn.execute(
+            "INSERT INTO memory_versions(memory_id, title, body, tags, "
+            "updated_at, replaced_at) "
+            "SELECT id, title, body, tags, updated_at, ? FROM memories "
+            "WHERE id=? AND valid_to IS NULL "
+            "AND (title <> ? OR body <> ? OR tags <> ?)",
+            (now, mid, title, body, tags_s))
+        if cur.rowcount > 0:
+            self._conn.execute(
+                "DELETE FROM memory_versions WHERE memory_id=? AND id NOT IN ("
+                "    SELECT id FROM memory_versions WHERE memory_id=? "
+                "    ORDER BY id DESC LIMIT ?)", (mid, mid, _VERSIONS_KEPT))
+
+    # On an update, keep the stored vector when this write brought none (no
+    # embedder - every `tether import` - or it failed) and the text it was
+    # computed from is unchanged. It used to be overwritten with NULL, which
+    # dropped the memory out of semantic recall until the next server start.
+    _KEEP_EMBEDDING_SQL = (
+        "CASE WHEN {new} IS NOT NULL THEN {new} "
+        "WHEN memories.title = {title} AND memories.body = {body} "
+        "THEN memories.embedding END")
+
+    def _stored_embedding(self, mid, emb):
+        """The vector the row holds after an upsert: `emb` if this write had
+        one, otherwise whatever _KEEP_EMBEDDING_SQL left in place."""
+        if emb is not None or self._emb_cache is None:
+            return emb                  # nothing to look up, or no cache to feed
+        row = self._conn.execute(
+            "SELECT embedding FROM memories WHERE id=?", (mid,)).fetchone()
+        return row[0] if row else None
 
     def _upsert_via_conflict(self, type, title, norm, body, tags_s,
                               incoming_links, now, emb, existing) -> tuple:
@@ -1744,10 +1902,16 @@ class Store:
         links_s = json.dumps(incoming_links)
         superseded = (self._find_near_duplicate(type, emb)
                       if (existing is None and self._consolidate) else None)
+        if existing is not None:
+            # Only when the probe found the memory: a create has nothing to
+            # keep, and this way it costs a create no extra statement. (If
+            # another connection created the row since the probe, that one
+            # overwrite goes unversioned - the upsert itself is still right.)
+            self._archive_previous(existing[0], title, body, tags_s, now)
         # Snapshot the memories table's AUTOINCREMENT counter so we can ask
         # the DB which branch of the upsert actually ran (see the action=
         # line below). Read immediately before the INSERT - everything above
-        # is SELECT-only, so nothing can have moved it since.
+        # leaves `memories` alone, so nothing can have moved it since.
         seq_before = self._memories_seq()
         self._conn.execute(
             "INSERT INTO memories(type, title, title_norm, body, tags, links, "
@@ -1756,10 +1920,13 @@ class Store:
             "ON CONFLICT(type, title_norm) WHERE valid_to IS NULL DO UPDATE SET "
             "title=excluded.title, body=excluded.body, tags=excluded.tags, "
             "links=(SELECT json_group_array(value) FROM ("
-            "    SELECT value FROM json_each(memories.links) "
+            "    SELECT value FROM json_each(CASE WHEN json_valid(memories.links) "
+            "        THEN memories.links ELSE '[]' END) "
             "    UNION SELECT value FROM json_each(excluded.links))), "
             "updated_at=excluded.updated_at, device_id=excluded.device_id, "
-            "author=excluded.author, embedding=excluded.embedding",
+            "author=excluded.author, embedding=" + self._KEEP_EMBEDDING_SQL.format(
+                new="excluded.embedding", title="excluded.title",
+                body="excluded.body"),
             (type, title, norm, body, tags_s, links_s, now, now,
              self._device_id, emb, self._author, now))
         # Re-resolve the row: lastrowid doesn't advance on the DO UPDATE branch,
@@ -1789,8 +1956,8 @@ class Store:
         seq_after = self._memories_seq()
         action = ("created" if seq_after != seq_before and seq_after == mid
                   else "updated")
-        # Either branch leaves `mid` current with embedding=emb (#81).
-        self._cache_put(mid, emb, type)
+        # Either branch leaves `mid` current, with this vector (#81).
+        self._cache_put(mid, self._stored_embedding(mid, emb), type)
         if action == "created" and superseded is not None:
             self._conn.execute(
                 "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
@@ -1806,14 +1973,17 @@ class Store:
         was probed inside that same transaction, so no other writer could
         have interleaved since - a plain branch on it is safe here."""
         if existing is not None:
-            mid, existing_links_json = existing
+            mid, existing_links_json = existing[0], existing[1]
             links_s = self._merge_links(existing_links_json, incoming_links)
+            self._archive_previous(mid, title, body, tags_s, now)
             self._conn.execute(
-                "UPDATE memories SET title=?, body=?, tags=?, links=?, updated_at=?, "
-                "device_id=?, author=?, embedding=? WHERE id=?",
-                (title, body, tags_s, links_s, now, self._device_id,
-                 self._author, emb, mid))
-            self._cache_put(mid, emb, type)
+                "UPDATE memories SET embedding=" + self._KEEP_EMBEDDING_SQL.format(
+                    new="?", title="?", body="?")
+                + ", title=?, body=?, tags=?, links=?, updated_at=?, "
+                "device_id=?, author=? WHERE id=?",
+                (emb, emb, title, body, title, body, tags_s, links_s, now,
+                 self._device_id, self._author, mid))
+            self._cache_put(mid, self._stored_embedding(mid, emb), type)
             return mid, "updated"
         links_s = json.dumps(incoming_links)
         superseded = self._find_near_duplicate(type, emb) if self._consolidate else None
@@ -2090,6 +2260,51 @@ class Store:
         return self._hydrate(ids)
 
     @_locked
+    def history(self, id) -> list:
+        """Earlier versions of memory `id` that an update replaced, newest
+        first: [{version, title, body, tags, updated_at, replaced_at}].
+        `revert(id, version)` puts one back."""
+        id = _as_id(id)
+        if id is None:
+            return []
+        rows = self._conn.execute(
+            "SELECT id, title, body, tags, updated_at, replaced_at "
+            "FROM memory_versions WHERE memory_id=? ORDER BY id DESC",
+            (id,)).fetchall()
+        return [{"version": r[0], "title": r[1], "body": r[2], "tags": r[3],
+                 "updated_at": r[4], "replaced_at": r[5]} for r in rows]
+
+    @_locked
+    def revert(self, id, version) -> dict:
+        """Put an earlier version's title, body and tags back on memory `id`.
+
+        It is an ordinary update of the same memory - same id, so links,
+        edges and citations still point at it - and what it replaces is kept
+        as a version in turn, so a revert can itself be undone."""
+        mid, vid = _as_id(id), _as_id(version)
+        row = None if mid is None else self._conn.execute(
+            "SELECT type, title_norm FROM memories WHERE id=? AND valid_to IS NULL",
+            (mid,)).fetchone()
+        if row is None:
+            raise AgentError(f"no current memory with id {id!r}")
+        old = None if vid is None else self._conn.execute(
+            "SELECT title, body, tags FROM memory_versions "
+            "WHERE id=? AND memory_id=?", (vid, mid)).fetchone()
+        if old is None:
+            raise AgentError(f"memory #{mid} has no version {version!r}")
+        # The write goes through remember(), which finds its row by title:
+        # make sure that is THIS row before anything is written. (A version
+        # only ever differs from its memory in case and spacing, so this
+        # holds unless the table was edited by hand.)
+        if _norm(_clean_title(old[0])) != row[1]:
+            raise AgentError(
+                f"version {vid} of memory #{mid} has a different title; "
+                "it cannot be put back on this memory")
+        self.remember(row[0], old[0], old[1], tags=old[2],
+                      _any_title_length=True, _exact_tags=True)
+        return {"reverted": mid, "version": vid}
+
+    @_locked
     def stats(self) -> dict:
         """Counts for the status resource. A locked Store method because the
         server used to run these two queries on the connection directly,
@@ -2204,7 +2419,23 @@ class Store:
         # `seeds` stays the immutable v0.2 result (the protected tier); prime a copy
         # so priming/spread never reorder the seed tier.
         activated = dict(seeds)
-        for mid, a in self._graph.session_activation(sid).items():
+        # budget=0 is documented as "direct matches only", so it primes
+        # nothing. Otherwise session members that are not themselves seeds
+        # may ride along - but only if they pass the same `type` filter the
+        # seeds did; they used to come back from recall(type="user") whatever
+        # their type, labelled as direct matches.
+        primed = self._graph.session_activation(sid) if budget > 0 else {}
+        extra = [m for m in primed if m not in seeds]
+        if extra and type is not None:
+            allowed = set()
+            for k in range(0, len(extra), 500):
+                chunk = extra[k:k + 500]
+                ph = ",".join("?" for _ in chunk)
+                allowed.update(r[0] for r in self._conn.execute(
+                    f"SELECT id FROM memories WHERE id IN ({ph}) AND type = ? "
+                    "AND valid_to IS NULL", (*chunk, type)).fetchall())
+            primed = {m: a for m, a in primed.items() if m in seeds or m in allowed}
+        for mid, a in primed.items():
             activated[mid] = activated.get(mid, 0.0) + _PRIMING_WEIGHT * a
         activation, receipts = self._graph.spread(activated, budget, type)
         # protect-head / re-rank-tail. The #15 seed floor bounds `seeds` to
@@ -2246,11 +2477,14 @@ class Store:
         hits = self._hydrate(order)
         for h in hits:
             r = receipts.get(h["id"])
-            if r is not None and h["id"] not in seeds:
+            if h["id"] in seeds:
+                h["via"] = {"seed": True}
+            elif r is not None:
                 h["via"] = {"path": [{"from": r["from"], "kind": r["kind"], "w": r["w"]}],
                             "hops": r["hops"]}
             else:
-                h["via"] = {"seed": True}
+                # here only because an earlier recall in this session surfaced it
+                h["via"] = {"primed": True}
         return self._excerpt_hits(hits, query, full)
 
     def _recency_order(self, ids):
@@ -2272,7 +2506,7 @@ class Store:
         row = self._conn.execute("SELECT links FROM memories WHERE id=?", (mid,)).fetchone()
         if row is None:
             raise AgentError(f"no memory with id {mid}")
-        return json.loads(row[0])
+        return _loads_links(row[0])
 
     # #38: union the new id into links inside the statement itself, rather than
     # SELECT-ing the list into Python, appending, and writing it back. The old
@@ -2286,7 +2520,8 @@ class Store:
     _LINK_UNION_SQL = (
         "UPDATE memories SET links = ("
         "    SELECT json_group_array(value) FROM ("
-        "        SELECT value FROM json_each(memories.links)"
+        "        SELECT value FROM json_each(CASE WHEN json_valid(memories.links)"
+        "            THEN memories.links ELSE '[]' END)"
         "        UNION SELECT ?))"
         ", updated_at = ? WHERE id = ?")
 
@@ -2310,6 +2545,7 @@ class Store:
         self._conn.execute(self._LINK_UNION_SQL, (id_b, now, id_a))
         self._conn.execute(self._LINK_UNION_SQL, (id_a, now, id_b))
         self._graph.on_link(id_a, id_b)
+        self._note_unwired(links=True)
         self._commit()
         self._sync()
         return {"linked": [id_a, id_b]}
@@ -2330,6 +2566,7 @@ class Store:
         if id_a is None or id_b is None:
             raise AgentError("dismiss_cluster takes two integer memory ids")
         self._graph.dismiss_peak(id_a, id_b)
+        self._commit()                # so crystallization_candidates() notices
         return {"dismissed": [id_a, id_b]}
 
     @_locked
@@ -2514,6 +2751,8 @@ class Store:
 
     def _purge_impl(self, id) -> dict:
         cur = self._conn.execute("DELETE FROM memories WHERE id=?", (id,))
+        # A permanent delete means the content is gone, earlier versions too.
+        self._conn.execute("DELETE FROM memory_versions WHERE memory_id=?", (id,))
         self._graph.on_forget(id)
         self._cache_drop(id)
         self._commit()
@@ -2534,7 +2773,7 @@ class Store:
         out = []
         for row in rows:
             d = dict(zip(cols, row))
-            d["links"] = json.loads(d["links"] or "[]")
+            d["links"] = _loads_links(d["links"])
             out.append(d)
         return out
 
@@ -2694,10 +2933,11 @@ class Store:
             return []
         try:
             from . import crystallize
-            sig = self._conn.execute(
-                "SELECT (SELECT COUNT(*) FROM edges), "
-                "(SELECT COALESCE(MAX(updated_at), '') FROM edges), "
-                "(SELECT COUNT(*) FROM crystallize_dismissed)").fetchone()
+            # Every commit here (and any from another connection) changes
+            # this, so the view follows forget/restore/updates too - not only
+            # edge changes, which is all the old edge-count signature saw: a
+            # forgotten memory stayed listed as a cluster member.
+            sig = self._store_signature()
             if sig != self._cryst_sig:
                 self._cryst_cache = crystallize.candidates(self._conn, self._embedder)
                 self._cryst_sig = sig

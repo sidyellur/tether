@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cli.py - the admin command line: export, import, restore and hard-purge.
+"""cli.py - the admin command line: export, import, restore, history, revert and hard-purge.
 
 Not the agent-facing surface (that's server.py's MCP tools). This is the
 operator escape hatch tether's non-destructive design otherwise lacks (#49):
@@ -72,6 +72,22 @@ def cmd_restore(args) -> int:
     return 0 if result["existed"] else 1
 
 
+def cmd_history(args) -> int:
+    versions = _build_store().history(args.id)
+    print(json.dumps(versions, indent=2))
+    return 0
+
+
+def cmd_revert(args) -> int:
+    try:
+        result = _build_store().revert(args.id, args.version)
+    except ValueError as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+    print(json.dumps(result))
+    return 0
+
+
 def cmd_purge(args) -> int:
     if not args.yes:
         sys.stderr.write(
@@ -99,6 +115,17 @@ def main(argv=None) -> int:
         "restore", help="un-forget a soft-deleted memory (clears valid_to)")
     p_restore.add_argument("id", type=int)
     p_restore.set_defaults(func=cmd_restore)
+
+    p_history = sub.add_parser(
+        "history", help="list the earlier versions of a memory that updates replaced")
+    p_history.add_argument("id", type=int)
+    p_history.set_defaults(func=cmd_history)
+
+    p_revert = sub.add_parser(
+        "revert", help="put an earlier version of a memory back (see `history`)")
+    p_revert.add_argument("id", type=int)
+    p_revert.add_argument("version", type=int)
+    p_revert.set_defaults(func=cmd_revert)
 
     p_purge = sub.add_parser(
         "purge", help="permanently delete a memory (bypasses forget's soft-delete)")

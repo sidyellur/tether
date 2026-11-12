@@ -1,6 +1,8 @@
 import json as _json
 import sqlite3
 import threading
+import warnings
+import zlib
 
 import pytest
 
@@ -4159,3 +4161,528 @@ def test_migrate_cleans_legacy_titles_so_they_stay_updatable():
     s.migrate()                                        # one-time: no rescan
     s._conn.set_trace_callback(None)
     assert not [q for q in scans if q.startswith("SELECT id, title FROM memories")]
+# --- updates keep the previous version ---------------------------------------
+
+def test_update_keeps_the_previous_version_and_the_same_id():
+    s = make_store()
+    mid = s.remember("user", "Deploy key location", "the real valuable fact", tags="ops")["id"]
+    again = s.remember("user", "  deploy KEY   location ", "overwritten")
+    assert again == {"id": mid, "action": "updated"}
+    assert s.get(mid)["body"] == "overwritten"
+    (v,) = s.history(mid)
+    assert v["body"] == "the real valuable fact" and v["tags"] == "ops"
+    assert v["title"] == "Deploy key location" and v["replaced_at"]
+    # a version is not a memory: no extra row, nothing for search to find
+    assert s._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+    assert s.recall("valuable fact") == []
+    assert s._conn.execute("SELECT COUNT(*) FROM memories_fts WHERE memories_fts "
+                           "MATCH 'valuable'").fetchone()[0] == 0
+    assert "valuable" not in s.boot_index() and len(s.export_all()) == 1
+    assert s._conn.in_transaction is False
+
+
+def test_an_update_that_changes_nothing_keeps_no_version():
+    s = make_store()
+    mid = s.remember("user", "Same", "body", tags="t")["id"]
+    s.remember("user", "Same", "body", tags="t")
+    assert s.history(mid) == []
+
+
+def test_creating_a_memory_costs_no_version_statement():
+    s, conn = _counting_store()
+    conn.reset()
+    s.remember("user", "Brand new", "body")
+    assert not [w for w in conn.writes if "memory_versions" in w]
+
+
+def test_revert_puts_a_version_back_on_the_same_memory():
+    s, _ = _counting_store()
+    other = s.remember("user", "Other", "x")["id"]
+    mid = s.remember("user", "Fact", "original", tags="t1", links=[other])["id"]
+    s.remember("user", "Fact", "mistake", tags="t2")
+    version = s.history(mid)[0]["version"]
+    assert s.revert(mid, version) == {"reverted": mid, "version": version}
+    hit = s.get(mid)
+    assert (hit["body"], hit["tags"]) == ("original", "t1")
+    # same id, so what pointed at it still does
+    assert s._conn.execute("SELECT links FROM memories WHERE id=?",
+                           (other,)).fetchone()[0] == f"[{mid}]"
+    assert s._conn.execute("SELECT src, dst FROM edges WHERE kind='explicit'"
+                           ).fetchall() == [(other, mid)]
+    # and the revert can itself be undone
+    assert [v["body"] for v in s.history(mid)] == ["mistake", "original"]
+    for bad in ((mid, 9999), (9999, version), (other, version), ("x", version)):
+        with pytest.raises(ValueError):
+            s.revert(*bad)
+
+
+def test_only_the_newest_versions_are_kept():
+    from tether.store import _VERSIONS_KEPT
+    s = make_store()
+    mid = s.remember("user", "Churn", "v0")["id"]
+    for i in range(1, _VERSIONS_KEPT + 6):
+        s.remember("user", "Churn", f"v{i}")
+    versions = s.history(mid)
+    assert len(versions) == _VERSIONS_KEPT
+    assert versions[0]["body"] == f"v{_VERSIONS_KEPT + 4}"       # newest first
+    assert s._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+
+
+def test_versions_are_kept_on_the_locked_upsert_path_without_piling_up():
+    # #41's degraded mode: duplicate current rows, no unique index. Each
+    # update versions only the row it updates.
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None)
+    s.migrate()
+    conn.execute("DROP INDEX idx_memories_dedup")
+    for body in ("one", "two"):
+        conn.execute("INSERT INTO memories(type, title, title_norm, body, created_at, "
+                     "updated_at) VALUES ('user', 'Dup', 'dup', ?, 't', 't')", (body,))
+    conn.commit()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        s.migrate()
+    assert s._has_unique_dedup_index is False
+    for i in range(25):
+        assert s.remember("user", "Dup", f"v{i}")["action"] == "updated"
+    assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM memory_versions").fetchone()[0] == 10
+    assert conn.in_transaction is False
+
+
+def test_purge_removes_earlier_versions_too():
+    s = make_store()
+    mid = s.remember("user", "Secret", "the secret is hunter2")["id"]
+    s.remember("user", "Secret", "the secret is rotated")
+    s.remember("user", "Secret", "redacted")
+    assert len(s.history(mid)) == 2
+    s.purge(mid)
+    assert s.history(mid) == []
+    dump = " ".join(str(r) for t in ("memories", "memory_versions", "memory_tags")
+                    for r in s._conn.execute(f"SELECT * FROM {t}").fetchall())
+    assert "hunter2" not in dump and "rotated" not in dump
+    assert s._conn.execute("SELECT COUNT(*) FROM memories_fts WHERE memories_fts "
+                           "MATCH 'hunter2'").fetchone()[0] == 0
+
+
+def test_refining_a_memory_does_not_lower_its_own_rank():
+    # Versions kept as rows in `memories` stayed in the FTS index and diluted
+    # the live memory's own terms: the more it was refined, the lower it sank.
+    s = make_store()
+    for i in range(30):
+        s.remember("user", f"Filler {i}", "nothing to see in this one")
+    a = s.remember("user", "A note", "zebra zebra crossing rules and zebra stripes")["id"]
+    b = s.remember("user", "B note", "quokka habitat")["id"]
+    before = [h["id"] for h in s.recall("zebra quokka")]
+    for i in range(10):
+        s.remember("user", "A note", f"zebra zebra crossing rules and zebra stripes, rev {i}")
+    assert [h["id"] for h in s.recall("zebra quokka")] == before
+    assert set(before) == {a, b}
+
+
+def test_consolidated_memories_are_untouched_by_versioning():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(),
+              consolidate=True, dedup_threshold=0.9)
+    s.migrate()
+    old = s.remember("user", "Car one", "I drive my car")["id"]
+    new = s.remember("user", "Car two", "I drive my car")
+    assert new["action"] == "consolidated"
+    for i in range(15):
+        s.remember("user", "Car two", f"I drive my car {i}")
+    assert all(v["title"] == "Car two" for v in s.history(new["id"]))
+    assert s.restore(old)["action"] == "restored"       # still there, restorable
+
+
+# --- import / graph consistency ---------------------------------------------
+
+def _graph_store(conn, assoc, embedder=None):
+    """One "boot" of a store on `conn`, as the server does it."""
+    s = Store(conn, "d", lambda *a, **k: None, assoc=assoc, embedder=embedder,
+              author="dev")
+    s.migrate()
+    if embedder is not None:
+        s.backfill_embeddings()
+    return s
+
+
+def test_an_import_without_an_embedder_keeps_vectors_of_unchanged_memories():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    live = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(), author="a")
+    live.migrate()
+    live.backfill_embeddings()
+    same = live.remember("user", "Meal", "pizza and food")["id"]
+    changed = live.remember("user", "Ride", "I drive my car")["id"]
+    cli_like = Store(conn, "d", lambda *a, **k: None)          # no embedder, as the CLI
+    cli_like.migrate()
+    cli_like.remember("user", "Meal", "pizza and food")
+    cli_like.remember("user", "Ride", "now about python tests")
+    emb = dict(conn.execute("SELECT id, embedding IS NOT NULL FROM memories "
+                            "WHERE valid_to IS NULL").fetchall())
+    assert emb == {same: 1, changed: 0}       # kept where the text is the same
+
+
+def test_links_made_with_the_graph_off_are_wired_when_it_is_next_on():
+    conn = sqlite3.connect(":memory:")
+    on = _graph_store(conn, assoc=True)                # sets the one-time backfill flag
+    a = on.remember("user", "A", "alpha")["id"]
+    off = _graph_store(conn, assoc=False)              # e.g. `tether import`
+    b = off.remember("user", "B", "beta", links=[a])["id"]
+    c = off.remember("user", "C", "gamma")["id"]
+    off.link(b, c)
+    assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+    _graph_store(conn, assoc=True)
+    assert set(conn.execute("SELECT src, dst FROM edges WHERE kind='explicit'"
+                            ).fetchall()) == {(a, b), (b, c)}
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'graph_unwired%'"
+                        ).fetchone()[0] == 0
+    assert conn.in_transaction is False
+
+
+def test_memories_embedded_with_the_graph_off_get_neighbours_when_it_is_next_on():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    off = _graph_store(conn, assoc=False, embedder=FakeEmbedder())
+    off.remember("user", "Car", "I drive my car")
+    off.remember("user", "Auto", "driving the automobile")
+    assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+    on = _graph_store(conn, assoc=True, embedder=FakeEmbedder())
+    assert conn.execute("SELECT COUNT(*) FROM edges WHERE kind='semantic'").fetchone()[0] == 1
+    calls = []
+    on._graph.backfill_semantic = lambda *a, **k: calls.append(1)
+    on.backfill_embeddings()                           # and not again next time
+    assert calls == []
+
+
+def test_unwired_markers_are_written_once_and_never_with_the_graph_on():
+    conn = _CountingConn(sqlite3.connect(":memory:"))
+    off = Store(conn, "d", lambda *a, **k: None, assoc=False)
+    off.migrate()
+    a = off.remember("user", "A", "alpha")["id"]       # no embedder, no links: no marker
+    b = off.remember("user", "B", "beta")["id"]
+    marks = lambda: [r[0] for r in conn.execute(
+        "SELECT key FROM meta WHERE key LIKE 'graph_unwired%'")]
+    assert marks() == []
+    off.link(a, b)
+    conn.reset()
+    off.link(a, b)
+    assert not [w for w in conn.writes if "meta" in w]
+    assert marks() == ["graph_unwired_links"]
+    on, conn2 = _counting_store()
+    x = on.remember("user", "X", "x")["id"]
+    on.link(x, on.remember("user", "Y", "y", links=[x])["id"])
+    assert conn2.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'graph_unwired%'"
+                         ).fetchone()[0] == 0
+
+
+def test_rewriting_a_memory_replaces_its_semantic_neighbours():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(), assoc=True)
+    s.migrate()
+    a = s.remember("user", "topic a", "I drive my car")["id"]
+    b = s.remember("user", "topic b", "driving the automobile")["id"]
+    assert conn.execute("SELECT src, dst FROM edges WHERE kind='semantic'").fetchall() == [(a, b)]
+    s.remember("user", "topic a", "pizza and food")    # nothing to do with cars now
+    assert conn.execute("SELECT COUNT(*) FROM edges WHERE kind='semantic'").fetchone()[0] == 0
+    assert [h["title"] for h in s.recall("automobile")] == ["topic b"]
+
+
+def test_a_wholesale_rewire_clears_stale_semantic_edges():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(), assoc=True, author="a")
+    s.migrate()
+    s.backfill_embeddings()
+    s.remember("user", "one", "I drive my car")
+    conn.execute("INSERT INTO edges VALUES (1, 99, 'semantic', 0.9, 't')")
+    conn.execute("INSERT INTO edges VALUES (1, 98, 'explicit', 1.0, 't')")
+    s._meta_set(s._embedding_meta_key("embedding_model"), "another-model")
+    s._commit()
+    s.backfill_embeddings()
+    assert conn.execute("SELECT dst, kind FROM edges").fetchall() == [(98, "explicit")]
+
+
+def test_backfill_does_not_put_archived_rows_in_the_semantic_cache():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    plain = Store(conn, "d", lambda *a, **k: None)                 # no embedder
+    plain.migrate()
+    keep = plain.remember("user", "Keep", "I drive my car")["id"]
+    gone = plain.remember("user", "Gone", "driving the automobile")["id"]
+    plain.forget(gone)
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(), assoc=True, author="a")
+    s.migrate()
+    s._meta_set(s._embedding_meta_key("embedding_model"), "fake-3d")
+    s._meta_set(s._embedding_meta_key("embedding_dims"), 3)
+    s._commit()
+    s._embedding_matrix()                              # a live cache to keep in step
+    assert s.backfill_embeddings() == 2
+    assert s._embedding_matrix()[0] == [keep]
+    assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+
+
+def test_one_damaged_vector_does_not_disable_semantic_recall():
+    pytest.importorskip("numpy")
+    s = make_semantic_store()
+    a = s.remember("user", "Car", "I drive my car")["id"]
+    bad = s.remember("user", "Food", "pizza and food")["id"]
+    s._conn.execute("UPDATE memories SET embedding=? WHERE id=?", (b"\x00" * 8, bad))
+    s._conn.commit()
+    s._invalidate_embedding_cache()
+    assert s._vector_ids("car drive") == [a]
+
+
+def test_a_damaged_links_column_does_not_break_writes_or_startup():
+    s = make_store()
+    a = s.remember("user", "A", "a")["id"]
+    b = s.remember("user", "B", "b")["id"]
+    s._conn.execute("UPDATE memories SET links='not json' WHERE id=?", (a,))
+    s._conn.execute("DELETE FROM meta WHERE key='explicit_links_backfilled'")
+    s._conn.commit()
+    conn = s._conn
+    g = Store(conn, "d", lambda *a_, **k: None, assoc=True)
+    g.migrate()                                        # used to raise JSONDecodeError
+    assert g.remember("user", "A", "a2", links=[b])["action"] == "updated"
+    assert g.export_all()[0]["links"] == [b]         # the damaged value was replaced
+
+
+# --- recall filters hold for primed memories too -----------------------------
+
+def test_session_priming_respects_the_type_filter_and_is_labelled():
+    s, _ = _counting_store()
+    p = s.remember("project", "deploy pipeline", "kubernetes rollout steps")["id"]
+    u = s.remember("user", "coffee preference", "likes espresso")["id"]
+    s.recall("kubernetes rollout", session="one")
+    typed = s.recall("espresso", type="user", session="one")
+    assert [h["id"] for h in typed] == [u]
+    untyped = s.recall("espresso", session="one")
+    assert {h["id"]: h["via"] for h in untyped} == {u: {"seed": True}, p: {"primed": True}}
+    assert [h["id"] for h in s.recall("espresso", session="one", budget=0)] == [u]
+
+
+def test_crystallization_view_follows_forget_and_dismiss():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, assoc=True, crystallize=True,
+              embedder=FakeEmbedder())
+    s.migrate()
+    ids = [s.remember("user", f"car note {i}", f"I drive my car number {i}")["id"]
+           for i in range(3)]
+    s.link(ids[0], ids[1])
+    assert [c["member_ids"] for c in s.crystallization_candidates()] == [ids]
+    s.forget(ids[2])
+    assert s.crystallization_candidates() == []
+    s.restore(ids[2])
+    assert [c["member_ids"] for c in s.crystallization_candidates()] == [ids]
+    s.dismiss_cluster(ids[0], ids[1])
+    assert s.crystallization_candidates() == []
+
+
+def _semantic_edges(conn, mid):
+    return sorted((a if b == mid else b, round(w, 3)) for a, b, w in conn.execute(
+        "SELECT src, dst, weight FROM edges WHERE kind='semantic' "
+        "AND (src=? OR dst=?)", (mid, mid)).fetchall())
+
+
+def test_an_update_that_leaves_the_text_alone_leaves_its_neighbours_alone():
+    np = pytest.importorskip("numpy")
+
+    class Rand:
+        name, dims = "rand", 16
+
+        def embed(self, text):
+            # crc32, not hash(): str hashing is randomized per process
+            v = np.random.default_rng(zlib.crc32(text.encode())).standard_normal(16)
+            return [float(x) for x in v / np.linalg.norm(v)]
+
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=Rand(), assoc=True)
+    s.migrate()
+    ids = [s.remember("user", f"T{i}", f"body number {i}")["id"] for i in range(40)]
+    # the memory with the most neighbours: others chose it as theirs too, and
+    # those are the edges a careless replace would lose
+    target = max(ids, key=lambda m: len(_semantic_edges(conn, m)))
+    n = ids.index(target)
+    before = _semantic_edges(conn, target)
+    assert len(before) > 8
+    s.remember("user", f"T{n}", f"body number {n}", tags="new-tag")  # tags only
+    assert _semantic_edges(conn, target) == before
+    s._embedder = None                                               # embedder gone
+    s.remember("user", f"T{n}", f"body number {n}", tags="another")
+    assert _semantic_edges(conn, target) == before
+    assert conn.execute("SELECT embedding IS NOT NULL FROM memories WHERE id=?",
+                        (target,)).fetchone()[0] == 1
+
+
+def test_a_rewrite_keeps_a_former_neighbour_that_is_still_close():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(), assoc=True)
+    s.migrate()
+    a = s.remember("user", "a", "I drive my car")["id"]
+    b = s.remember("user", "b", "driving the automobile")["id"]
+    c = s.remember("user", "c", "pizza and food")["id"]
+    s.remember("user", "a", "my car, I drive it daily")      # still about cars
+    assert [n for n, _ in _semantic_edges(conn, a)] == [b]
+    s.remember("user", "a", "pizza and food for lunch")      # now about food
+    assert [n for n, _ in _semantic_edges(conn, a)] == [c]
+
+
+def test_unwired_marker_is_set_again_after_another_process_cleared_it():
+    conn = sqlite3.connect(":memory:")
+    off = _graph_store(conn, assoc=False)             # a long-running graph-less process
+    a = off.remember("user", "A", "a")["id"]
+    b = off.remember("user", "B", "b")["id"]
+    c = off.remember("user", "C", "c")["id"]
+    off.link(a, b)
+    _graph_store(conn, assoc=True)                    # another process boots: replays, clears
+    off.link(b, c)                                    # the first one carries on
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key='graph_unwired_links'"
+                        ).fetchone()[0] == 1
+    _graph_store(conn, assoc=True)
+    assert set(conn.execute("SELECT src, dst FROM edges WHERE kind='explicit'"
+                            ).fetchall()) == {(a, b), (b, c)}
+
+
+def test_a_rewrite_made_without_the_graph_is_rewired_cleanly_later():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    on = _graph_store(conn, assoc=True, embedder=FakeEmbedder())
+    a = on.remember("user", "a", "I drive my car")["id"]
+    b = on.remember("user", "b", "driving the automobile")["id"]
+    on.remember("user", "c", "pizza and food")
+    assert [n for n, _ in _semantic_edges(conn, a)] == [b]
+    cli_like = _graph_store(conn, assoc=False)        # no graph, no embedder
+    cli_like.remember("user", "a", "pizza and food for lunch")
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key='graph_unwired_semantic'"
+                        ).fetchone()[0] == 1
+    _graph_store(conn, assoc=True, embedder=FakeEmbedder())
+    assert b not in [n for n, _ in _semantic_edges(conn, a)]
+
+
+# --- second-review follow-ups -------------------------------------------------
+
+def test_editing_a_hub_keeps_the_edges_other_memories_have_to_it():
+    # 30 satellites each have the hub among their nearest; a one-character
+    # edit of the hub (same vector) must not strip those edges, and the
+    # result must equal what a clean re-wire of the whole store gives.
+    np = pytest.importorskip("numpy")
+
+    class Hubby:
+        name, dims = "hubby", 32
+
+        def embed(self, text):
+            rng = np.random.default_rng(zlib.crc32(text.split("#")[0].encode()))
+            v = rng.standard_normal(32)
+            if not text.startswith("hub"):
+                v = v * 0.35 + np.ones(32)             # satellites lean toward the hub
+            else:
+                v = np.ones(32)
+            return [float(x) for x in v / np.linalg.norm(v)]
+
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=Hubby(), assoc=True, author="a")
+    s.migrate()
+    s.backfill_embeddings()
+    hub = s.remember("user", "hub", "hub body")["id"]
+    for i in range(30):
+        s.remember("user", f"sat {i}", f"satellite {i}")
+    s._graph.backfill_semantic(matrix=s._embedding_matrix())
+    s._commit()
+    clean = _semantic_edges(conn, hub)
+    assert len(clean) > 20
+    s.remember("user", "hub", "hub body#")             # text changed, same vector
+    assert _semantic_edges(conn, hub) == clean
+    assert conn.in_transaction is False
+
+
+def test_a_failed_rewire_leaves_the_old_edges_in_place():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(), assoc=True)
+    s.migrate()
+    a = s.remember("user", "a", "I drive my car")["id"]
+    s.remember("user", "b", "driving the automobile")
+    before = _semantic_edges(conn, a)
+
+    def boom(*args, **kw):
+        raise RuntimeError("upsert failed")
+
+    s._graph._upsert_edges = boom
+    s.remember("user", "a", "pizza and food now")      # degrade-never: no raise
+    assert _semantic_edges(conn, a) == before          # not deleted-and-lost
+    assert conn.in_transaction is False
+
+
+def test_backfill_replaces_the_edges_of_a_row_rewritten_without_a_vector():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=FakeEmbedder(), assoc=True, author="a")
+    s.migrate()
+    s.backfill_embeddings()
+    a = s.remember("user", "a", "I drive my car")["id"]
+    b = s.remember("user", "b", "driving the automobile")["id"]
+    c = s.remember("user", "c", "pizza and food")["id"]
+    embedder, s._embedder = s._embedder, None          # embedder unavailable for a while
+    s.remember("user", "a", "pizza and food for lunch")
+    s._embedder = embedder
+    assert s.backfill_embeddings() == 1
+    assert [n for n, _ in _semantic_edges(conn, a)] == [c] and b != c
+
+
+def test_revert_restores_tags_exactly_and_refuses_a_mismatched_title():
+    conn = sqlite3.connect(":memory:")
+    plain = Store(conn, "d", lambda *a, **k: None)
+    plain.migrate()
+    mid = plain.remember("project", "Note", "one", tags="x")["id"]     # no project tag
+    s = Store(conn, "d", lambda *a, **k: None, project="webapp")
+    s.migrate()
+    s.remember("project", "Note", "two", tags="y")
+    version = [v for v in s.history(mid) if v["body"] == "one"][0]["version"]
+    assert s.revert(mid, version) == {"reverted": mid, "version": version}
+    assert s.get(mid)["tags"] == "x"                   # not "x,proj:webapp"
+    conn.execute("UPDATE memory_versions SET title='Something else' WHERE id=?", (version,))
+    conn.commit()
+    with pytest.raises(ValueError, match="different title"):
+        s.revert(mid, version)
+    assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+    with pytest.raises(ValueError, match="'x'"):
+        s.revert("x", 1)
+
+
+def test_a_link_committed_during_the_replay_is_not_lost():
+    # The marker is cleared before the replay reads the links, so a
+    # graph-less writer landing mid-replay sets it again.
+    conn = sqlite3.connect(":memory:")
+    off = _graph_store(conn, assoc=False)
+    a = off.remember("user", "A", "a")["id"]
+    b = off.remember("user", "B", "b")["id"]
+    c = off.remember("user", "C", "c")["id"]
+    off.link(a, b)
+    on = Store(conn, "d", lambda *a_, **k: None, assoc=True)
+    real = on._graph.backfill_explicit
+
+    def interleaved(pairs):
+        real(pairs)
+        off.link(b, c)                                 # lands after the links were read
+
+    on._graph.backfill_explicit = interleaved
+    on.migrate()
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key='graph_unwired_links'"
+                        ).fetchone()[0] == 1
+    _graph_store(conn, assoc=True)
+    assert set(conn.execute("SELECT src, dst FROM edges WHERE kind='explicit'"
+                            ).fetchall()) == {(a, b), (b, c)}
+
+
+def test_a_create_without_an_embedder_issues_no_extra_statements():
+    conn = _CountingConn(sqlite3.connect(":memory:"))
+    s = Store(conn, "d", lambda *a, **k: None)
+    s.migrate()
+    s.remember("user", "warm", "x")
+    conn.reset()
+    s.remember("user", "Brand new", "body")
+    assert (conn.reads, len(conn.writes), conn.commits) == (4, 1, 1)

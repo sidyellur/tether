@@ -225,3 +225,17 @@ def test_export_file_is_private_to_its_owner(tmp_path, monkeypatch):
         assert len(json.loads(out.read_text())) == 2
     finally:
         os.umask(old)
+
+
+def test_history_lists_replaced_versions(tmp_path, monkeypatch, capsys):
+    a, _ = _seed(tmp_path, monkeypatch)
+    store = cli._build_store()
+    store.remember("user", "A", "body a, revised")
+    capsys.readouterr()
+    assert cli.main(["history", str(a)]) == 0
+    versions = json.loads(capsys.readouterr().out)
+    assert [v["body"] for v in versions] == ["body a"]
+    assert cli.main(["revert", str(a), str(versions[0]["version"])]) == 0
+    assert json.loads(capsys.readouterr().out)["reverted"] == a
+    assert cli._build_store().get(a)["body"] == "body a"
+    assert cli.main(["revert", str(a), "99999"]) == 1

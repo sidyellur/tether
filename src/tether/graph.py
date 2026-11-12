@@ -181,7 +181,7 @@ class Graph:
         except Exception:
             pass
 
-    def on_remember(self, mid, emb_blob, matrix=None) -> None:
+    def on_remember(self, mid, emb_blob, matrix=None, replace=False) -> None:
         """Wire semantic kNN edges for `mid`.
 
         `matrix` is an optional (ids, mat, types) triple the caller has already
@@ -190,7 +190,9 @@ class Graph:
         near-duplicate probe, once here). Falls back to its own scan when the
         caller has nothing to share, so Graph stays usable standalone.
         """
-        if not self.enabled or emb_blob is None:
+        if not self.enabled:
+            return
+        if emb_blob is None:
             return
         try:
             import numpy as np
@@ -227,9 +229,62 @@ class Graph:
             order = [int(i) for i in top if ids[int(i)] != mid]
             neighbours = [(mid, ids[i], "semantic", float(sims[i]))
                           for i in order[:KNN_K] if float(sims[i]) > 0]
+            if replace:
+                self._replace_semantic_edges(mid, neighbours, ids, mat, sims, np)
+                return
             self._upsert_edges(neighbours, _now(), mode="max")
         except Exception:
             return
+
+    # How many former neighbours a rewrite re-checks (the closest first).
+    _REWIRE_CHECK_MAX = 64
+
+    def _replace_semantic_edges(self, mid, neighbours, ids, mat, sims, np) -> None:
+        """Start `mid`'s semantic edges over after its text was rewritten.
+
+        Its old edges were weighted for text that is gone; upserting on top
+        kept every one at full weight forever, so a memory rewritten from
+        cars to pizza still surfaced for "automobile". But an edge is shared
+        with the memory at the other end, and many exist because THAT memory
+        chose `mid` as one of its nearest. So besides `mid`'s own new top-k
+        (`neighbours`), a former neighbour keeps its edge, at the new
+        similarity, exactly when `mid` is still among its own nearest k -
+        which is what a clean re-wire of the whole store would produce.
+        (Comparing against the weakest of `mid`'s new top-k instead kept
+        nothing: everything outside the top-k is below it by definition, so
+        one typo fix stripped a hub of every edge others had to it.)
+
+        The delete and the re-insert happen together or not at all.
+        """
+        former = [r[0] for r in self._conn.execute(
+            "SELECT CASE WHEN src=? THEN dst ELSE src END FROM edges "
+            "WHERE kind='semantic' AND (src=? OR dst=?)", (mid, mid, mid)).fetchall()]
+        chosen = {n[1] for n in neighbours}
+        index = {m: i for i, m in enumerate(ids)}
+        candidates = sorted(
+            ((float(sims[index[o]]), o) for o in set(former) - chosen
+             if o in index and float(sims[index[o]]) > 0), reverse=True)
+        keep = list(neighbours)
+        for sim, other in candidates[:self._REWIRE_CHECK_MAX]:
+            theirs = mat @ mat[index[other]]
+            theirs[index[other]] = -np.inf               # not its own neighbour
+            if len(theirs) > KNN_K:
+                kth = float(np.partition(theirs, -KNN_K)[-KNN_K])
+            else:
+                kth = -np.inf
+            if sim >= kth:
+                keep.append((mid, other, "semantic", sim))
+        self._conn.execute("SAVEPOINT tether_rewire")
+        try:
+            self._conn.execute(
+                "DELETE FROM edges WHERE kind='semantic' AND (src=? OR dst=?)",
+                (mid, mid))
+            self._upsert_edges(keep, _now(), mode="max")
+        except Exception:
+            self._conn.execute("ROLLBACK TO tether_rewire")
+            self._conn.execute("RELEASE tether_rewire")
+            raise
+        self._conn.execute("RELEASE tether_rewire")
 
     def on_link(self, id_a, id_b) -> None:
         if not self.enabled:
@@ -303,6 +358,9 @@ class Graph:
                 mat = np.frombuffer(b"".join(r[1] for r in rows),
                                     dtype="<f4").reshape(len(ids), -1)
             shared = (ids, mat, None)
+            # A wholesale re-wire starts clean: every vector is being placed
+            # afresh, so edges from the previous vectors are stale.
+            self._conn.execute("DELETE FROM edges WHERE kind='semantic'")
             for i, mid in enumerate(ids):
                 self.on_remember(mid, mat[i].tobytes(), matrix=shared)
         except Exception:
