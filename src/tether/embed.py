@@ -23,7 +23,17 @@ def _is_cached(model_name: str) -> bool:
     hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
     cache_dir = os.environ.get("HF_HUB_CACHE", os.path.join(hf_home, "hub"))
     repo_dir = "models--" + model_name.replace("/", "--")
-    return os.path.isdir(os.path.join(cache_dir, repo_dir))
+    # A snapshot holding the weights, not merely the directory: an
+    # interrupted first download leaves the directory behind, and forcing
+    # the hub offline on that basis meant the model could never finish
+    # downloading - semantic recall stayed off with nothing to say why.
+    snapshots = os.path.join(cache_dir, repo_dir, "snapshots")
+    try:
+        return any(
+            os.path.exists(os.path.join(snapshots, rev, "model.safetensors"))
+            for rev in os.listdir(snapshots))
+    except OSError:
+        return False
 
 
 class Embedder:

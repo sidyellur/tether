@@ -5,6 +5,8 @@ name: Release
 # The publish job only runs after the tag is confirmed to match the
 # pyproject version AND the test suite passes, so a red build or a
 # mistyped tag can never reach PyPI (a published version is permanent).
+# Actions are pinned by commit, not by a tag someone could move: the publish
+# job holds the OIDC permission that lets it release to PyPI.
 on:
   push:
     tags: ["v*"]
@@ -14,9 +16,11 @@ jobs:
     name: Guard tag + run tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
 
@@ -27,6 +31,16 @@ jobs:
           echo "tag=${TAG} pyproject=${VER}"
           if [ "${TAG}" != "${VER}" ]; then
             echo "::error::tag v${TAG} does not match pyproject version ${VER} — bump pyproject or retag"
+            exit 1
+          fi
+
+      - name: Assert the tagged commit is on main
+        # A v* tag on any branch used to publish. Only history that has been
+        # through main (and its CI) may.
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::tag ${GITHUB_REF_NAME} points at a commit that is not on main"
             exit 1
           fi
 
@@ -47,9 +61,9 @@ jobs:
       contents: read           # required for actions/checkout (private repo)
       id-token: write          # required for OIDC trusted publishing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
 
@@ -59,4 +73,4 @@ jobs:
           python -m build
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # release/v1

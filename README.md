@@ -431,6 +431,8 @@ tether export                    # dump all current memories to JSON (stdout)
 tether export -o backup.json     # ...or to a file
 tether import backup.json        # merge an export back into the store
 tether restore <id>              # un-forget a soft-deleted memory
+tether history <id>              # earlier versions of a memory that updates replaced
+tether revert <id> <version>     # put one of those versions back
 tether purge <id> --yes          # permanently delete a memory (bypasses forget)
 ```
 
@@ -446,8 +448,42 @@ report tells you what happened: `{"created", "updated", "skipped", "linked",
 forgetting sweep). It refuses if a newer memory has since claimed the same
 `type`+`title`, naming the blocker rather than failing opaquely.
 
-`purge` refuses to run without `--yes`. All commands honor the same
+`history` lists what updates replaced. `remember` updates a memory in place
+when the title matches, but the previous title, body and tags are kept as a
+version (the newest 10 per memory), so an update is as reversible as a
+`forget`. `revert` puts a version back on the same memory - same id, so links
+to it still hold - and keeps what it replaced as a version in turn.
+
+`purge` removes a memory's versions with it, and refuses to run without `--yes`. All commands honor the same
 `TETHER_DB`/`TETHER_SYNC_*` env vars as the server.
+
+## Safety limits and privacy
+
+Memory outlives the session that wrote it, so tether treats what it stores,
+and what it is asked, as untrusted:
+
+- **Titles are one line.** Line breaks and control characters collapse to a
+  space, and a new memory's title is capped at 500 characters, because titles
+  are printed in the index every session auto-loads; without this a saved
+  title could forge further entries or section headers there. The index also
+  shows at most 200 characters of any title.
+- **Links take the ids of current memories only.** Anything else (a word, a
+  forgotten memory, the memory itself) is dropped and reported in
+  `dropped_links`.
+- **Requests are bounded:** `limit`, `budget`, the number of tag filters and
+  the number of distinct query words all have ceilings well above real use.
+- **Errors meant for the agent are plain messages;** anything internal is
+  logged to the server's stderr and returned as a generic failure.
+- **Files are private.** A new database is created `0600`, a directory
+  tether creates `0700`, and `tether export -o` writes a `0600` file. An
+  existing database keeps its owner and group access and only loses access
+  for everyone else; an existing directory is left as it is.
+- **Sync refuses to send the token unencrypted across the internet:** an
+  `http://` or `ws://` sync URL is accepted for this machine, a private
+  network address or a single-label host name. For anything else set
+  `TETHER_SYNC_ALLOW_INSECURE=1` (a VPN, say), or use `libsql://`/`https://`.
+- **A bad request never turns sync off.** Only a write that fails on the
+  replica and then succeeds on a local connection does.
 
 ## License
 
