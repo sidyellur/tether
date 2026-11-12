@@ -50,10 +50,10 @@ crystallization (Tier B2) each have their own design doc under
   search.
 - **Local-first, sync optional** — the local path is untouched when no backend is
   configured; degradation never throws.
-- **Hybrid search** — FTS5 keyword hits and local static embeddings are
-  fused. An optional usage graph (explicit links, learned co-recall, semantic
-  neighbours) can pull in connected memories on top; it is off by default.
-  Every layer is additive and degrades to plain keyword recall.
+- **Hybrid search, associative on top** — FTS5 keyword hits and local static
+  embeddings are fused, then a usage graph (explicit links, learned co-recall,
+  semantic neighbours) pulls in connected memories. Every layer is additive
+  and degrades to plain keyword recall.
 - **Safe under parallel tool calls** — an agent that fires several
   `remember`/`recall` calls at once gets atomic, correctly-reported results;
   see [Performance and durability](#performance-and-durability).
@@ -160,11 +160,11 @@ next read rather than making you wait.
 | `TETHER_DEVICE_ID` | hostname | the device id recorded on each memory (and the default `TETHER_AUTHOR`) |
 
 One thing to know about replicas: libSQL forwards **every write** to the
-hosted primary. With the associative graph off (the default) `recall` makes
-no writes. Turn the graph on and `recall` writes too — it records what was
-recalled together so memories can wire up over time. On a replica that makes
-each recall a few network round-trips on top of the local search, so leave
-the graph off there unless learned associations are worth that to you.
+hosted primary, and with the associative graph on (the default) `recall`
+writes too — it records what was recalled together so memories can wire up
+over time. On a replica that makes each recall a few network round-trips on
+top of the local search. If that matters more to you than learned
+associations, `TETHER_ASSOC=0` makes recall read-only again.
 
 ## Keyword search
 
@@ -228,12 +228,12 @@ Consolidation never deletes — `forget` soft-deletes (see [Tools](#tools)), and
 only the admin CLI's `purge` is permanent. All of this degrades to plain
 keyword recall when the semantic extra is absent.
 
-## Associative recall (optional, off by default)
+## Associative recall (optional)
 
-Set `TETHER_ASSOC=1` and `recall` doesn't just return keyword/semantic
-matches — it follows a **usage graph** to related memories, so asking about
-one thing surfaces its connected context. The graph's edges come from three
-local, deterministic sources — no LLM, no network:
+`recall` doesn't just return keyword/semantic matches — it follows a **usage
+graph** to related memories, so asking about one thing surfaces its connected
+context. The graph's edges come from three local, deterministic sources — no
+LLM, no network:
 
 - **semantic** — nearest neighbours by embedding (needs the `[semantic]` extra),
 - **explicit** — the `link()` verb,
@@ -246,7 +246,7 @@ edge it came through), and two optional `recall` args tune it:
 |---|---|---|
 | `budget` (per call) | `TETHER_RECALL_BUDGET` | how far to follow associations; `0` = direct matches only |
 | `session` (per call) | time-bucketed | group related recalls so they prime each other |
-| `TETHER_ASSOC` | off | set `1`/`true`/`on` to enable; turning on `TETHER_CRYSTALLIZE` or `TETHER_FORGET` enables it too unless you set `0` |
+| `TETHER_ASSOC` | on | set `0`/`false`/`off` for plain keyword+semantic recall |
 | `TETHER_RECALL_BUDGET` | `8` | default association breadth |
 | `TETHER_PROTECT_HEAD` | `8` | how many top direct hits are locked above associations |
 | `TETHER_SEED_FLOOR` | `0.35` | minimum cosine similarity a semantic hit needs to seed an associative walk; below it a memory is only reachable through an edge. `0` disables the floor |
@@ -255,19 +255,8 @@ Associative recall is **seed-dominant**: the top direct matches are locked in
 place, and associations only fill the slots below them — so turning association
 on never demotes a hit that keyword/semantic search already ranked highly.
 
-With the graph off (or `budget=0`, or an empty graph), `recall` is plain
-keyword + semantic search — associative recall is purely additive and never
-breaks a lookup.
-
-It is off by default because it has not yet earned its cost. On the LoCoMo
-benchmark below it slightly *lowered* recall (R@10 0.620 against 0.628
-without it), about doubled the time per query, and made every `recall` write
-to the database. It is aimed at stores with real links and repeated working
-sessions, which that benchmark doesn't have, so try it on your own store.
-
-You can turn it on at any time. Links and memories saved while it was off are
-wired into the graph on the first start with it on; associations learned from
-use only begin accumulating from then.
+With `TETHER_ASSOC=0` (or `budget=0`, or an empty graph), `recall` behaves exactly
+as before — associative recall is purely additive and never breaks a lookup.
 
 ## Self-organizing store (optional)
 
@@ -279,7 +268,7 @@ As a store grows, tether keeps it legible using the same usage graph:
   shows two labeled slices — **load-bearing** memories (highest *behavioral*
   degree: `explicit` links + learned co-recall, never mere similarity) and the
   most **recent** ones — so the index stays small and shows what actually
-  matters. Without a graph (the default), it falls back to a plain
+  matters. Without a graph (`TETHER_ASSOC=0`), it falls back to a plain
   most-recent-N list instead of the hub/recency split. Below the cap it's the
   full newest-first list either way.
 - **Forgetting-by-disconnection** (opt-in, `TETHER_FORGET`). A bounded sweep
@@ -288,8 +277,7 @@ As a store grows, tether keeps it legible using the same usage graph:
   isolated** (no `explicit`/`hebbian` edge — semantic similarity doesn't count).
   Archived memories drop out of recall and the boot-index but are **retained and
   reversible** (it reuses the same mark-invalid machinery as consolidation;
-  nothing is deleted). It needs the graph, so `TETHER_FORGET` turns
-  `TETHER_ASSOC` on with it. Safety rails: never runs without a live behavioral graph,
+  nothing is deleted). Safety rails: never runs without a live behavioral graph,
   below `2 × CAP` memories, or more than `TETHER_FORGET_MAX_PER_SWEEP` (default
   10) per sweep.
 
@@ -326,7 +314,7 @@ principle-worthy is a strong signal.
 | Tool | What it does |
 |---|---|
 | `remember(type, title, body, tags?, links?, crystallizes?)` | Save a memory; upserts on `type`+`title` so facts refine rather than duplicate. `crystallizes=[ids]` writes it as a principle over those sources (needs `TETHER_CRYSTALLIZE`) |
-| `recall(query?, type?, limit?, budget?, session?, tags?, id?, full?)` | Hybrid keyword + semantic search (plus, with `TETHER_ASSOC=1`, the usage graph's related memories and a `via` receipt per hit); returns id/type/title/body/tags/updated_at. `body` is a **query-centered excerpt** — see [Excerpts](#excerpts) — with `id=N` fetching one memory whole. `tags` is an exact-match filter (a memory must carry every listed tag); combine it with `query`, or omit `query` for a guaranteed-complete tag lookup |
+| `recall(query?, type?, limit?, budget?, session?, tags?, id?, full?)` | Hybrid keyword + semantic search, then follows the usage graph to related memories; returns id/type/title/body/tags/updated_at + a `via` receipt. `body` is a **query-centered excerpt** — see [Excerpts](#excerpts) — with `id=N` fetching one memory whole. `tags` is an exact-match filter (a memory must carry every listed tag); combine it with `query`, or omit `query` for a guaranteed-complete tag lookup |
 | `link(id_a, id_b)` | Bidirectional link between two memories |
 | `forget(id)` | Soft-delete a memory: marks it no longer current (excluded from recall/the boot index) via the same reversible `valid_to` machinery as consolidation, rather than deleting the row. See [Export and permanent deletion](#export-and-permanent-deletion) for a real, permanent delete |
 | `dismiss_cluster(id_a, id_b)` | Reflection control (crystallization): drop the candidate cluster nucleated by peak edge `(id_a, id_b)` so it isn't re-surfaced. Not a memory operation; only relevant with `TETHER_CRYSTALLIZE` |

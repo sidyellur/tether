@@ -273,16 +273,6 @@ def _unpack(blob: bytes) -> tuple:
     return struct.unpack(f"<{len(blob) // 4}f", blob)
 
 
-# Set in `meta` when a write that would have produced graph edges happened
-# while the associative graph was disabled (its default): a link made, or a
-# memory embedded, with nothing wired. The next boot WITH the graph enabled
-# replays what was missed - links from the `links` column in migrate(), the
-# semantic neighbours in backfill_embeddings() - and clears the marker. Two
-# markers because the two replays live in different places and the semantic
-# one needs an embedder that may not be present on the same boot.
-_UNWIRED_LINKS = "graph_unwired_links"
-_UNWIRED_SEMANTIC = "graph_unwired_semantic"
-
 _RECENCY_WEIGHT = 0.25
 _PRIMING_WEIGHT = 0.25
 # #92: a flat bonus added to the seed score of every hit tagged with the
@@ -671,9 +661,6 @@ class Store:
         # counts/max-id remain for noticing a foreign connection's writes.
         self._write_seq = 0
         self._graph = Graph(conn, enabled=assoc)
-        # Which "graph wiring was skipped" markers this process has already
-        # confirmed are in `meta` (see _note_unwired).
-        self._unwired_noted = set()
         # Set for real by migrate()'s _ensure_dedup_unique_index(); defaults
         # to the conservative (locking) path if migrate() is somehow skipped.
         self._has_unique_dedup_index = False
@@ -721,19 +708,6 @@ class Store:
         # the incremental path never saw - and rebuild instead of serving a
         # stale matrix. None when the pragma is unavailable (-> no check).
         self._emb_cache_version = None
-
-    def _note_unwired(self, links=False, semantic=False) -> None:
-        """Record that this write skipped graph wiring because the graph is
-        disabled, so enabling it later knows to catch up (see _UNWIRED_LINKS).
-        A no-op with the graph on. Costs one `meta` read per process for each
-        kind, and one write ever, inside the caller's transaction."""
-        if self._graph.enabled:
-            return
-        for wanted, key in ((links, _UNWIRED_LINKS), (semantic, _UNWIRED_SEMANTIC)):
-            if wanted and key not in self._unwired_noted:
-                if not self._meta_get(key):
-                    self._meta_set(key, "1")
-                self._unwired_noted.add(key)
 
     def _degrade_to_local(self) -> bool:
         """A replica write just failed (e.g. the network dropped mid-session).
@@ -1049,9 +1023,7 @@ class Store:
         self._ensure_consolidation_columns()
         self._ensure_dedup_unique_index()
         self._graph.migrate()
-        if self._graph.enabled and (
-                not self._meta_get("explicit_links_backfilled")
-                or self._meta_get(_UNWIRED_LINKS)):
+        if self._graph.enabled and not self._meta_get("explicit_links_backfilled"):
             # #113: link() (and, since #103, remember(links=...)) already wire
             # the explicit edge at write time, so this replay only matters
             # once - to upgrade a database that predates the associative
@@ -1076,7 +1048,6 @@ class Store:
                         pairs.append((rid, other))
             self._graph.backfill_explicit(pairs)
             self._meta_set("explicit_links_backfilled", "1")
-            self._conn.execute("DELETE FROM meta WHERE key=?", (_UNWIRED_LINKS,))
         self._prune_legacy_session_meta()
         self._commit()
 
@@ -1334,18 +1305,11 @@ class Store:
                     embedded.append((mid, blob))
                     done += 1
                 self._commit()
-            catch_up = bool(self._graph.enabled
-                            and self._meta_get(_UNWIRED_SEMANTIC))
-            if wiped or catch_up:
-                # Either vectors just changed wholesale, or memories were
-                # embedded while the graph was disabled (_note_unwired) and
-                # it has since been turned on. Both mean every current
-                # memory needs (re-)wiring; anything cached may be stale.
+            if wiped:
+                # Vectors just changed wholesale, so anything cached is stale
+                # and every current memory needs re-wiring.
                 self._invalidate_embedding_cache()
                 self._graph.backfill_semantic(matrix=self._embedding_matrix())
-                if catch_up:
-                    self._conn.execute(
-                        "DELETE FROM meta WHERE key=?", (_UNWIRED_SEMANTIC,))
             elif done > 0:
                 # Only the rows embedded this run are new; the incremental
                 # cache (_cache_put, above) already reflects them, so
@@ -1458,7 +1422,6 @@ class Store:
         shared = (self._embedding_matrix()
                   if emb is not None and self._graph.enabled else None)
         self._graph.on_remember(mid, emb, matrix=shared)
-        self._note_unwired(links=bool(valid_links), semantic=emb is not None)
         dropped_crystallizes = []
         if self._crystallize and crystallizes:
             valid, dropped_crystallizes = self._valid_crystallize_sources(
@@ -2055,7 +2018,6 @@ class Store:
         self._conn.execute(self._LINK_UNION_SQL, (id_b, now, id_a))
         self._conn.execute(self._LINK_UNION_SQL, (id_a, now, id_b))
         self._graph.on_link(id_a, id_b)
-        self._note_unwired(links=True)
         self._commit()
         self._sync()
         return {"linked": [id_a, id_b]}

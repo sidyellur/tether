@@ -87,30 +87,12 @@ def test_decay_half_life_off_by_default_and_positive_only(monkeypatch):
     assert config.decay_half_life_days() is None
 
 
-def test_assoc_is_off_by_default_and_opt_in(monkeypatch):
-    for var in ("TETHER_ASSOC", "TETHER_CRYSTALLIZE", "TETHER_FORGET"):
-        monkeypatch.delenv(var, raising=False)
-    assert config.assoc_enabled() is False
-    monkeypatch.setenv("TETHER_ASSOC", "")           # empty counts as unset
-    assert config.assoc_enabled() is False
-    for v in ("1", "true", "on", "YES"):
-        monkeypatch.setenv("TETHER_ASSOC", v)
-        assert config.assoc_enabled() is True
+def test_assoc_enabled_default_true(monkeypatch):
+    monkeypatch.delenv("TETHER_ASSOC", raising=False)
+    assert config.assoc_enabled() is True
     for v in ("0", "false", "off", "NO"):
         monkeypatch.setenv("TETHER_ASSOC", v)
         assert config.assoc_enabled() is False
-
-
-def test_assoc_follows_the_features_that_need_the_graph(monkeypatch):
-    for var in ("TETHER_ASSOC", "TETHER_CRYSTALLIZE", "TETHER_FORGET"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("TETHER_CRYSTALLIZE", "1")
-    assert config.assoc_enabled() is True
-    monkeypatch.delenv("TETHER_CRYSTALLIZE")
-    monkeypatch.setenv("TETHER_FORGET", "1")
-    assert config.assoc_enabled() is True
-    monkeypatch.setenv("TETHER_ASSOC", "0")          # an explicit value wins
-    assert config.assoc_enabled() is False
 
 
 def test_recall_budget_default_and_parsing(monkeypatch):
