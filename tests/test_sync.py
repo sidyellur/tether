@@ -459,7 +459,8 @@ def test_unencrypted_sync_url_is_refused_unless_loopback(tmp_path, monkeypatch, 
     monkeypatch.setattr(sync, "_import_libsql", lambda: (FakeLibsql, "_check_same_thread"))
     monkeypatch.delenv("TETHER_SYNC_ALLOW_INSECURE", raising=False)
     public = ("http://db.example.com", "ws://db.example.com:8080/x", "http://8.8.8.8:8080",
-              "http://box.tailnet.ts.net:8080")
+              "http://box.tailnet.ts.net:8080",
+              "http://134744072", "http://0x08080808")     # both spell 8.8.8.8
     for url in public:
         _, _, mode = sync.open_connection(tmp_path / "a.db", SyncConfig(url, "SECRET-TOKEN"))
         assert mode == "degraded" and not calls
@@ -469,7 +470,8 @@ def test_unencrypted_sync_url_is_refused_unless_loopback(tmp_path, monkeypatch, 
     # this machine, a LAN, a compose service, or anything encrypted: allowed
     allowed = ("http://127.0.0.1:8080", "http://localhost:8080", "http://192.168.1.20:8080",
                "http://10.0.0.5", "http://100.64.1.2:8080", "ws://sqld:8080",
-               "http://[::1]:8080", "https://db.example.com", "libsql://db.example.com")
+               "http://[::1]:8080", "http://localhost.:8080", "http://2130706433",
+               "https://db.example.com", "libsql://db.example.com")
     for url in allowed:
         sync.open_connection(tmp_path / "b.db", SyncConfig(url, "SECRET-TOKEN"))
     assert len(calls) == len(allowed)
@@ -491,11 +493,12 @@ def test_sync_failure_log_never_carries_credentials(tmp_path, monkeypatch, capsy
     assert "libsql://db.example.com" in err
     for secret in ("hunter2", "QUERYSECRET", "TOKEN-123"):
         assert secret not in err
-    # a stub-length token must not chew up ordinary words in the message
+    # a short token is still redacted, but only as a whole word
     monkeypatch.setattr(sync, "_open_replica",
-                        lambda p, c: (_ for _ in ()).throw(RuntimeError("token broken")))
+                        lambda p, c: (_ for _ in ()).throw(
+                            RuntimeError("token broken: bad auth tok rejected")))
     sync.open_connection(tmp_path / "n.db", SyncConfig("libsql://db.example.com", "tok"))
-    assert "token broken" in capsys.readouterr().err
+    assert "token broken: bad auth *** rejected" in capsys.readouterr().err
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX permissions")

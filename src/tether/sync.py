@@ -91,6 +91,7 @@ with deltas noted):
 
 import ipaddress
 import os
+import re
 import socket
 import sqlite3
 import sys
@@ -183,9 +184,17 @@ def _is_private_host(host) -> bool:
     a bare single-label name such as `localhost` or a compose service."""
     if not host:
         return False
+    host = host[:-1] if host.endswith(".") else host
     try:
         return not ipaddress.ip_address(host).is_global
     except ValueError:
+        pass
+    try:
+        # Resolvers also accept one-number and hex spellings of an IPv4
+        # address ("134744072" and "0x08080808" are both 8.8.8.8); judge
+        # those by the address they mean, not as a single-label name.
+        return not ipaddress.ip_address(socket.inet_aton(host)).is_global
+    except (OSError, ValueError):
         return "." not in host
 
 
@@ -373,7 +382,9 @@ def open_connection(db_path, sync_cfg):
         # The client's error text can quote the URL (credentials and all) and,
         # in principle, the token: neither belongs in a log.
         reason = str(e).replace(str(sync_cfg.url), _safe_url(sync_cfg.url))
-        if len(str(sync_cfg.token or "")) >= 8:      # a real token, not a stub that
-            reason = reason.replace(str(sync_cfg.token), "***")   # matches words
+        if sync_cfg.token:
+            # as a whole word, so a short token cannot chew up ordinary ones
+            reason = re.sub(r"(?<![A-Za-z0-9_-])" + re.escape(str(sync_cfg.token))
+                            + r"(?![A-Za-z0-9_-])", "***", reason)
         sys.stderr.write(f"tether: sync offline ({reason}); using local file\n")
         return _local(db_path, mode="degraded")

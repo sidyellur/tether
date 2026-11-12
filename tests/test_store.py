@@ -4686,3 +4686,29 @@ def test_a_create_without_an_embedder_issues_no_extra_statements():
     conn.reset()
     s.remember("user", "Brand new", "body")
     assert (conn.reads, len(conn.writes), conn.commits) == (4, 1, 1)
+
+
+def test_an_overlong_digit_string_is_not_an_id():
+    s = make_store()
+    a = s.remember("user", "A", "a")["id"]
+    huge = "9" * 5000                                  # int() itself refuses this
+    r = s.remember("user", "B", "b", links=[huge, str(a)])
+    assert r["dropped_links"] == [huge]
+    assert s.get(huge) is None
+    with pytest.raises(ValueError, match="integer memory id"):
+        s.forget(huge)
+    assert s._conn.in_transaction is False
+
+
+def test_a_legacy_title_arriving_after_the_cleanup_is_adopted_not_duplicated():
+    s = make_store()                                   # titles_cleaned is already set
+    s._conn.execute(
+        "INSERT INTO memories(type, title, title_norm, body, created_at, updated_at) "
+        "VALUES ('user', ?, ?, 'old', 't', 't')", ("Build\x1b[1m notes", "build\x1b[1m notes"))
+    s._conn.commit()
+    mid = s._conn.execute("SELECT id FROM memories").fetchone()[0]
+    again = s.remember("user", "Build\x1b[1m notes", "new")
+    assert again == {"id": mid, "action": "updated"}
+    assert s._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+    assert s.get(mid)["title"] == "Build [1m notes"
+    assert [v["body"] for v in s.history(mid)] == ["old"]

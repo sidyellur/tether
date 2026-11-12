@@ -21,3 +21,15 @@ def test_real_embedder_produces_unit_normalized_vectors():
     assert e.dims > 0 and len(v) == e.dims
     assert abs(math.sqrt(sum(x * x for x in v)) - 1.0) < 1e-4
     assert isinstance(e.name, str) and e.name
+
+
+def test_is_cached_needs_the_weights_not_just_the_directory(tmp_path, monkeypatch):
+    from tether import embed
+
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    repo = tmp_path / "models--acme--tiny"
+    assert embed._is_cached("acme/tiny") is False
+    (repo / "snapshots" / "abc123").mkdir(parents=True)    # an interrupted download
+    assert embed._is_cached("acme/tiny") is False
+    (repo / "snapshots" / "abc123" / "model.safetensors").write_bytes(b"x")
+    assert embed._is_cached("acme/tiny") is True
