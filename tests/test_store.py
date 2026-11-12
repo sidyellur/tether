@@ -3990,3 +3990,83 @@ def test_import_skips_malformed_ids_and_links_instead_of_aborting():
     assert res["created"] == 4 and res["skipped"] == 1
     assert res["linked"] == 1 and res["dropped_links"] == 2
     assert s._conn.in_transaction is False
+
+
+# --- a replica only degrades when the replica was the problem ----------------
+
+def test_a_bad_request_never_degrades_a_replica(tmp_path):
+    s, _ = _make_degradable_store(tmp_path)
+    a = s.remember("user", "A", "a")["id"]
+    gone = s.remember("user", "Dup", "x")["id"]
+    s.forget(gone)
+    s.remember("user", "Dup", "y")
+    replica = s._conn
+    attempts = [
+        lambda: s.remember("user", "T", "b", links=[{"id": 1}, [1], 2 ** 70]),
+        lambda: s.remember("user", None, "b"),
+        lambda: s.remember("user", "T", "b", tags=[1]),
+        lambda: s.remember("user", "T", "body \ud83d", tags="a\x00b"),
+        lambda: s.remember("user", "T", "b", crystallizes=[2 ** 70]),
+        lambda: s.forget(2 ** 70),
+        lambda: s.restore(gone),                     # deliberate refusal: title clash
+        lambda: s.link(a, "nope"),
+    ]
+    for attempt in attempts:
+        try:
+            attempt()
+        except ValueError:
+            pass
+        assert s._degraded is False and s._conn is replica
+        assert s._conn.in_transaction is False
+
+
+def test_an_error_that_also_fails_locally_restores_the_replica(tmp_path, capsys):
+    # Not a request error by type, but not the replica's fault either: the
+    # local retry fails the same way, so the switch must not stick.
+    s, _ = _make_degradable_store(tmp_path)
+    s.remember("user", "seed", "x")
+    replica = s._conn
+    notified = []
+    s._on_degrade = lambda: notified.append(1)
+
+    def broken(*a, **k):
+        s._conn.execute("INSERT INTO memories(type, title, title_norm, body, "
+                        "created_at, updated_at) VALUES ('user','half','half','w','t','t')")
+        raise RuntimeError("some bug, not the network")
+
+    s._remember_impl = broken
+    with pytest.raises(RuntimeError, match="some bug"):
+        s.remember("user", "T", "b")
+    assert s._degraded is False and s._conn is replica and not notified
+    assert "degrading" not in capsys.readouterr().err
+    assert s._conn.in_transaction is False
+    # neither attempt's half-written row survived
+    assert sqlite3.connect(s._db_path).execute(
+        "SELECT COUNT(*) FROM memories WHERE title='half'").fetchone()[0] == 0
+
+
+def test_a_failed_retry_after_a_real_outage_leaves_nothing_half_written(tmp_path):
+    s, db_path = _make_degradable_store(tmp_path)
+    s.remember("user", "seed", "x")
+    _kill_replica(s)
+    real = s._remember_impl
+
+    def flaky(*a, **k):
+        real(*a, **k)                                 # commits on a healthy connection
+        raise RuntimeError("after the write")
+
+    s._remember_impl = flaky
+    with pytest.raises(RuntimeError):
+        s.remember("user", "T", "b")
+    assert s._degraded is False                       # the local retry failed too
+    del s._remember_impl
+    assert s.remember("user", "T2", "b")["action"] == "created"   # real outage: degrades
+    assert s._degraded is True
+
+
+def test_stats_reports_current_counts():
+    s = make_store()
+    a = s.remember("user", "A", "a")["id"]
+    s.remember("user", "B", "b")
+    s.forget(a)
+    assert s.stats() == {"memory_count": 1, "edge_count": 0}

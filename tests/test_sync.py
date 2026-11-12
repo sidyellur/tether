@@ -1,8 +1,22 @@
+import os
+import socket
 import sqlite3
+import stat
 import threading
+import time
+
+import pytest
 
 from tether import sync
 from tether.config import SyncConfig
+
+
+@pytest.fixture(autouse=True)
+def _no_network_preflight(monkeypatch, request):
+    """The fake clients below use made-up hostnames; the real preflight would
+    go and look for them. Tests of the preflight itself opt back in."""
+    if "real_preflight" not in request.keywords:
+        monkeypatch.setattr(sync, "_preflight", lambda url, timeout: None)
 
 
 def test_no_config_returns_plain_sqlite(tmp_path):
@@ -370,3 +384,119 @@ def test_probe_timeout_closes_the_abandoned_connection(tmp_path, monkeypatch):
     assert mode == "degraded"
     assert conn_holder["conn"].closed is True
     assert isinstance(conn, sqlite3.Connection)
+
+
+# --- start-up hang, unencrypted URLs, log redaction, file permissions -------
+
+def _silent_listener():
+    """A server that accepts a connection and then never says anything."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    held = []
+
+    def accept():
+        try:
+            while True:
+                held.append(srv.accept()[0])
+        except OSError:
+            pass
+    threading.Thread(target=accept, daemon=True).start()
+    return srv, srv.getsockname()[1]
+
+
+@pytest.mark.real_preflight
+def test_a_host_that_accepts_but_never_answers_degrades_instead_of_hanging(
+        tmp_path, monkeypatch, capsys):
+    srv, port = _silent_listener()
+    connected = []
+
+    class FakeLibsql:
+        @staticmethod
+        def connect(*a, **k):
+            connected.append(1)             # the real client would block here forever
+            raise AssertionError("connect must not be reached")
+
+    monkeypatch.setattr(sync, "_import_libsql", lambda: (FakeLibsql, "_check_same_thread"))
+    monkeypatch.setattr(sync, "_INITIAL_SYNC_TIMEOUT", 0.3)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    started = time.monotonic()
+    try:
+        conn, _, mode = sync.open_connection(
+            tmp_path / "m.db", SyncConfig(f"http://127.0.0.1:{port}", "tok"))
+    finally:
+        srv.close()
+    assert mode == "degraded" and not connected
+    assert time.monotonic() - started < 5
+    assert "did not answer" in capsys.readouterr().err
+    assert isinstance(conn, sqlite3.Connection)
+
+
+@pytest.mark.real_preflight
+def test_preflight_lets_a_refused_connection_through(monkeypatch):
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()                                    # nothing listens there now
+    sync._preflight(f"http://127.0.0.1:{port}", 0.5)  # the client reports this itself
+    sync._preflight("file:///nowhere", 0.5)           # not a network URL: no check
+
+
+def test_unencrypted_sync_url_is_refused_unless_loopback(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    class FakeLibsql:
+        @staticmethod
+        def connect(*a, **k):
+            calls.append(k)
+            raise RuntimeError("stop here")
+
+    monkeypatch.setattr(sync, "_import_libsql", lambda: (FakeLibsql, "_check_same_thread"))
+    for url in ("http://db.example.com", "ws://db.example.com:8080/x"):
+        _, _, mode = sync.open_connection(tmp_path / "a.db", SyncConfig(url, "SECRET-TOKEN"))
+        assert mode == "degraded" and not calls
+        err = capsys.readouterr().err
+        assert "not encrypted" in err and "SECRET-TOKEN" not in err
+    for url in ("http://127.0.0.1:8080", "http://localhost:8080", "https://db.example.com",
+                "libsql://db.example.com"):
+        sync.open_connection(tmp_path / "b.db", SyncConfig(url, "SECRET-TOKEN"))
+    assert len(calls) == 4
+
+
+def test_sync_failure_log_never_carries_credentials(tmp_path, monkeypatch, capsys):
+    url = "libsql://user:hunter2@db.example.com/path?authToken=QUERYSECRET"
+
+    def boom(db_path, cfg):
+        raise RuntimeError(f"handshake with {cfg.url} failed (token {cfg.token})")
+
+    monkeypatch.setattr(sync, "_open_replica", boom)
+    sync.open_connection(tmp_path / "m.db", SyncConfig(url, "TOKEN-123"))
+    err = capsys.readouterr().err
+    assert "libsql://db.example.com" in err
+    for secret in ("hunter2", "QUERYSECRET", "TOKEN-123"):
+        assert secret not in err
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permissions")
+def test_store_files_and_a_new_directory_are_private(tmp_path):
+    old = os.umask(0o022)
+    try:
+        path = tmp_path / "fresh" / "memory.db"
+        conn, _, _ = sync.open_connection(path, None)
+        conn.execute("CREATE TABLE t(x)")
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.commit()
+        assert stat.S_IMODE(os.stat(path.parent).st_mode) == 0o700
+        for entry in os.listdir(path.parent):
+            assert stat.S_IMODE(os.stat(path.parent / entry).st_mode) == 0o600, entry
+        # an existing directory is left exactly as it was
+        shared = tmp_path / "shared"
+        shared.mkdir(mode=0o755)
+        sync.open_connection(shared / "memory.db", None)
+        assert stat.S_IMODE(os.stat(shared).st_mode) == 0o755
+        assert stat.S_IMODE(os.stat(shared / "memory.db").st_mode) == 0o600
+    finally:
+        os.umask(old)

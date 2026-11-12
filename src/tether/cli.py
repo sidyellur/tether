@@ -13,6 +13,7 @@ documented as reversible needs somewhere to actually reverse it.
 
 import argparse
 import json
+import os
 import sys
 
 from . import config
@@ -22,7 +23,6 @@ from .sync import open_connection
 
 def _build_store() -> Store:
     path = config.db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     conn, sync_now, _mode = open_connection(path, config.sync_config())
     # Same tokenizer setting as the server, so an admin command never flips
     # the FTS index back and forth against what the server built (#90).
@@ -36,7 +36,10 @@ def cmd_export(args) -> int:
     data = _build_store().export_all()
     text = json.dumps(data, indent=2)
     if args.output:
-        with open(args.output, "w") as f:
+        # A backup holds every memory: create it readable by its owner only.
+        # (An existing file keeps whatever mode it already has.)
+        fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(text)
     else:
         print(text)

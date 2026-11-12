@@ -158,6 +158,12 @@ class AgentError(ValueError):
     it was the request that was wrong, not the connection."""
 
 
+# Errors that say the REQUEST was wrong, not the connection (see
+# Store._write_with_replica_fallback). Plain ValueError is deliberately not
+# here: the libsql client reports database errors as bare ValueError.
+_REQUEST_ERRORS = (AgentError, TypeError, AttributeError, LookupError,
+                   OverflowError, UnicodeError, json.JSONDecodeError)
+
 # Limits on what one call may ask for. None of these is close to real use;
 # they exist so a single malformed or hostile request cannot bloat every
 # later session (titles are auto-loaded in the boot index), hold the store
@@ -792,22 +798,13 @@ class Store:
         # stale matrix. None when the pragma is unavailable (-> no check).
         self._emb_cache_version = None
 
-    def _degrade_to_local(self) -> bool:
-        """A replica write just failed (e.g. the network dropped mid-session).
-        Swap to a fresh local-only connection for the remainder of the
-        process so the caller's write can be retried instead of raised.
-        Returns False (nothing to degrade to, or already degraded) when the
-        original error should propagate instead."""
-        if self._degraded or self._db_path is None:
-            return False
-        try:
-            conn, sync_now, _mode = sync._local(self._db_path)
-        except Exception:
-            return False
+    def _use_connection(self, conn, sync_now) -> None:
         self._conn = conn
         self._graph._conn = conn
         self._sync_now = sync_now
-        self._invalidate_embedding_cache()   # different DB, different rows
+        self._invalidate_embedding_cache()   # different handle, maybe different rows
+
+    def _mark_degraded(self) -> None:
         self._degraded = True
         if self._on_degrade is not None:
             try:
@@ -817,6 +814,19 @@ class Store:
         sys.stderr.write(
             "tether: replica write failed; degrading to local-only for the "
             "remainder of the process\n")
+
+    def _degrade_to_local(self) -> bool:
+        """Swap to a fresh local-only connection for the remainder of the
+        process. Returns False (nothing to degrade to, or already degraded)
+        when there is nothing to swap to."""
+        if self._degraded or self._db_path is None:
+            return False
+        try:
+            conn, sync_now, _mode = sync._local(self._db_path)
+        except Exception:
+            return False
+        self._use_connection(conn, sync_now)
+        self._mark_degraded()
         return True
 
     def _invalidate_embedding_cache(self) -> None:
@@ -1065,16 +1075,50 @@ class Store:
         self._invalidate_embedding_cache()
 
     def _write_with_replica_fallback(self, fn):
-        """Run a write; on failure, roll back the half-finished transaction so
-        the connection isn't left poisoned for the next call (#104), then
-        degrade to local once and retry, or re-raise."""
+        """Run a write. On failure, roll back the half-finished transaction
+        so the connection isn't left poisoned for the next call (#104), and -
+        only if the REPLICA was the problem - continue on a local connection.
+
+        "The replica was the problem" used to mean "anything raised": a
+        malformed argument, a deliberate refusal, a value SQLite cannot bind
+        all switched a healthy replica to local-only for the rest of the
+        process, silently ending cross-device sync. Two guards now:
+
+        - An error that is plainly about the request (_REQUEST_ERRORS) is
+          re-raised as it is. Arguments are validated before this wrapper
+          runs, so this is the second line of defence, not the first.
+        - Anything else is retried on a fresh local connection, and the
+          switch is kept only if that retry SUCCEEDS. If the same call fails
+          locally too, the replica was not at fault: the replica connection
+          is put back and the original error raised. The retry's own partial
+          work is rolled back either way (it used to be left open, to be
+          committed by whatever call came next).
+        """
         try:
             return fn()
-        except Exception:
+        except Exception as first:
             self._rollback_quietly()
-            if not self._degrade_to_local():
+            if (isinstance(first, _REQUEST_ERRORS) or self._degraded
+                    or self._db_path is None):
                 raise
-            return fn()
+            try:
+                local_conn, local_sync, _mode = sync._local(self._db_path)
+            except Exception:
+                raise first from None
+            replica = (self._conn, self._sync_now)
+            self._use_connection(local_conn, local_sync)
+            try:
+                result = fn()
+            except Exception:
+                self._rollback_quietly()
+                self._use_connection(*replica)
+                try:
+                    local_conn.close()
+                except Exception:
+                    pass
+                raise first from None
+            self._mark_degraded()
+            return result
 
     @_locked
     def migrate(self) -> None:
@@ -1983,6 +2027,18 @@ class Store:
         params.append(limit)
         ids = [r[0] for r in self._conn.execute(sql, tuple(params)).fetchall()]
         return self._hydrate(ids)
+
+    @_locked
+    def stats(self) -> dict:
+        """Counts for the status resource. A locked Store method because the
+        server used to run these two queries on the connection directly,
+        outside the lock: on another thread's shared connection that both
+        failed itself and made concurrent boot-index reads come back wrong
+        ("no memories yet" for a full store)."""
+        memories = self._conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL").fetchone()[0]
+        edges = self._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        return {"memory_count": memories, "edge_count": edges}
 
     @_locked
     def get(self, id) -> dict:

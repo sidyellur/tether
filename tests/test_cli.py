@@ -206,3 +206,22 @@ def test_build_store_does_not_require_mcp_or_embed(tmp_path, monkeypatch):
     store = cli._build_store()
     assert isinstance(store, Store)
     assert store._embedder is None
+
+
+def test_export_file_is_private_to_its_owner(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    import pytest
+
+    if os.name != "posix":
+        pytest.skip("POSIX permissions")
+    _seed(tmp_path, monkeypatch)
+    old = os.umask(0o022)
+    try:
+        out = tmp_path / "backup.json"
+        assert cli.main(["export", "-o", str(out)]) == 0
+        assert stat.S_IMODE(os.stat(out).st_mode) == 0o600
+        assert len(json.loads(out.read_text())) == 2
+    finally:
+        os.umask(old)

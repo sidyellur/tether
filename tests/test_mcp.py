@@ -664,3 +664,61 @@ def test_status_resource_has_no_db_path_key(monkeypatch, tmp_path):
         assert "db_path" not in data
     finally:
         server._store = None
+
+
+def test_status_and_index_stay_correct_under_concurrent_calls(tmp_path, monkeypatch):
+    # status() used to query the shared connection outside the store lock:
+    # it errored itself and made concurrent index reads come back wrong.
+    import threading
+
+    from tether import server
+
+    for var in ("TETHER_SYNC_URL", "TETHER_SYNC_TOKEN", "TETHER_PROJECT",
+                "CLAUDE_PROJECT_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")
+    server._store = None
+    try:
+        st = server._get_store()
+        for i in range(20):
+            st.remember("user", f"T{i}", "body")
+        wrong, stop = [], threading.Event()
+
+        def read_status():
+            while not stop.is_set():
+                r = server.status()
+                if '"memory_count": 20' not in r:
+                    wrong.append(r)
+
+        readers = [threading.Thread(target=read_status) for _ in range(2)]
+        for t in readers:
+            t.start()
+        try:
+            for i in range(300):
+                st.remember("user", f"T{i % 20}", f"body {i}")
+                index = server.memory_index()
+                if index.count("\n") < 20:
+                    wrong.append(index)
+        finally:
+            stop.set()
+            for t in readers:
+                t.join()
+        assert wrong == []
+    finally:
+        server._store = None
+
+
+def test_err_passes_only_agent_errors_through():
+    import json as _j
+
+    from tether import server
+    from tether.store import AgentError
+
+    assert server._err(AgentError("no memory with id 7")) == {"error": "no memory with id 7"}
+    for internal in (ValueError("unterminated string near /home/me/memory.db"),
+                     _j.JSONDecodeError("Expecting value", "doc", 0),
+                     UnicodeEncodeError("utf-8", "\ud83d", 0, 1, "surrogates not allowed")):
+        msg = server._err(internal)["error"]
+        assert msg.endswith("operation failed; see server log")
+        assert "memory.db" not in msg and "Expecting" not in msg
