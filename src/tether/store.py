@@ -164,6 +164,11 @@ class AgentError(ValueError):
 _REQUEST_ERRORS = (AgentError, TypeError, AttributeError, LookupError,
                    OverflowError, UnicodeError, json.JSONDecodeError)
 
+def _is_busy(exc) -> bool:
+    text = str(exc).lower()
+    return "database is locked" in text or "database is busy" in text
+
+
 # Limits on what one call may ask for. None of these is close to real use;
 # they exist so a single malformed or hostile request cannot bloat every
 # later session (titles are auto-loaded in the boot index), hold the store
@@ -209,6 +214,19 @@ def _is_id(x) -> bool:
     64-bit column."""
     return (isinstance(x, int) and not isinstance(x, bool)
             and _INT64_MIN <= x <= _INT64_MAX)
+
+
+def _as_id(x):
+    """`x` as a memory id, or None. Agents send ids as "12" or 12.0 often
+    enough that refusing them would lose links that used to work; those are
+    read as the integer they plainly mean. What is NOT accepted is letting
+    SQLite decide: its affinity also matches ' 1', '1e0' and True to id 1,
+    and stored each spelling."""
+    if isinstance(x, str) and x.strip().isascii() and x.strip().isdigit():
+        x = int(x.strip())
+    elif isinstance(x, float) and x.is_integer():
+        x = int(x)
+    return x if _is_id(x) else None
 
 
 def _norm(title: str) -> str:
@@ -679,7 +697,10 @@ class Store:
         # #92: the project this server serves (config.project()), or None.
         # Drives the auto `proj:<name>` tag on remember, the "# This project"
         # slice of the boot index, and the same-project recall bonus.
-        self._project = _sanitize_tag(_clean_title(project or "")).replace(",", "-") or None
+        # Exactly the treatment a stored tag gets (and no more: collapsing
+        # inner whitespace too would stop matching tags already stored for a
+        # directory like "My  App").
+        self._project = _sanitize_tag(project or "").replace(",", "-") or None
         # #83: every public method's DB work runs under this (see _locked),
         # making a call atomic from the agent's point of view. #105: it is
         # NOT held across a write-path sync or read-path pull any more -
@@ -1087,6 +1108,9 @@ class Store:
         - An error that is plainly about the request (_REQUEST_ERRORS) is
           re-raised as it is. Arguments are validated before this wrapper
           runs, so this is the second line of defence, not the first.
+        - A database that is merely busy (another writer held the lock past
+          the busy timeout) says nothing about the replica either: the retry
+          would succeed just because the lock had cleared.
         - Anything else is retried on a fresh local connection, and the
           switch is kept only if that retry SUCCEEDS. If the same call fails
           locally too, the replica was not at fault: the replica connection
@@ -1099,7 +1123,7 @@ class Store:
         except Exception as first:
             self._rollback_quietly()
             if (isinstance(first, _REQUEST_ERRORS) or self._degraded
-                    or self._db_path is None):
+                    or self._db_path is None or _is_busy(first)):
                 raise
             try:
                 local_conn, local_sync, _mode = sync._local(self._db_path)
@@ -1149,6 +1173,7 @@ class Store:
             self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
         self._ensure_consolidation_columns()
         self._ensure_dedup_unique_index()
+        self._clean_legacy_titles()
         self._graph.migrate()
         if self._graph.enabled and not self._meta_get("explicit_links_backfilled"):
             # #113: link() (and, since #103, remember(links=...)) already wire
@@ -1200,6 +1225,31 @@ class Store:
                 self._conn.execute(
                     "DELETE FROM meta WHERE key IN (?, ?)",
                     (key, "assoc_session:" + key[prefix:]))
+        except Exception:
+            return
+
+    def _clean_legacy_titles(self) -> None:
+        """One-time: bring titles written before titles were cleaned into the
+        shape remember() now stores. Without it, a memory whose old title
+        holds a control character could never be updated again: the cleaned
+        title normalizes to a different dedup key, so re-remembering it made
+        a second memory instead. A title whose cleaned form collides with
+        another current memory is left as it is. Never raises."""
+        try:
+            if self._meta_get("titles_cleaned"):
+                return
+            for mid, title in self._conn.execute(
+                    "SELECT id, title FROM memories").fetchall():
+                clean = _clean_title(title or "")
+                if not clean or clean == title:
+                    continue
+                try:
+                    self._conn.execute(
+                        "UPDATE memories SET title=?, title_norm=? WHERE id=?",
+                        (clean, _norm(clean), mid))
+                except Exception:
+                    continue
+            self._meta_set("titles_cleaned", "1")
         except Exception:
             return
 
@@ -1466,7 +1516,7 @@ class Store:
 
     @_locked
     def remember(self, type, title, body, tags=None, links=None,
-                 crystallizes=None) -> dict:
+                 crystallizes=None, _any_title_length=False) -> dict:
         # Everything about the REQUEST is checked here, before the write
         # wrapper: a bad argument is the caller's mistake and must come back
         # as a message, never be mistaken for a failed connection.
@@ -1477,11 +1527,9 @@ class Store:
         title = _clean_title(title)
         if not title:
             raise AgentError("title must not be empty")
-        if len(title) > _TITLE_MAX_CHARS:
-            raise AgentError(
-                f"title is {len(title)} characters; keep it under "
-                f"{_TITLE_MAX_CHARS} and put the detail in the body")
         body = _scrub(body)
+        if isinstance(tags, (set, frozenset)):
+            tags = sorted(tags, key=str)
         if tags is not None and not isinstance(tags, (str, list, tuple)):
             raise AgentError("tags must be a comma-separated string or a list")
         if links is not None and not isinstance(links, (list, tuple)):
@@ -1489,9 +1537,11 @@ class Store:
         if crystallizes is not None and not isinstance(crystallizes, (list, tuple)):
             raise AgentError("crystallizes must be a list of memory ids")
         return self._write_with_replica_fallback(
-            lambda: self._remember_impl(type, title, body, tags, links, crystallizes))
+            lambda: self._remember_impl(type, title, body, tags, links,
+                                        crystallizes, _any_title_length))
 
-    def _remember_impl(self, type, title, body, tags, links, crystallizes) -> dict:
+    def _remember_impl(self, type, title, body, tags, links, crystallizes,
+                       any_title_length=False) -> dict:
         now = _now()
         norm = _norm(title)
         tags_s = _tags_to_str(tags)
@@ -1534,6 +1584,15 @@ class Store:
         # the upsert on an UPDATE; on a CREATE, `mid` doesn't exist as a
         # resolvable id yet, so a self-link there is already impossible to
         # pass validation and needs no separate check.
+        # The title cap applies to NEW memories only. A memory that already
+        # has a longer title (written before the cap existed) must stay
+        # updatable, and import must restore a backup as it was - a cap there
+        # would silently drop the record and every link to it.
+        if (existing is None and not any_title_length
+                and len(title) > _TITLE_MAX_CHARS):
+            raise AgentError(
+                f"title is {len(title)} characters; keep it under "
+                f"{_TITLE_MAX_CHARS} and put the detail in the body")
         self_id = existing[0] if existing is not None else None
         valid_links, dropped_links = self._valid_link_ids(incoming_links, self_id)
 
@@ -1618,18 +1677,19 @@ class Store:
         ids of CURRENT memories other than `self_id`, in the order given;
         `dropped` is everything else, reported back to the caller.
 
-        Only real ints count (see _is_id). Matching on `WHERE id = ?` alone
+        Ids are read with _as_id. Matching on `WHERE id = ?` alone
         let SQLite's type affinity resolve '1', ' 1', 1.0 and True to memory
         1 and store each spelling in the `links` column; it also accepted a
         forgotten memory's id, and an unhashable item (a dict, a nested
         list) raised from inside the write."""
-        candidates, dropped = [], []
-        for x in links:
-            if _is_id(x):
-                if x != self_id and x not in candidates:
-                    candidates.append(x)
-            else:
-                dropped.append(x)
+        candidates, dropped, given = [], [], {}
+        for raw in links:
+            x = _as_id(raw)
+            if x is None:
+                dropped.append(raw)
+            elif x != self_id and x not in given:
+                given[x] = raw                  # report a drop as it was sent
+                candidates.append(x)
         current = set()
         for k in range(0, len(candidates), 500):
             chunk = candidates[k:k + 500]
@@ -1638,16 +1698,17 @@ class Store:
                 f"SELECT id FROM memories WHERE id IN ({ph}) "
                 "AND valid_to IS NULL", tuple(chunk)).fetchall())
         valid = [x for x in candidates if x in current]
-        dropped += [x for x in candidates if x not in current]
+        dropped += [given[x] for x in candidates if x not in current]
         return valid, dropped
 
     def _current_id(self, x):
         """`x` if it is the id of a current memory; AgentError otherwise."""
-        if not _is_id(x) or self._conn.execute(
+        mid = _as_id(x)
+        if mid is None or self._conn.execute(
                 "SELECT 1 FROM memories WHERE id=? AND valid_to IS NULL",
-                (x,)).fetchone() is None:
+                (mid,)).fetchone() is None:
             raise AgentError(f"no memory with id {x!r}")
-        return x
+        return mid
 
     def _memories_seq(self):
         """The last id AUTOINCREMENT handed out for `memories` (None before the
@@ -2044,7 +2105,8 @@ class Store:
     def get(self, id) -> dict:
         """One memory, whole - the fetch half of snippet-plus-fetch (#30).
         Returns None when the id doesn't exist or is no longer current."""
-        if not _is_id(id):
+        id = _as_id(id)
+        if id is None:
             return None
         self._maybe_sync_for_read()
         hits = self._hydrate([id])
@@ -2082,11 +2144,13 @@ class Store:
         try:
             # A negative limit is not "no limit": Python's [:-1] dropped the
             # last hit and SQL's LIMIT -1 returned everything.
-            limit = min(max(0, int(limit)), _LIMIT_MAX)
+            limit = 20 if limit is None else min(max(0, int(limit)), _LIMIT_MAX)
             if budget is not None:
                 budget = min(max(0, int(budget)), _BUDGET_MAX)
         except (TypeError, ValueError, OverflowError):
             raise AgentError("limit and budget must be integers") from None
+        if isinstance(tags, (set, frozenset)):
+            tags = sorted(tags, key=str)
         if tags is not None and not isinstance(tags, (str, list, tuple)):
             raise AgentError("tags must be a comma-separated string or a list")
         tag_list = list(dict.fromkeys(_parse_tags(tags)))
@@ -2234,8 +2298,8 @@ class Store:
         # Both must be current memories: linking to a forgotten one "worked"
         # and bumped its timestamp, and a memory linked to itself stored its
         # own id in its own links.
-        self._current_id(id_a)
-        self._current_id(id_b)
+        id_a = self._current_id(id_a)
+        id_b = self._current_id(id_b)
         if id_a == id_b:
             raise AgentError("cannot link a memory to itself")
         return self._write_with_replica_fallback(
@@ -2262,15 +2326,17 @@ class Store:
             raise AgentError(
                 "crystallization is not enabled (set TETHER_CRYSTALLIZE=1); "
                 "dismiss_cluster has nothing to dismiss")
-        if not (_is_id(id_a) and _is_id(id_b)):
+        id_a, id_b = _as_id(id_a), _as_id(id_b)
+        if id_a is None or id_b is None:
             raise AgentError("dismiss_cluster takes two integer memory ids")
         self._graph.dismiss_peak(id_a, id_b)
         return {"dismissed": [id_a, id_b]}
 
     @_locked
     def forget(self, id) -> dict:
-        if not _is_id(id):
+        if _as_id(id) is None:
             raise AgentError(f"id must be an integer memory id, got {id!r}")
+        id = _as_id(id)
         return self._write_with_replica_fallback(lambda: self._forget_impl(id))
 
     def _forget_impl(self, id) -> dict:
@@ -2301,8 +2367,9 @@ class Store:
         is that reversal, kept CLI-only for the same reason purge is: it is an
         operator action, not something an agent should reach for.
         """
-        if not _is_id(id):
+        if _as_id(id) is None:
             raise AgentError(f"id must be an integer memory id, got {id!r}")
+        id = _as_id(id)
         return self._write_with_replica_fallback(lambda: self._restore_impl(id))
 
     def _restore_impl(self, id) -> dict:
@@ -2351,6 +2418,7 @@ class Store:
         silently pointed at the wrong memory.
         """
         created = updated = skipped = 0
+        skipped_titles = []
         id_map = {}
         for rec in records:
             try:
@@ -2386,12 +2454,14 @@ class Store:
                 skipped += 1
                 continue
             try:
-                res = self.remember(type_, title, body, tags=tags)
+                res = self.remember(type_, title, body, tags=tags,
+                                    _any_title_length=True)
             except Exception:
                 # One bad record must not abort the whole import; the rollback
                 # in _write_with_replica_fallback (#104) guarantees the store
                 # is still writable for the next record in this loop.
                 skipped += 1
+                skipped_titles.append(_clean_title(title)[:80])
                 continue
             if _is_id(rec.get("id")):
                 id_map[rec["id"]] = res["id"]
@@ -2425,8 +2495,11 @@ class Store:
                     linked += 1
                 except Exception:
                     dropped_links += 1
-        return {"created": created, "updated": updated, "skipped": skipped,
-                "linked": linked, "dropped_links": dropped_links}
+        report = {"created": created, "updated": updated, "skipped": skipped,
+                  "linked": linked, "dropped_links": dropped_links}
+        if skipped_titles:
+            report["skipped_titles"] = skipped_titles   # which ones, not just how many
+        return report
 
     @_locked
     def purge(self, id) -> dict:
@@ -2434,8 +2507,9 @@ class Store:
         Deliberately NOT exposed as a default MCP tool argument (#49); reserved
         for an explicit admin path (the CLI) so an agent can't trigger it by
         hallucinating a flag."""
-        if not _is_id(id):
+        if _as_id(id) is None:
             raise AgentError(f"id must be an integer memory id, got {id!r}")
+        id = _as_id(id)
         return self._write_with_replica_fallback(lambda: self._purge_impl(id))
 
     def _purge_impl(self, id) -> dict:

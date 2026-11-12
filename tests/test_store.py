@@ -2931,6 +2931,7 @@ def test_action_is_created_when_another_table_just_took_the_same_rowid():
     back "updated". Reproduced here without recall: park last_insert_rowid()
     on the id the next memory will get, then remember a brand-new title."""
     s = make_store()
+    s._conn.execute("DELETE FROM meta")     # migrate() keeps rows of its own there
     s._conn.execute("INSERT INTO meta(key, value) VALUES ('probe', '1')")   # meta rowid 1
     assert s._conn.execute("SELECT last_insert_rowid()").fetchone()[0] == 1
     r = s.remember("user", "Brand new", "memory id 1")                     # memories id 1
@@ -3855,6 +3856,46 @@ def test_remember_rejects_blank_oversized_and_non_string_titles():
     assert s._conn.in_transaction is False
 
 
+def test_title_cap_does_not_strand_existing_memories_or_imports():
+    # A memory written before the cap existed must stay updatable, and an
+    # import must restore a backup as it was written.
+    s = make_store()
+    long_title = "y" * 617
+    s._conn.execute(
+        "INSERT INTO memories(type, title, title_norm, body, created_at, updated_at) "
+        "VALUES ('project', ?, ?, 'old body', 't', 't')", (long_title, long_title))
+    s._conn.commit()
+    assert s.remember("project", long_title, "new body")["action"] == "updated"
+    other = make_store()
+    report = other.import_records(
+        [{"id": 1, "type": "project", "title": "z" * 700, "body": "b", "links": [2]},
+         {"id": 2, "type": "user", "title": "short", "body": "b"}])
+    assert report == {"created": 2, "updated": 0, "skipped": 0, "linked": 1,
+                      "dropped_links": 0}
+
+
+def test_import_names_what_it_skipped(monkeypatch):
+    s = make_store()
+    real = s._remember_impl
+
+    def flaky(type, title, *a, **k):
+        if title == "Bad one":
+            raise RuntimeError("boom")
+        return real(type, title, *a, **k)
+
+    s._remember_impl = flaky
+    report = s.import_records([{"type": "user", "title": "Good", "body": "b"},
+                               {"type": "user", "title": "Bad one", "body": "b"}])
+    assert report["skipped"] == 1 and report["skipped_titles"] == ["Bad one"]
+
+
+def test_recall_treats_limit_none_as_the_default_and_accepts_a_tag_set():
+    s = make_store()
+    s.remember("user", "T", "common words", tags={"x", "y"})
+    assert len(s.recall("common", limit=None)) == 1
+    assert len(s.recall("", tags={"x", "y"})) == 1
+
+
 def test_lone_surrogates_are_replaced_not_fatal():
     s = make_store()
     r = s.remember("user", "emoji \ud83d cut", "body with \ud83d here", tags="t\ud83d")
@@ -3867,29 +3908,34 @@ def test_links_accept_only_current_integer_ids():
     a = s.remember("user", "A", "a")["id"]
     gone = s.remember("user", "Gone", "g")["id"]
     s.forget(gone)
+    # "1", " 1 " and 1.0 plainly mean memory 1 and are read as it - once.
     r = s.remember("user", "B", "b",
-                   links=[a, a, "1", " 1", 1.0, True, {"id": a}, [a], gone, 2 ** 70, 9999])
-    assert r["dropped_links"] == ["1", " 1", 1.0, True, {"id": a}, [a], 2 ** 70, gone, 9999]
+                   links=[a, a, "1", " 1 ", 1.0, True, "1e0", "x", {"id": a}, [a],
+                          gone, 2 ** 70, "9999"])
+    assert r["dropped_links"] == [True, "1e0", "x", {"id": a}, [a], 2 ** 70, gone, "9999"]
     assert s._conn.execute("SELECT links FROM memories WHERE id=?",
                            (r["id"],)).fetchone()[0] == f"[{a}]"
     with pytest.raises(ValueError, match="no memory with id"):
         s.link(a, gone)
     with pytest.raises(ValueError, match="no memory with id"):
-        s.link("1", a)
+        s.link("nope", a)
     with pytest.raises(ValueError, match="itself"):
-        s.link(a, a)
+        s.link(a, str(a))
     assert s._conn.execute("SELECT links FROM memories WHERE id=?",
                            (a,)).fetchone()[0] == f"[{r['id']}]"
 
 
 def test_ids_that_are_not_integers_are_refused_cleanly():
     s = make_store()
-    for bad in ("1", 1.0, True, None, 2 ** 70, [1]):
+    for bad in ("one", 1.5, True, None, 2 ** 70, [1], "1e0"):
         assert s.get(bad) is None
         for call in (s.forget, s.restore, s.purge):
             with pytest.raises(ValueError):
                 call(bad)
     assert s._conn.in_transaction is False
+    mid = s.remember("user", "A", "a")["id"]
+    assert s.get(str(mid))["id"] == mid               # "3" and 3.0 mean 3
+    assert s.forget(float(mid)) == {"forgotten": mid, "existed": True}
 
 
 def test_recall_clamps_limit_and_validates_arguments():
@@ -3967,6 +4013,28 @@ def test_project_name_is_sanitized_the_way_its_tag_is():
     s.remember("project", "Note", "body")
     assert s._conn.execute("SELECT tags FROM memories").fetchone()[0] == "proj:myappx"
     assert "# This project (myappx)" in s.boot_index()
+    # ...and nothing more: tags already stored for such a name keep matching
+    for name, tag in (("My  App", "proj:My  App"), ("my\tapp", "proj:myapp")):
+        conn = sqlite3.connect(":memory:")
+        s = Store(conn, "d", lambda *a, **k: None, project=name)
+        s.migrate()
+        s.remember("project", "Note", "body")
+        assert s._conn.execute("SELECT tags FROM memories").fetchone()[0] == tag
+        assert "# This project" in s.boot_index()
+
+
+def test_a_busy_database_does_not_degrade_a_replica(tmp_path):
+    s, _ = _make_degradable_store(tmp_path)
+    s.remember("user", "seed", "x")
+    replica = s._conn
+
+    def busy(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    s._remember_impl = busy
+    with pytest.raises(sqlite3.OperationalError):
+        s.remember("user", "T", "b")
+    assert s._degraded is False and s._conn is replica
 
 
 def test_boot_index_with_no_room_left_has_no_empty_section_header():
@@ -4070,3 +4138,24 @@ def test_stats_reports_current_counts():
     s.remember("user", "B", "b")
     s.forget(a)
     assert s.stats() == {"memory_count": 1, "edge_count": 0}
+
+
+def test_migrate_cleans_legacy_titles_so_they_stay_updatable():
+    s = make_store()
+    s._conn.execute(
+        "INSERT INTO memories(type, title, title_norm, body, created_at, updated_at) "
+        "VALUES ('user', ?, ?, 'old', 't', 't')",
+        ("Build\x1b[1m notes", "build\x1b[1m notes"))
+    s._conn.execute("DELETE FROM meta WHERE key='titles_cleaned'")
+    s._conn.commit()
+    s.migrate()
+    again = s.remember("user", "Build\x1b[1m notes", "new")
+    assert again["action"] == "updated"
+    assert s._conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL").fetchone()[0] == 1
+    assert [h["id"] for h in s.recall("Build notes")] == [again["id"]]
+    scans = []
+    s._conn.set_trace_callback(scans.append)
+    s.migrate()                                        # one-time: no rescan
+    s._conn.set_trace_callback(None)
+    assert not [q for q in scans if q.startswith("SELECT id, title FROM memories")]

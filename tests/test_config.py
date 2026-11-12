@@ -270,5 +270,5 @@ def test_dedup_threshold_must_be_a_cosine_in_range(monkeypatch):
 
 def test_project_name_drops_characters_tags_cannot_hold(monkeypatch):
     monkeypatch.delenv("TETHER_PROJECT", raising=False)
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", '/home/u/my"app\\ two,three')
-    assert config.project() == "myapp two-three"
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", '/home/u/my"app\\  two,three')
+    assert config.project() == "myapp  two-three"      # inner spacing is left alone

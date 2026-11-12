@@ -71,13 +71,13 @@ def project():
         root = os.environ.get("CLAUDE_PROJECT_DIR", "")
         name = os.path.basename(os.path.normpath(root)) if root.strip() else ""
     # The name becomes a `proj:<name>` tag, so it gets the same treatment a
-    # stored tag does: no commas (they separate tags), none of the characters
-    # tags have stripped, whitespace collapsed. Otherwise a directory called
+    # stored tag does, and no more: no commas (they separate tags) and none of
+    # the characters tags have stripped. Otherwise a directory called
     # `my"app` is tagged `proj:myapp` but looked up as `proj:my"app`, and its
     # project section and ranking bonus silently never apply.
-    for ch in ('"', "\\", "\x00"):
+    for ch in ('"', "\\", "\x00", "\t", "\n", "\r"):
         name = name.replace(ch, "")
-    name = " ".join(name.split()).replace(",", "-")
+    name = name.strip().replace(",", "-")
     return name or None
 
 

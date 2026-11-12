@@ -455,15 +455,26 @@ def test_unencrypted_sync_url_is_refused_unless_loopback(tmp_path, monkeypatch, 
             raise RuntimeError("stop here")
 
     monkeypatch.setattr(sync, "_import_libsql", lambda: (FakeLibsql, "_check_same_thread"))
-    for url in ("http://db.example.com", "ws://db.example.com:8080/x"):
+    monkeypatch.delenv("TETHER_SYNC_ALLOW_INSECURE", raising=False)
+    public = ("http://db.example.com", "ws://db.example.com:8080/x", "http://8.8.8.8:8080",
+              "http://box.tailnet.ts.net:8080")
+    for url in public:
         _, _, mode = sync.open_connection(tmp_path / "a.db", SyncConfig(url, "SECRET-TOKEN"))
         assert mode == "degraded" and not calls
         err = capsys.readouterr().err
-        assert "not encrypted" in err and "SECRET-TOKEN" not in err
-    for url in ("http://127.0.0.1:8080", "http://localhost:8080", "https://db.example.com",
-                "libsql://db.example.com"):
+        assert "not encrypted" in err and "TETHER_SYNC_ALLOW_INSECURE" in err
+        assert "SECRET-TOKEN" not in err
+    # this machine, a LAN, a compose service, or anything encrypted: allowed
+    allowed = ("http://127.0.0.1:8080", "http://localhost:8080", "http://192.168.1.20:8080",
+               "http://10.0.0.5", "http://100.64.1.2:8080", "ws://sqld:8080",
+               "http://[::1]:8080", "https://db.example.com", "libsql://db.example.com")
+    for url in allowed:
         sync.open_connection(tmp_path / "b.db", SyncConfig(url, "SECRET-TOKEN"))
-    assert len(calls) == 4
+    assert len(calls) == len(allowed)
+    # ...and an explicit opt-in covers a private route tether cannot recognize
+    monkeypatch.setenv("TETHER_SYNC_ALLOW_INSECURE", "1")
+    sync.open_connection(tmp_path / "c.db", SyncConfig(public[3], "SECRET-TOKEN"))
+    assert len(calls) == len(allowed) + 1
 
 
 def test_sync_failure_log_never_carries_credentials(tmp_path, monkeypatch, capsys):
@@ -478,6 +489,11 @@ def test_sync_failure_log_never_carries_credentials(tmp_path, monkeypatch, capsy
     assert "libsql://db.example.com" in err
     for secret in ("hunter2", "QUERYSECRET", "TOKEN-123"):
         assert secret not in err
+    # a stub-length token must not chew up ordinary words in the message
+    monkeypatch.setattr(sync, "_open_replica",
+                        lambda p, c: (_ for _ in ()).throw(RuntimeError("token broken")))
+    sync.open_connection(tmp_path / "n.db", SyncConfig("libsql://db.example.com", "tok"))
+    assert "token broken" in capsys.readouterr().err
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX permissions")
@@ -498,5 +514,44 @@ def test_store_files_and_a_new_directory_are_private(tmp_path):
         sync.open_connection(shared / "memory.db", None)
         assert stat.S_IMODE(os.stat(shared).st_mode) == 0o755
         assert stat.S_IMODE(os.stat(shared / "memory.db").st_mode) == 0o600
+        # an EXISTING store keeps its owner and group access (a deliberately
+        # shared one stays shared) and only loses access for everyone else;
+        # a neighbouring file that merely shares the name is not tether's
+        os.chmod(shared / "memory.db", 0o664)
+        (shared / "memory.db-backup.json").write_text("{}")
+        os.chmod(shared / "memory.db-backup.json", 0o644)
+        sync.open_connection(shared / "memory.db", None)
+        assert stat.S_IMODE(os.stat(shared / "memory.db").st_mode) == 0o660
+        assert stat.S_IMODE(os.stat(shared / "memory.db-backup.json").st_mode) == 0o644
     finally:
         os.umask(old)
+
+
+@pytest.mark.real_preflight
+def test_preflight_ignores_proxy_settings_like_the_client_does(monkeypatch):
+    # A proxy that swallows the request must not be what gets tested.
+    proxy, proxy_port = _silent_listener()
+    backend = socket.socket()
+    backend.bind(("127.0.0.1", 0))
+    backend.listen(1)
+    hits = []
+
+    def serve():
+        try:
+            conn, _ = backend.accept()
+            hits.append(conn.recv(2048))
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            conn.close()
+        except OSError:
+            pass
+    threading.Thread(target=serve, daemon=True).start()
+    for var in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(var, f"http://127.0.0.1:{proxy_port}")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    try:
+        sync._preflight(f"http://127.0.0.1:{backend.getsockname()[1]}", 2)
+    finally:
+        proxy.close()
+        backend.close()
+    assert hits and hits[0].startswith(b"GET /health")

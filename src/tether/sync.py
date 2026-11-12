@@ -125,32 +125,38 @@ def _import_libsql():
         return libsql_experimental, "check_same_thread"
 
 
-def _make_private(db_path) -> None:
-    """Keep the store readable by its owner only. Memories are about as
-    personal as data gets, and both the directory and the file used to be
-    created with the process umask - world-readable on a typical machine.
+# The files that make up a store: the database, SQLite's WAL companions, and
+# the embedded replica's bookkeeping. Nothing else beside it is tether's.
+_STORE_SUFFIXES = ("", "-wal", "-shm", "-info", "-client_wal_index")
 
-    The DB file (and any companion files beside it: -wal, -shm, the replica's
-    bookkeeping) is set to 0600; SQLite gives a new -wal/-shm the mode of the
-    main file. The directory is only restricted when tether creates it (see
-    open_connection) - an existing one, which with TETHER_DB may be shared or
-    not even ours, is left alone. Best-effort and POSIX-only: a failure here
-    must never stop the store opening."""
+
+def _make_private(db_path, created) -> None:
+    """Keep the store readable by its owner. Memories are about as personal
+    as data gets, and the files used to be created with the process umask -
+    world-readable on a typical machine.
+
+    A store tether has just CREATED gets 0600 (SQLite gives a new -wal/-shm
+    the mode of the main file). An EXISTING one only loses access for
+    "other": its owner and group bits are kept, so a store someone has
+    deliberately shared with a group stays shared. Only the store's own
+    files are touched (_STORE_SUFFIXES), never a neighbour that happens to
+    share the name. Best-effort and POSIX-only: a failure here must never
+    stop the store opening."""
     if os.name != "posix":
         return
-    try:
-        folder, name = os.path.split(str(db_path))
-        for entry in os.listdir(folder or "."):
-            if entry == name or entry.startswith(name + "-"):
-                try:
-                    os.chmod(os.path.join(folder, entry), 0o600)
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    for suffix in _STORE_SUFFIXES:
+        path = str(db_path) + suffix
+        try:
+            mode = os.stat(path).st_mode & 0o777
+            want = 0o600 if created else mode & ~0o007
+            if want != mode:
+                os.chmod(path, want)
+        except OSError:
+            pass
 
 
 def _local(db_path, mode="local"):
+    created = not os.path.exists(str(db_path))
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     # WAL lets readers (e.g. recall) proceed alongside a writer instead of
     # blocking; busy_timeout makes a contended write retry instead of an
@@ -167,19 +173,20 @@ def _local(db_path, mode="local"):
     # per commit here; an SSD fsync is typically 1-5 ms. Connection-level,
     # so it lives with busy_timeout rather than in the file.
     conn.execute("PRAGMA synchronous=NORMAL")
-    _make_private(db_path)
+    _make_private(db_path, created)
     return conn, (lambda timeout=2.0: None), mode
 
 
-def _is_loopback(host) -> bool:
+def _is_private_host(host) -> bool:
+    """A host on this machine or a private network: an IP that is not
+    globally routable (loopback, RFC 1918, link-local, carrier-grade NAT), or
+    a bare single-label name such as `localhost` or a compose service."""
     if not host:
         return False
-    if host.lower() == "localhost":
-        return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        return not ipaddress.ip_address(host).is_global
     except ValueError:
-        return False
+        return "." not in host
 
 
 def _safe_url(url) -> str:
@@ -195,15 +202,26 @@ def _safe_url(url) -> str:
 
 
 def _check_url(sync_cfg) -> None:
-    """Refuse a sync URL that would send the token unencrypted. libsql
-    accepts http:// and ws:// and puts `Authorization: Bearer <token>` on
-    the wire in the clear; only a loopback host (a local dev server) is
-    allowed to use them."""
+    """Refuse a sync URL that would send the token unencrypted across the
+    internet. libsql accepts http:// and ws:// and puts
+    `Authorization: Bearer <token>` on the wire in the clear.
+
+    Private destinations are allowed (see _is_private_host): a self-hosted
+    server on the same machine, LAN or compose network is the normal way to
+    run one, and refusing it would silently stop sync that works today.
+    Anything else - including a name on a VPN that tether cannot recognize
+    as private - needs TETHER_SYNC_ALLOW_INSECURE=1, which says so in the
+    message."""
     parts = urllib.parse.urlsplit(str(sync_cfg.url))
-    if parts.scheme.lower() in ("http", "ws") and not _is_loopback(parts.hostname):
-        raise ValueError(
-            f"{_safe_url(sync_cfg.url)} is not encrypted and would expose the "
-            "sync token; use libsql:// or https://")
+    if parts.scheme.lower() not in ("http", "ws") or _is_private_host(parts.hostname):
+        return
+    if os.environ.get("TETHER_SYNC_ALLOW_INSECURE", "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        return
+    raise ValueError(
+        f"{_safe_url(sync_cfg.url)} is not encrypted and would expose the sync "
+        "token; use libsql:// or https://, or set TETHER_SYNC_ALLOW_INSECURE=1 "
+        "if the connection is already private (a VPN)")
 
 
 def _preflight(url, timeout) -> None:
@@ -219,6 +237,11 @@ def _preflight(url, timeout) -> None:
     Only "no answer in time" is a failure. A refused connection, a DNS or
     TLS error, an HTTP error status - the client reports each of those
     promptly by itself, and a host that answers at all cannot hang it.
+
+    The request goes DIRECT, ignoring any HTTP(S)_PROXY in the environment,
+    because the libsql client does: asking through a proxy would test a
+    route the client never takes, and a proxy that stalls for this host
+    would turn off a sync that works.
     """
     parts = urllib.parse.urlsplit(str(url))
     scheme = {"libsql": "https", "wss": "https", "ws": "http"}.get(
@@ -226,9 +249,10 @@ def _preflight(url, timeout) -> None:
     if scheme not in ("http", "https") or not parts.hostname:
         return
     port = f":{parts.port}" if parts.port else ""
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(
-                f"{scheme}://{parts.hostname}{port}/health", timeout=timeout):
+        with direct.open(f"{scheme}://{host}{port}/health", timeout=timeout):
             pass
     except TimeoutError:
         raise TimeoutError(
@@ -259,6 +283,7 @@ def _open_replica(db_path, sync_cfg):
     _check_url(sync_cfg)
     _preflight(sync_cfg.url, _INITIAL_SYNC_TIMEOUT)
 
+    created = not os.path.exists(str(db_path))
     conn = libsql.connect(
         str(db_path), sync_url=sync_cfg.url, auth_token=sync_cfg.token,
         **{thread_kwarg: False})
@@ -327,7 +352,7 @@ def _open_replica(db_path, sync_cfg):
             wake.set()
             condition.wait_for(lambda: counter >= target, timeout=timeout)
 
-    _make_private(db_path)
+    _make_private(db_path, created)
     return conn, sync_now, "replica"
 
 
@@ -348,7 +373,7 @@ def open_connection(db_path, sync_cfg):
         # The client's error text can quote the URL (credentials and all) and,
         # in principle, the token: neither belongs in a log.
         reason = str(e).replace(str(sync_cfg.url), _safe_url(sync_cfg.url))
-        if sync_cfg.token:
-            reason = reason.replace(str(sync_cfg.token), "***")
+        if len(str(sync_cfg.token or "")) >= 8:      # a real token, not a stub that
+            reason = reason.replace(str(sync_cfg.token), "***")   # matches words
         sys.stderr.write(f"tether: sync offline ({reason}); using local file\n")
         return _local(db_path, mode="degraded")
