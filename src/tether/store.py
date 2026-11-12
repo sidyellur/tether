@@ -459,28 +459,103 @@ _EXCERPT_CHARS = 500
 _EXCERPT_SNAP = 40
 
 
+def _excerpt_anchor(low: str, query, max_chars: int):
+    """(first, last) character offsets of the stretch of `low` that best
+    answers `query`, or None when no query word occurs in it.
+
+    The best stretch is the `max_chars` window holding the most DISTINCT
+    query words, each counted once and weighted so that a word that is rare
+    in this body counts for more than one that is everywhere in it. Before
+    this, the excerpt centred on the earliest occurrence of ANY query word -
+    usually a name or a common word near the top - so 98% of excerpts of a
+    long memory were just its opening lines, and the part that answered the
+    question was in view only a quarter of the time (now over half, same
+    width). Stop-words are ignored unless the query is nothing but.
+
+    Two passes over the sorted occurrences with a sliding window, so the
+    cost is linear in how often the query words appear; ties go to the
+    earliest stretch, keeping the result deterministic.
+    """
+    words = {t for t in re.split(r"\W+", (query or "").lower()) if len(t) >= 3}
+    words = {t for t in words if t not in _STOPWORDS} or words
+    occurrences = []
+    for word in words:
+        at = low.find(word)
+        while at != -1:
+            occurrences.append((at, word))
+            at = low.find(word, at + 1)
+    if not occurrences:
+        return None
+    occurrences.sort()
+    total = {}
+    for _, word in occurrences:
+        total[word] = total.get(word, 0) + 1
+    weight = {word: 1.0 + 1.0 / n for word, n in total.items()}
+    best = -1.0
+    best_words = set()
+    in_window = {}
+    score = 0.0
+    right = 0
+    for left in range(len(occurrences)):
+        start = occurrences[left][0]
+        while (right < len(occurrences) and
+               occurrences[right][0] + len(occurrences[right][1]) - start <= max_chars):
+            word = occurrences[right][1]
+            if not in_window.get(word):
+                score += weight[word]
+            in_window[word] = in_window.get(word, 0) + 1
+            right += 1
+        if score > best + 1e-12:
+            best = score
+            best_words = {w for w, n in in_window.items() if n}
+        word = occurrences[left][1]
+        in_window[word] -= 1
+        if not in_window[word]:
+            score -= weight[word]
+    # The winning window is only "some max_chars stretch holding these
+    # words"; its left edge is wherever the scan happened to be. Centre the
+    # excerpt on the TIGHTEST stretch that holds every one of them instead,
+    # so a frequent word far to one side can't push the rare one - usually
+    # the point of the query - out to the edge and cut off what follows it.
+    need = len(best_words)
+    have = {}
+    span = None
+    left = 0
+    for right, (at, word) in enumerate(occurrences):
+        if word not in best_words:
+            continue
+        have[word] = have.get(word, 0) + 1
+        while len(have) == need:
+            first_at, first_word = occurrences[left]
+            if first_word in best_words:
+                width = at + len(word) - first_at
+                if span is None or width < span[1] - span[0]:
+                    span = (first_at, at + len(word))
+                have[first_word] -= 1
+                if not have[first_word]:
+                    del have[first_word]
+            left += 1
+    at, word = occurrences[0]
+    return span or (at, at + len(word))
+
+
 def _excerpt(body: str, query, max_chars: int):
     """(text, truncated) - a relevance-centered window of `body`.
 
-    Centers on the first query term that appears in the body, so the caller
-    sees WHY the memory matched rather than just its opening lines. Falls back
-    to the head of the body when nothing matches (a semantic-only hit, or a
-    tag lookup with no query at all). Ellipses mark where text was cut.
+    Centers on the stretch of the body where the query's words cluster (see
+    _excerpt_anchor), so the caller sees WHY the memory matched rather than
+    just its opening lines. Falls back to the head of the body when nothing
+    matches (a semantic-only hit, or a tag lookup with no query at all).
+    Ellipses mark where text was cut.
     """
     if max_chars <= 0 or not body or len(body) <= max_chars:
         return body, False
-    low = body.lower()
-    pos = -1
-    for tok in re.split(r"\W+", (query or "").lower()):
-        if len(tok) < 3:
-            continue                    # too short to locate anything useful
-        found = low.find(tok)
-        if found != -1 and (pos == -1 or found < pos):
-            pos = found
-    if pos == -1:
+    anchor = _excerpt_anchor(body.lower(), query, max_chars)
+    if anchor is None:
         cut = body[:max_chars].rstrip()
         return cut + "…", True
-    start = max(0, pos - max_chars // 2)
+    first, last = anchor
+    start = max(0, first - max(0, max_chars - (last - first)) // 2)
     end = min(len(body), start + max_chars)
     start = max(0, end - max_chars)     # re-anchor if we hit the tail
     if start > 0:                       # snap forward to a word boundary
