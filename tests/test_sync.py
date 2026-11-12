@@ -441,7 +441,9 @@ def test_preflight_lets_a_refused_connection_through(monkeypatch):
     probe.bind(("127.0.0.1", 0))
     port = probe.getsockname()[1]
     probe.close()                                    # nothing listens there now
-    sync._preflight(f"http://127.0.0.1:{port}", 0.5)  # the client reports this itself
+    # (a generous timeout: Windows retries a refused local connect for ~2 s
+    # before reporting it, and only "no answer in time" may raise)
+    sync._preflight(f"http://127.0.0.1:{port}", 10)   # the client reports this itself
     sync._preflight("file:///nowhere", 0.5)           # not a network URL: no check
 
 

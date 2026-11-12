@@ -270,5 +270,10 @@ def test_dedup_threshold_must_be_a_cosine_in_range(monkeypatch):
 
 def test_project_name_drops_characters_tags_cannot_hold(monkeypatch):
     monkeypatch.delenv("TETHER_PROJECT", raising=False)
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", '/home/u/my"app\\  two,three')
+    # via TETHER_PROJECT: a backslash in a directory path is a separator on
+    # Windows, so the same string names a different directory there
+    monkeypatch.setenv("TETHER_PROJECT", 'my"app\\  two,three\t')
     assert config.project() == "myapp  two-three"      # inner spacing is left alone
+    monkeypatch.delenv("TETHER_PROJECT")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", '/home/u/my"app')
+    assert config.project() == "myapp"
