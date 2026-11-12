@@ -181,7 +181,7 @@ class Graph:
         except Exception:
             pass
 
-    def on_remember(self, mid, emb_blob, matrix=None) -> None:
+    def on_remember(self, mid, emb_blob, matrix=None, replace=False) -> None:
         """Wire semantic kNN edges for `mid`.
 
         `matrix` is an optional (ids, mat, types) triple the caller has already
@@ -190,7 +190,9 @@ class Graph:
         near-duplicate probe, once here). Falls back to its own scan when the
         caller has nothing to share, so Graph stays usable standalone.
         """
-        if not self.enabled or emb_blob is None:
+        if not self.enabled:
+            return
+        if emb_blob is None:
             return
         try:
             import numpy as np
@@ -227,6 +229,29 @@ class Graph:
             order = [int(i) for i in top if ids[int(i)] != mid]
             neighbours = [(mid, ids[i], "semantic", float(sims[i]))
                           for i in order[:KNN_K] if float(sims[i]) > 0]
+            if replace:
+                # `mid` was rewritten: its semantic edges were weighted for
+                # text that is gone. Upserting on top kept every old edge at
+                # full weight forever, so a memory rewritten from cars to
+                # pizza still surfaced for "automobile". Start its edges
+                # over - but an edge is shared with the memory at the other
+                # end, which may have chosen `mid` as ITS neighbour, so a
+                # former neighbour is kept, at its new similarity, when it is
+                # still at least as close as the weakest of the new top-k.
+                former = {r[0] for r in self._conn.execute(
+                    "SELECT CASE WHEN src=? THEN dst ELSE src END FROM edges "
+                    "WHERE kind='semantic' AND (src=? OR dst=?)",
+                    (mid, mid, mid)).fetchall()}
+                chosen = {n[1] for n in neighbours}
+                floor = min((n[3] for n in neighbours), default=0.0)
+                index = {ids[i]: i for i in range(len(ids))} if former - chosen else {}
+                for other in sorted(former - chosen):
+                    i = index.get(other)
+                    if i is not None and float(sims[i]) > 0 and float(sims[i]) >= floor:
+                        neighbours.append((mid, other, "semantic", float(sims[i])))
+                self._conn.execute(
+                    "DELETE FROM edges WHERE kind='semantic' AND (src=? OR dst=?)",
+                    (mid, mid))
             self._upsert_edges(neighbours, _now(), mode="max")
         except Exception:
             return
@@ -303,6 +328,9 @@ class Graph:
                 mat = np.frombuffer(b"".join(r[1] for r in rows),
                                     dtype="<f4").reshape(len(ids), -1)
             shared = (ids, mat, None)
+            # A wholesale re-wire starts clean: every vector is being placed
+            # afresh, so edges from the previous vectors are stale.
+            self._conn.execute("DELETE FROM edges WHERE kind='semantic'")
             for i, mid in enumerate(ids):
                 self.on_remember(mid, mat[i].tobytes(), matrix=shared)
         except Exception:
