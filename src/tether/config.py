@@ -136,12 +136,24 @@ _DEFAULT_SEED_FLOOR = 0.35
 
 
 def assoc_enabled() -> bool:
-    """Associative (spreading-activation) recall is on by default; any of
-    0/false/no/off forces plain v0.2 hybrid recall."""
-    val = os.environ.get("TETHER_ASSOC")
-    if val is None:
-        return True
-    return val.strip().lower() not in _ASSOC_OFF
+    """Associative (spreading-activation) recall is OFF by default; set
+    TETHER_ASSOC=1 to turn it on, and any of 0/false/no/off forces it off.
+
+    It used to default on. Measured on LoCoMo it slightly lowered recall
+    (R@10 0.620 vs 0.628 without it, R@20 0.668 vs 0.707), about doubled the
+    time per query, and made every recall write to the database - a handful
+    of network round trips per recall on a sync replica. Plain keyword +
+    semantic recall is the better default until the graph earns its place.
+
+    Unset, it follows the two features that cannot work without the graph:
+    crystallization and the forgetting sweep both read its edges, so turning
+    either on turns the graph on with it rather than leaving it silently
+    inert. An explicit TETHER_ASSOC value always wins.
+    """
+    val = (os.environ.get("TETHER_ASSOC") or "").strip().lower()
+    if not val:
+        return crystallize_enabled() or forget_enabled()
+    return val not in _ASSOC_OFF
 
 
 def recall_budget() -> int:

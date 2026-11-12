@@ -3818,3 +3818,89 @@ def test_excerpt_window_choice_is_deterministic_on_ties():
     first = _excerpt(body, "alpha marker", 120)
     assert first == _excerpt(body, "alpha marker", 120)
     assert "marker one" in first[0]                  # earliest of equal windows
+
+
+# --- the associative graph is opt-in; enabling it later catches up ----------
+
+def _graph_store(conn, assoc, embedder=None):
+    s = Store(conn, "d", lambda *a, **k: None, assoc=assoc, embedder=embedder,
+              author="dev")
+    s.migrate()
+    if embedder is not None:
+        s.backfill_embeddings()
+    return s
+
+
+def test_recall_without_the_graph_is_read_only():
+    s, conn = _counting_store()
+    s._graph.enabled = False
+    s.remember("user", "Car", "I drive my car to work")
+    conn.reset()
+    hits = s.recall("car work")
+    assert hits and "via" not in hits[0]
+    assert conn.writes == [] and conn.commits == 0
+    assert conn.in_transaction is False
+
+
+def test_links_made_with_the_graph_off_are_wired_when_it_is_turned_on():
+    conn = sqlite3.connect(":memory:")
+    off = _graph_store(conn, assoc=False)
+    a = off.remember("user", "A", "alpha")["id"]
+    b = off.remember("user", "B", "beta", links=[a])["id"]
+    c = off.remember("user", "C", "gamma")["id"]
+    off.link(b, c)
+    assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+    _graph_store(conn, assoc=True)                    # next boot, graph on
+    edges = set(conn.execute(
+        "SELECT src, dst FROM edges WHERE kind='explicit'").fetchall())
+    assert edges == {(a, b), (b, c)}
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'graph_unwired%'"
+                        ).fetchone()[0] == 0
+    assert conn.in_transaction is False
+
+
+def test_memories_embedded_with_the_graph_off_get_neighbours_when_it_is_turned_on():
+    pytest.importorskip("numpy")
+    conn = sqlite3.connect(":memory:")
+    off = _graph_store(conn, assoc=False, embedder=FakeEmbedder())
+    off.remember("user", "Car", "I drive my car")
+    off.remember("user", "Auto", "driving the automobile")
+    assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+    on = _graph_store(conn, assoc=True, embedder=FakeEmbedder())
+    assert conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='semantic'").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'graph_unwired%'"
+                        ).fetchone()[0] == 0
+    # ...and it does not redo the work on the boot after that
+    calls = []
+    on._graph.backfill_semantic = lambda *a, **k: calls.append(1)
+    on.backfill_embeddings()
+    assert calls == []
+
+
+def test_unwired_marker_is_written_once_and_only_by_writes_that_skip_wiring():
+    conn = _CountingConn(sqlite3.connect(":memory:"))
+    s = Store(conn, "d", lambda *a, **k: None, assoc=False)
+    s.migrate()
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'graph_unwired%'"
+                        ).fetchone()[0] == 0         # opening a store marks nothing
+    a = s.remember("user", "A", "alpha")["id"]        # no embedder, no links
+    b = s.remember("user", "B", "beta")["id"]
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'graph_unwired%'"
+                        ).fetchone()[0] == 0
+    s.link(a, b)
+    conn.reset()
+    s.link(a, b)
+    s.export_all()
+    assert not [w for w in conn.writes if "meta" in w]   # already noted
+    assert [r[0] for r in conn.execute(
+        "SELECT key FROM meta WHERE key LIKE 'graph_unwired%'")] == ["graph_unwired_links"]
+
+
+def test_enabled_graph_never_writes_the_unwired_markers():
+    s, conn = _counting_store()
+    a = s.remember("user", "A", "alpha")["id"]
+    b = s.remember("user", "B", "beta", links=[a])["id"]
+    s.link(a, b)
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'graph_unwired%'"
+                        ).fetchone()[0] == 0

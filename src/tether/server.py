@@ -163,8 +163,9 @@ def recall(query: str = "", type: str | None = None, limit: int = 20,
            budget: int | None = None, session: str | None = None,
            tags: str | None = None, id: int | None = None,
            full: bool = False) -> dict:
-    """Search memories by keyword and semantic similarity, then follow the
-    usage graph to related memories, most relevant first.
+    """Search memories by keyword and semantic similarity, most relevant
+    first. (With the optional associative graph enabled, it also follows
+    links and learned associations to related memories.)
 
     Ask in plain language, the way you would ask a colleague ("how do we run
     the integration tests?", "what did the user decide about the auth
@@ -174,11 +175,12 @@ def recall(query: str = "", type: str | None = None, limit: int = 20,
     the current project rank slightly ahead of equally-good ones from
     elsewhere.
 
-    Each hit carries {id, type, title, body, tags, updated_at} and a `via`
-    receipt explaining why it surfaced (a direct match, or the edge it was
-    reached through). Use `updated_at` to judge staleness (an old fact may no
-    longer hold; verify before relying on it) and `id` to cite what you update
-    via remember/link.
+    Each hit carries {id, type, title, body, tags, updated_at}. Use
+    `updated_at` to judge staleness (an old fact may no longer hold; verify
+    before relying on it) and `id` to cite what you update via remember/link.
+    With the associative graph enabled, hits also carry a `via` receipt
+    explaining why each surfaced (a direct match, or the edge it was reached
+    through).
 
     `body` is an EXCERPT centered on your query, not the whole memory. When a
     memory was longer than the excerpt, the hit also carries `truncated: true`
@@ -190,7 +192,9 @@ def recall(query: str = "", type: str | None = None, limit: int = 20,
         type: optional filter ("user"/"feedback"/"project"/"reference").
         limit: max results (default 20).
         budget: how far to follow associations (0 = direct matches only).
-        session: optional id grouping related recalls so they prime each other.
+            Only has an effect when the associative graph is enabled.
+        session: optional id grouping related recalls so they prime each
+            other. Only has an effect when the associative graph is enabled.
         tags: optional comma-separated tags; exact-match filter (a memory must
             carry every listed tag). Combine with `query` to filter its ranked
             hits, or use alone (query omitted) to list every current memory

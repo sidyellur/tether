@@ -265,7 +265,7 @@ def test_server_recall_budget_session(monkeypatch, tmp_path):
             return [x / n for x in v] if n else v
 
     monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
-    monkeypatch.delenv("TETHER_ASSOC", raising=False)
+    monkeypatch.setenv("TETHER_ASSOC", "1")          # the graph is opt-in
     monkeypatch.delenv("TETHER_SEMANTIC", raising=False)
     monkeypatch.delenv("TETHER_SYNC_URL", raising=False)
     monkeypatch.delenv("TETHER_SYNC_TOKEN", raising=False)
@@ -662,5 +662,27 @@ def test_status_resource_has_no_db_path_key(monkeypatch, tmp_path):
     try:
         data = json.loads(server.status())
         assert "db_path" not in data
+    finally:
+        server._store = None
+
+
+def test_server_runs_without_the_graph_by_default(tmp_path, monkeypatch):
+    from tether import server
+
+    for var in ("TETHER_ASSOC", "TETHER_CRYSTALLIZE", "TETHER_FORGET",
+                "TETHER_SYNC_URL", "TETHER_SYNC_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")
+    server._store = None
+    try:
+        s = server._get_store()
+        assert s._graph.enabled is False
+        s.remember("user", "Auth", "we switched to JWT tokens")
+        hits = s.recall("JWT tokens")
+        assert hits and "via" not in hits[0]
+        assert s._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+        assert s._conn.execute(
+            "SELECT COUNT(*) FROM session_members").fetchone()[0] == 0
     finally:
         server._store = None
