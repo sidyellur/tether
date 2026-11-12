@@ -329,8 +329,10 @@ clusters for a reflection pass).
 ## Excerpts
 
 `recall` returns a **relevance-centered excerpt** of each memory's body, not
-the whole thing — the window is centered on the first query term that appears,
-so you see *why* the memory matched rather than just its opening lines. A hit
+the whole thing — the window is centered on the stretch where the most of your
+query's words appear together (a word that is rare in that memory counting for
+more than one that is everywhere in it), so you see *why* the memory matched
+rather than just its opening lines. A hit
 that was cut also carries `truncated: true` and `body_chars` (the real length),
 and you fetch the one memory you actually want in full with `recall(id=N)`.
 

@@ -3776,3 +3776,45 @@ def test_index_rows_chunks_past_the_parameter_limit():
     ids = [s.remember("user", f"N{i}", "x")["id"] for i in range(3)]
     got = s._index_rows([*ids, *range(10_000, 11_200)])
     assert sorted(got) == ids
+
+
+def _buried(answer, opening="Caroline said hello to everyone at the start. "):
+    filler = "Nothing relevant happens in this stretch of the notes. " * 40
+    return opening + filler + answer + " " + filler
+
+
+def test_excerpt_prefers_where_query_words_cluster_over_an_early_stray_match():
+    # "caroline" is in the opening line; the answer is buried. The excerpt
+    # used to centre on the first occurrence of ANY query word - the opening.
+    from tether.store import _excerpt
+    body = _buried("Caroline adopted a greyhound named Biscuit in March.")
+    text, cut = _excerpt(body, "What dog did Caroline adopt?", 300)
+    assert cut is True
+    assert "greyhound named Biscuit" in text
+    assert text.startswith("…") and text.endswith("…")
+    assert len(text) <= 300 + 2
+
+
+def test_excerpt_weights_a_rare_word_above_one_that_is_everywhere():
+    from tether.store import _excerpt
+    common = "The project plan mentions the project budget and the project team. " * 30
+    body = common + "The migration cutover is scheduled for the ninth." + " " + common
+    text, _ = _excerpt(body, "project migration", 200)
+    assert "migration cutover" in text
+
+
+def test_excerpt_ignores_stop_words_unless_the_query_is_only_stop_words():
+    from tether.store import _excerpt
+    body = _buried("The deploy key rotates every ninety days.", opening="What then? ")
+    assert "deploy key rotates" in _excerpt(body, "what about the deploy key", 200)[0]
+    # nothing but stop-words: still anchors on them rather than giving up
+    text, cut = _excerpt(body, "what then", 200)
+    assert cut is True and text.startswith("What then?")
+
+
+def test_excerpt_window_choice_is_deterministic_on_ties():
+    from tether.store import _excerpt
+    body = ("alpha marker one. " + "x " * 400 + "alpha marker two. " + "x " * 400)
+    first = _excerpt(body, "alpha marker", 120)
+    assert first == _excerpt(body, "alpha marker", 120)
+    assert "marker one" in first[0]                  # earliest of equal windows
