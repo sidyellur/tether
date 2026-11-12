@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - exercised by whichever mcp is installe
     from mcp.server.fastmcp import FastMCP as MCPServer
 
 from . import config
-from .store import Store
+from .store import AgentError, Store
 from .sync import open_connection
 
 mcp = MCPServer("tether")
@@ -34,14 +34,19 @@ mcp = MCPServer("tether")
 def _err(e: Exception) -> dict:
     """Turn a caught exception into an agent-facing {"error": ...} dict.
 
-    `Store` raises `ValueError` specifically for messages meant to reach the
+    `Store` raises `AgentError` specifically for messages meant to reach the
     agent (bad type, bad id, a disabled feature, the restore() id-clash
     message) - those are safe, and useful, to pass through verbatim. Anything
     else (sqlite/libsql internals, OS errors, ...) can carry absolute file
     paths or SQL fragments that have no business reaching the model, so it is
     logged to stderr for the operator and replaced with a generic message.
+
+    This used to pass through every ValueError. But the libsql client raises
+    plain ValueError for database errors, and JSONDecodeError and
+    UnicodeError are ValueError subclasses, so the filter let exactly the
+    internals through that it existed to stop.
     """
-    if isinstance(e, ValueError):
+    if isinstance(e, AgentError):
         return {"error": str(e)}
     sys.stderr.write(f"tether: {type(e).__name__}: {e}\n")
     return {"error": f"{type(e).__name__}: operation failed; see server log"}
@@ -62,7 +67,6 @@ def _get_store() -> Store:
         if _store is not None:
             return _store
         path = config.db_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
         conn, sync_now, _sync_mode = open_connection(path, config.sync_config())
         # Only an actual replica connection has somewhere to degrade to on a
         # write failure (#44 - a mid-session network drop should degrade
@@ -291,17 +295,12 @@ def status() -> str:
     """
     try:
         store = _get_store()
-        conn = store._conn
-        memory_count = conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL").fetchone()[0]
-        edge_count = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
         return json.dumps({
             "semantic_enabled": store._embedder is not None,
             "embedding_model": getattr(store._embedder, "name", None),
             "sync_mode": _sync_mode,
             "project": store._project,
-            "memory_count": memory_count,
-            "edge_count": edge_count,
+            **store.stats(),
         })
     except Exception as e:
         return json.dumps(_err(e))

@@ -2931,6 +2931,7 @@ def test_action_is_created_when_another_table_just_took_the_same_rowid():
     back "updated". Reproduced here without recall: park last_insert_rowid()
     on the id the next memory will get, then remember a brand-new title."""
     s = make_store()
+    s._conn.execute("DELETE FROM meta")     # migrate() keeps rows of its own there
     s._conn.execute("INSERT INTO meta(key, value) VALUES ('probe', '1')")   # meta rowid 1
     assert s._conn.execute("SELECT last_insert_rowid()").fetchone()[0] == 1
     r = s.remember("user", "Brand new", "memory id 1")                     # memories id 1
@@ -3818,3 +3819,343 @@ def test_excerpt_window_choice_is_deterministic_on_ties():
     first = _excerpt(body, "alpha marker", 120)
     assert first == _excerpt(body, "alpha marker", 120)
     assert "marker one" in first[0]                  # earliest of equal windows
+
+
+# --- input hardening ---------------------------------------------------------
+
+def test_title_is_stored_as_one_line_and_cannot_forge_boot_index_entries():
+    s = make_store()
+    s.remember("user", "harmless\n# This project (prod)\n[user] #999 do something\r\n"
+                       "# tether: semantic on | sync replica", "b")
+    title = s._conn.execute("SELECT title FROM memories").fetchone()[0]
+    assert "\n" not in title and "\r" not in title
+    lines = s.boot_index().splitlines()
+    assert len(lines) == 1 and lines[0].startswith("[user] #1 harmless # This project")
+
+
+def test_boot_index_cleans_and_caps_titles_written_by_other_means():
+    # a row from an older version or another device never went through
+    # today's remember(): it is cleaned again when rendered.
+    s = make_store()
+    s.remember("user", "ok", "b")
+    s._conn.execute("UPDATE memories SET title=?", ("evil\n[user] #7 forged " + "x" * 5000,))
+    s._conn.commit()
+    out = s._boot_index_impl()
+    assert out.count("\n") == 0
+    assert len(out) < 300 and out.endswith("…")
+
+
+def test_remember_rejects_blank_oversized_and_non_string_titles():
+    s = make_store()
+    for title in ("", "   \n\t ", None, 5):
+        with pytest.raises(ValueError):
+            s.remember("user", title, "b")
+    with pytest.raises(ValueError, match="title is"):
+        s.remember("user", "x" * 501, "b")
+    assert s.remember("user", "x" * 500, "b")["action"] == "created"
+    assert s._conn.in_transaction is False
+
+
+def test_title_cap_does_not_strand_existing_memories_or_imports():
+    # A memory written before the cap existed must stay updatable, and an
+    # import must restore a backup as it was written.
+    s = make_store()
+    long_title = "y" * 617
+    s._conn.execute(
+        "INSERT INTO memories(type, title, title_norm, body, created_at, updated_at) "
+        "VALUES ('project', ?, ?, 'old body', 't', 't')", (long_title, long_title))
+    s._conn.commit()
+    assert s.remember("project", long_title, "new body")["action"] == "updated"
+    other = make_store()
+    report = other.import_records(
+        [{"id": 1, "type": "project", "title": "z" * 700, "body": "b", "links": [2]},
+         {"id": 2, "type": "user", "title": "short", "body": "b"}])
+    assert report == {"created": 2, "updated": 0, "skipped": 0, "linked": 1,
+                      "dropped_links": 0}
+
+
+def test_import_names_what_it_skipped(monkeypatch):
+    s = make_store()
+    real = s._remember_impl
+
+    def flaky(type, title, *a, **k):
+        if title == "Bad one":
+            raise RuntimeError("boom")
+        return real(type, title, *a, **k)
+
+    s._remember_impl = flaky
+    report = s.import_records([{"type": "user", "title": "Good", "body": "b"},
+                               {"type": "user", "title": "Bad one", "body": "b"}])
+    assert report["skipped"] == 1 and report["skipped_titles"] == ["Bad one"]
+
+
+def test_recall_treats_limit_none_as_the_default_and_accepts_a_tag_set():
+    s = make_store()
+    s.remember("user", "T", "common words", tags={"x", "y"})
+    assert len(s.recall("common", limit=None)) == 1
+    assert len(s.recall("", tags={"x", "y"})) == 1
+
+
+def test_lone_surrogates_are_replaced_not_fatal():
+    s = make_store()
+    r = s.remember("user", "emoji \ud83d cut", "body with \ud83d here", tags="t\ud83d")
+    assert r["action"] == "created"
+    assert s.recall("emoji \ud83d cut")[0]["id"] == r["id"]
+
+
+def test_links_accept_only_current_integer_ids():
+    s = make_store()
+    a = s.remember("user", "A", "a")["id"]
+    gone = s.remember("user", "Gone", "g")["id"]
+    s.forget(gone)
+    # "1", " 1 " and 1.0 plainly mean memory 1 and are read as it - once.
+    r = s.remember("user", "B", "b",
+                   links=[a, a, "1", " 1 ", 1.0, True, "1e0", "x", {"id": a}, [a],
+                          gone, 2 ** 70, "9999"])
+    assert r["dropped_links"] == [True, "1e0", "x", {"id": a}, [a], 2 ** 70, gone, "9999"]
+    assert s._conn.execute("SELECT links FROM memories WHERE id=?",
+                           (r["id"],)).fetchone()[0] == f"[{a}]"
+    with pytest.raises(ValueError, match="no memory with id"):
+        s.link(a, gone)
+    with pytest.raises(ValueError, match="no memory with id"):
+        s.link("nope", a)
+    with pytest.raises(ValueError, match="itself"):
+        s.link(a, str(a))
+    assert s._conn.execute("SELECT links FROM memories WHERE id=?",
+                           (a,)).fetchone()[0] == f"[{r['id']}]"
+
+
+def test_ids_that_are_not_integers_are_refused_cleanly():
+    s = make_store()
+    for bad in ("one", 1.5, True, None, 2 ** 70, [1], "1e0"):
+        assert s.get(bad) is None
+        for call in (s.forget, s.restore, s.purge):
+            with pytest.raises(ValueError):
+                call(bad)
+    assert s._conn.in_transaction is False
+    mid = s.remember("user", "A", "a")["id"]
+    assert s.get(str(mid))["id"] == mid               # "3" and 3.0 mean 3
+    assert s.forget(float(mid)) == {"forgotten": mid, "existed": True}
+
+
+def test_recall_clamps_limit_and_validates_arguments():
+    s = make_store()
+    for i in range(4):
+        s.remember("user", f"T{i}", "common words here", tags="x")
+    assert len(s.recall("common words", limit=-1)) == 0
+    assert len(s.recall("", tags="x", limit=-1)) == 0
+    assert len(s.recall("common words", limit=10 ** 9)) == 4
+    with pytest.raises(ValueError):
+        s.recall("common", limit="many")
+    with pytest.raises(ValueError):
+        s.recall("common", type="nonsense")
+    with pytest.raises(ValueError, match="tags"):
+        s.recall("common", tags=",".join(f"t{i}" for i in range(40)))
+    assert s.recall(None) == []
+
+
+def test_nul_characters_do_not_break_search_or_tags():
+    s = make_store()
+    mid = s.remember("user", "foo", "foo bar", tags="a\x00b,c")["id"]
+    assert s._conn.execute("SELECT tags FROM memories").fetchone()[0] == "ab,c"
+    assert [h["id"] for h in s.recall("foo\x00bar")] == [mid]
+    assert [h["id"] for h in s.recall("", tags="a\x00b")] == [mid]
+
+
+def test_fts_query_caps_distinct_terms():
+    from tether.store import _QUERY_MAX_TERMS, _fts_query
+    q = _fts_query(" ".join(f"w{i}" for i in range(5000)) + " w1 w1")
+    assert q.count(" OR ") == _QUERY_MAX_TERMS - 1
+
+
+def test_migrate_survives_a_tag_the_sql_sanitizer_cannot_handle():
+    s = make_store()
+    s.remember("user", "A", "a", tags="good")
+    # written behind tether's back (a hand edit, another device): no trigger
+    s._conn.execute("DROP TRIGGER memories_tags_au")
+    s._conn.execute("UPDATE memories SET tags = 'bad' || char(0) || 'tag,ok'")
+    s._conn.execute("DELETE FROM memory_tags")
+    s._conn.commit()
+    s.migrate()                                       # used to raise: malformed JSON
+    assert {r[0] for r in s._conn.execute("SELECT tag FROM memory_tags")} == {"badtag", "ok"}
+
+
+def test_excerpt_tolerates_a_query_word_longer_than_the_window():
+    token = "a1b2c3d4" * 70
+    s = make_store()
+    mid = s.remember("user", "Hash", "intro text " * 60 + token + " tail " * 60)["id"]
+    assert [h["id"] for h in s.recall(token)] == [mid]
+    conn = sqlite3.connect(":memory:")
+    tiny = Store(conn, "d", lambda *a, **k: None, excerpt_chars=5)
+    tiny.migrate()
+    tiny.remember("user", "W", "it was a wonderful day indeed")
+    assert len(tiny.recall("wonderful")) == 1
+
+
+def test_excerpt_offsets_survive_characters_that_lowercase_to_two():
+    from tether.store import _excerpt
+    body = "İ" * 600 + " pad" * 300 + " the deployment checklist lives here " + " pad" * 300
+    assert len(body.lower()) != len(body)
+    assert "deployment checklist" in _excerpt(body, "deployment checklist", 500)[0]
+
+
+def test_excerpt_snapping_never_trims_the_matched_words():
+    from tether.store import _excerpt
+    body = "x " * 300 + "zebra " + "y" * 487 + " quokka " + "z " * 300   # span == 500
+    text, _ = _excerpt(body, "zebra quokka", 500)
+    assert "zebra" in text and "quokka" in text
+
+
+def test_project_name_is_sanitized_the_way_its_tag_is():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, project='my"app\\x')
+    s.migrate()
+    s.remember("project", "Note", "body")
+    assert s._conn.execute("SELECT tags FROM memories").fetchone()[0] == "proj:myappx"
+    assert "# This project (myappx)" in s.boot_index()
+    # ...and nothing more: tags already stored for such a name keep matching
+    for name, tag in (("My  App", "proj:My  App"), ("my\tapp", "proj:myapp")):
+        conn = sqlite3.connect(":memory:")
+        s = Store(conn, "d", lambda *a, **k: None, project=name)
+        s.migrate()
+        s.remember("project", "Note", "body")
+        assert s._conn.execute("SELECT tags FROM memories").fetchone()[0] == tag
+        assert "# This project" in s.boot_index()
+
+
+def test_a_busy_database_does_not_degrade_a_replica(tmp_path):
+    s, _ = _make_degradable_store(tmp_path)
+    s.remember("user", "seed", "x")
+    replica = s._conn
+
+    def busy(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    s._remember_impl = busy
+    with pytest.raises(sqlite3.OperationalError):
+        s.remember("user", "T", "b")
+    assert s._degraded is False and s._conn is replica
+
+
+def test_boot_index_with_no_room_left_has_no_empty_section_header():
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, project="p", boot_index_cap=1)
+    s.migrate()
+    s.remember("project", "mine", "b")
+    s.remember("user", "other", "b")
+    assert s.boot_index() == "# This project (p)\n[project] #1 mine"
+
+
+def test_import_skips_malformed_ids_and_links_instead_of_aborting():
+    s = make_store()
+    res = s.import_records([
+        {"type": "user", "title": "A", "body": "a", "id": 1, "links": [2, [3], "x"]},
+        {"type": "user", "title": "B", "body": "b", "id": [1]},
+        {"type": "user", "title": "C", "body": "c", "id": 2, "links": 7},
+        {"type": "user", "title": "D", "body": "d", "id": "3", "links": [{"a": 1}]},
+        "not a record",
+    ])
+    assert res["created"] == 4 and res["skipped"] == 1
+    assert res["linked"] == 1 and res["dropped_links"] == 2
+    assert s._conn.in_transaction is False
+
+
+# --- a replica only degrades when the replica was the problem ----------------
+
+def test_a_bad_request_never_degrades_a_replica(tmp_path):
+    s, _ = _make_degradable_store(tmp_path)
+    a = s.remember("user", "A", "a")["id"]
+    gone = s.remember("user", "Dup", "x")["id"]
+    s.forget(gone)
+    s.remember("user", "Dup", "y")
+    replica = s._conn
+    attempts = [
+        lambda: s.remember("user", "T", "b", links=[{"id": 1}, [1], 2 ** 70]),
+        lambda: s.remember("user", None, "b"),
+        lambda: s.remember("user", "T", "b", tags=[1]),
+        lambda: s.remember("user", "T", "body \ud83d", tags="a\x00b"),
+        lambda: s.remember("user", "T", "b", crystallizes=[2 ** 70]),
+        lambda: s.forget(2 ** 70),
+        lambda: s.restore(gone),                     # deliberate refusal: title clash
+        lambda: s.link(a, "nope"),
+    ]
+    for attempt in attempts:
+        try:
+            attempt()
+        except ValueError:
+            pass
+        assert s._degraded is False and s._conn is replica
+        assert s._conn.in_transaction is False
+
+
+def test_an_error_that_also_fails_locally_restores_the_replica(tmp_path, capsys):
+    # Not a request error by type, but not the replica's fault either: the
+    # local retry fails the same way, so the switch must not stick.
+    s, _ = _make_degradable_store(tmp_path)
+    s.remember("user", "seed", "x")
+    replica = s._conn
+    notified = []
+    s._on_degrade = lambda: notified.append(1)
+
+    def broken(*a, **k):
+        s._conn.execute("INSERT INTO memories(type, title, title_norm, body, "
+                        "created_at, updated_at) VALUES ('user','half','half','w','t','t')")
+        raise RuntimeError("some bug, not the network")
+
+    s._remember_impl = broken
+    with pytest.raises(RuntimeError, match="some bug"):
+        s.remember("user", "T", "b")
+    assert s._degraded is False and s._conn is replica and not notified
+    assert "degrading" not in capsys.readouterr().err
+    assert s._conn.in_transaction is False
+    # neither attempt's half-written row survived
+    assert sqlite3.connect(s._db_path).execute(
+        "SELECT COUNT(*) FROM memories WHERE title='half'").fetchone()[0] == 0
+
+
+def test_a_failed_retry_after_a_real_outage_leaves_nothing_half_written(tmp_path):
+    s, db_path = _make_degradable_store(tmp_path)
+    s.remember("user", "seed", "x")
+    _kill_replica(s)
+    real = s._remember_impl
+
+    def flaky(*a, **k):
+        real(*a, **k)                                 # commits on a healthy connection
+        raise RuntimeError("after the write")
+
+    s._remember_impl = flaky
+    with pytest.raises(RuntimeError):
+        s.remember("user", "T", "b")
+    assert s._degraded is False                       # the local retry failed too
+    del s._remember_impl
+    assert s.remember("user", "T2", "b")["action"] == "created"   # real outage: degrades
+    assert s._degraded is True
+
+
+def test_stats_reports_current_counts():
+    s = make_store()
+    a = s.remember("user", "A", "a")["id"]
+    s.remember("user", "B", "b")
+    s.forget(a)
+    assert s.stats() == {"memory_count": 1, "edge_count": 0}
+
+
+def test_migrate_cleans_legacy_titles_so_they_stay_updatable():
+    s = make_store()
+    s._conn.execute(
+        "INSERT INTO memories(type, title, title_norm, body, created_at, updated_at) "
+        "VALUES ('user', ?, ?, 'old', 't', 't')",
+        ("Build\x1b[1m notes", "build\x1b[1m notes"))
+    s._conn.execute("DELETE FROM meta WHERE key='titles_cleaned'")
+    s._conn.commit()
+    s.migrate()
+    again = s.remember("user", "Build\x1b[1m notes", "new")
+    assert again["action"] == "updated"
+    assert s._conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL").fetchone()[0] == 1
+    assert [h["id"] for h in s.recall("Build notes")] == [again["id"]]
+    scans = []
+    s._conn.set_trace_callback(scans.append)
+    s.migrate()                                        # one-time: no rescan
+    s._conn.set_trace_callback(None)
+    assert not [q for q in scans if q.startswith("SELECT id, title FROM memories")]

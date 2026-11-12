@@ -70,6 +70,13 @@ def project():
     else:
         root = os.environ.get("CLAUDE_PROJECT_DIR", "")
         name = os.path.basename(os.path.normpath(root)) if root.strip() else ""
+    # The name becomes a `proj:<name>` tag, so it gets the same treatment a
+    # stored tag does, and no more: no commas (they separate tags) and none of
+    # the characters tags have stripped. Otherwise a directory called
+    # `my"app` is tagged `proj:myapp` but looked up as `proj:my"app`, and its
+    # project section and ranking bonus silently never apply.
+    for ch in ('"', "\\", "\x00", "\t", "\n", "\r"):
+        name = name.replace(ch, "")
     name = name.strip().replace(",", "-")
     return name or None
 
@@ -113,9 +120,13 @@ def dedup_threshold() -> float:
     if not raw:
         return _DEFAULT_DEDUP_THRESHOLD
     try:
-        return float(raw)
+        val = float(raw)
     except ValueError:
         return _DEFAULT_DEDUP_THRESHOLD
+    # A cosine similarity: only (0, 1] means anything. 0 is "off" for the
+    # neighbouring knobs but here it made every new memory supersede its
+    # nearest same-type neighbour, however unrelated; nan never matches.
+    return val if 0.0 < val <= 1.0 else _DEFAULT_DEDUP_THRESHOLD
 
 
 def decay_half_life_days():

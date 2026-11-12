@@ -89,9 +89,15 @@ with deltas noted):
     already under way.
 """
 
+import ipaddress
+import os
+import socket
 import sqlite3
 import sys
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 
 _INITIAL_SYNC_TIMEOUT = 5.0
 _BUSY_TIMEOUT_MS = 5000
@@ -119,7 +125,38 @@ def _import_libsql():
         return libsql_experimental, "check_same_thread"
 
 
+# The files that make up a store: the database, SQLite's WAL companions, and
+# the embedded replica's bookkeeping. Nothing else beside it is tether's.
+_STORE_SUFFIXES = ("", "-wal", "-shm", "-info", "-client_wal_index")
+
+
+def _make_private(db_path, created) -> None:
+    """Keep the store readable by its owner. Memories are about as personal
+    as data gets, and the files used to be created with the process umask -
+    world-readable on a typical machine.
+
+    A store tether has just CREATED gets 0600 (SQLite gives a new -wal/-shm
+    the mode of the main file). An EXISTING one only loses access for
+    "other": its owner and group bits are kept, so a store someone has
+    deliberately shared with a group stays shared. Only the store's own
+    files are touched (_STORE_SUFFIXES), never a neighbour that happens to
+    share the name. Best-effort and POSIX-only: a failure here must never
+    stop the store opening."""
+    if os.name != "posix":
+        return
+    for suffix in _STORE_SUFFIXES:
+        path = str(db_path) + suffix
+        try:
+            mode = os.stat(path).st_mode & 0o777
+            want = 0o600 if created else mode & ~0o007
+            if want != mode:
+                os.chmod(path, want)
+        except OSError:
+            pass
+
+
 def _local(db_path, mode="local"):
+    created = not os.path.exists(str(db_path))
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     # WAL lets readers (e.g. recall) proceed alongside a writer instead of
     # blocking; busy_timeout makes a contended write retry instead of an
@@ -136,7 +173,97 @@ def _local(db_path, mode="local"):
     # per commit here; an SSD fsync is typically 1-5 ms. Connection-level,
     # so it lives with busy_timeout rather than in the file.
     conn.execute("PRAGMA synchronous=NORMAL")
+    _make_private(db_path, created)
     return conn, (lambda timeout=2.0: None), mode
+
+
+def _is_private_host(host) -> bool:
+    """A host on this machine or a private network: an IP that is not
+    globally routable (loopback, RFC 1918, link-local, carrier-grade NAT), or
+    a bare single-label name such as `localhost` or a compose service."""
+    if not host:
+        return False
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        return "." not in host
+
+
+def _safe_url(url) -> str:
+    """`url` reduced to scheme://host[:port] for logs: no userinfo, path or
+    query, any of which can carry a credential (`user:pass@`, `?authToken=`)."""
+    try:
+        parts = urllib.parse.urlsplit(str(url))
+        host = parts.hostname or "?"
+        port = f":{parts.port}" if parts.port else ""
+        return f"{parts.scheme or '?'}://{host}{port}"
+    except Exception:
+        return "<unparseable sync url>"
+
+
+def _check_url(sync_cfg) -> None:
+    """Refuse a sync URL that would send the token unencrypted across the
+    internet. libsql accepts http:// and ws:// and puts
+    `Authorization: Bearer <token>` on the wire in the clear.
+
+    Private destinations are allowed (see _is_private_host): a self-hosted
+    server on the same machine, LAN or compose network is the normal way to
+    run one, and refusing it would silently stop sync that works today.
+    Anything else - including a name on a VPN that tether cannot recognize
+    as private - needs TETHER_SYNC_ALLOW_INSECURE=1, which says so in the
+    message."""
+    parts = urllib.parse.urlsplit(str(sync_cfg.url))
+    if parts.scheme.lower() not in ("http", "ws") or _is_private_host(parts.hostname):
+        return
+    if os.environ.get("TETHER_SYNC_ALLOW_INSECURE", "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        return
+    raise ValueError(
+        f"{_safe_url(sync_cfg.url)} is not encrypted and would expose the sync "
+        "token; use libsql:// or https://, or set TETHER_SYNC_ALLOW_INSECURE=1 "
+        "if the connection is already private (a VPN)")
+
+
+def _preflight(url, timeout) -> None:
+    """Raise TimeoutError if the sync host accepts a connection but does not
+    answer within `timeout` seconds.
+
+    `libsql.connect(..., sync_url=...)` blocks inside native code, holding
+    the GIL, until the server replies - a stalled host, a captive portal or
+    a half-open proxy froze the whole server process at startup, and no
+    Python-level timeout (the bounded probe below included) could fire.
+    So ask the host for any HTTP response first, with a real socket timeout.
+
+    Only "no answer in time" is a failure. A refused connection, a DNS or
+    TLS error, an HTTP error status - the client reports each of those
+    promptly by itself, and a host that answers at all cannot hang it.
+
+    The request goes DIRECT, ignoring any HTTP(S)_PROXY in the environment,
+    because the libsql client does: asking through a proxy would test a
+    route the client never takes, and a proxy that stalls for this host
+    would turn off a sync that works.
+    """
+    parts = urllib.parse.urlsplit(str(url))
+    scheme = {"libsql": "https", "wss": "https", "ws": "http"}.get(
+        parts.scheme.lower(), parts.scheme.lower())
+    if scheme not in ("http", "https") or not parts.hostname:
+        return
+    port = f":{parts.port}" if parts.port else ""
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with direct.open(f"{scheme}://{host}{port}/health", timeout=timeout):
+            pass
+    except TimeoutError:
+        raise TimeoutError(
+            f"sync backend did not answer within {timeout}s: {_safe_url(url)}") from None
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, (socket.timeout, TimeoutError)):
+            raise TimeoutError(
+                f"sync backend did not answer within {timeout}s: "
+                f"{_safe_url(url)}") from None
+    except Exception:
+        return
 
 
 def _safe_sync(conn):
@@ -153,7 +280,10 @@ def _open_replica(db_path, sync_cfg):
     bounded with a background thread rather than called inline.
     """
     libsql, thread_kwarg = _import_libsql()
+    _check_url(sync_cfg)
+    _preflight(sync_cfg.url, _INITIAL_SYNC_TIMEOUT)
 
+    created = not os.path.exists(str(db_path))
     conn = libsql.connect(
         str(db_path), sync_url=sync_cfg.url, auth_token=sync_cfg.token,
         **{thread_kwarg: False})
@@ -175,7 +305,8 @@ def _open_replica(db_path, sync_cfg):
         except Exception:
             pass
         raise TimeoutError(
-            f"sync backend unreachable after {_INITIAL_SYNC_TIMEOUT}s: {sync_cfg.url}")
+            f"sync backend unreachable after {_INITIAL_SYNC_TIMEOUT}s: "
+            f"{_safe_url(sync_cfg.url)}")
     if errors:
         raise errors[0]
 
@@ -221,6 +352,7 @@ def _open_replica(db_path, sync_cfg):
             wake.set()
             condition.wait_for(lambda: counter >= target, timeout=timeout)
 
+    _make_private(db_path, created)
     return conn, sync_now, "replica"
 
 
@@ -230,10 +362,18 @@ def open_connection(db_path, sync_cfg):
     configured but the replica path failed, so it fell back to the local
     file) - the status resource (#51) surfaces this to tell "sync isn't
     configured" apart from "sync is configured but broken"."""
+    # A directory tether creates is private to its owner (see _make_private).
+    os.makedirs(os.path.dirname(os.path.abspath(str(db_path))),
+                mode=0o700, exist_ok=True)
     if sync_cfg is None:
         return _local(db_path)
     try:
         return _open_replica(db_path, sync_cfg)
     except Exception as e:  # import missing, connect failed, initial sync failed
-        sys.stderr.write(f"tether: sync offline ({e}); using local file\n")
+        # The client's error text can quote the URL (credentials and all) and,
+        # in principle, the token: neither belongs in a log.
+        reason = str(e).replace(str(sync_cfg.url), _safe_url(sync_cfg.url))
+        if len(str(sync_cfg.token or "")) >= 8:      # a real token, not a stub that
+            reason = reason.replace(str(sync_cfg.token), "***")   # matches words
+        sys.stderr.write(f"tether: sync offline ({reason}); using local file\n")
         return _local(db_path, mode="degraded")

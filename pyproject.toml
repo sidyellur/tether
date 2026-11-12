@@ -36,6 +36,7 @@ tether = "tether.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["real_preflight: run sync's real network preflight instead of the stub"]
 
 [project.urls]
 Homepage = "https://github.com/sidyellur/tether"

@@ -149,8 +149,84 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
+class AgentError(ValueError):
+    """An error whose message is written for the calling agent: a bad
+    argument, an unknown id, a disabled feature. A ValueError subclass so
+    existing `except ValueError` callers keep working; its own class so the
+    server can tell it apart from a ValueError raised by a library (libsql
+    reports database errors as plain ValueError) and so a failed write knows
+    it was the request that was wrong, not the connection."""
+
+
+# Errors that say the REQUEST was wrong, not the connection (see
+# Store._write_with_replica_fallback). Plain ValueError is deliberately not
+# here: the libsql client reports database errors as bare ValueError.
+_REQUEST_ERRORS = (AgentError, TypeError, AttributeError, LookupError,
+                   OverflowError, UnicodeError, json.JSONDecodeError)
+
+def _is_busy(exc) -> bool:
+    text = str(exc).lower()
+    return "database is locked" in text or "database is busy" in text
+
+
+# Limits on what one call may ask for. None of these is close to real use;
+# they exist so a single malformed or hostile request cannot bloat every
+# later session (titles are auto-loaded in the boot index), hold the store
+# lock for seconds, or exhaust SQLite's bound-parameter limit.
+_TITLE_MAX_CHARS = 500
+_INDEX_TITLE_CHARS = 200        # per-line cap when rendering the boot index
+_QUERY_MAX_TERMS = 64
+_TAG_FILTER_MAX = 32
+_SESSION_MAX_CHARS = 128
+_LIMIT_MAX = 10_000
+_BUDGET_MAX = 64
+_INT64_MIN, _INT64_MAX = -2 ** 63, 2 ** 63 - 1
+
+_SPACE_OR_CONTROL = re.compile(r"[\s\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _scrub(text: str) -> str:
+    """`text` with any lone surrogate replaced by U+FFFD. A truncated emoji
+    escape from a model ("\\ud83d") decodes to one, and SQLite cannot bind
+    it: the write raised UnicodeEncodeError from deep inside the store."""
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+
+
+def _clean_title(title: str) -> str:
+    """A title as one line: every run of whitespace or control characters
+    becomes a single space. Titles are printed one per line in the boot
+    index that every session auto-loads, so a newline in one could forge
+    further entries, a section header, or the status footer."""
+    return _SPACE_OR_CONTROL.sub(" ", _scrub(title)).strip()
+
+
+def _is_id(x) -> bool:
+    """A real, storable memory id: an int (bool is an int subclass, and
+    SQLite's affinity would match True or '1' or 1.0 to id 1) that fits a
+    64-bit column."""
+    return (isinstance(x, int) and not isinstance(x, bool)
+            and _INT64_MIN <= x <= _INT64_MAX)
+
+
+def _as_id(x):
+    """`x` as a memory id, or None. Agents send ids as "12" or 12.0 often
+    enough that refusing them would lose links that used to work; those are
+    read as the integer they plainly mean. What is NOT accepted is letting
+    SQLite decide: its affinity also matches ' 1', '1e0' and True to id 1,
+    and stored each spelling."""
+    if isinstance(x, str) and x.strip().isascii() and x.strip().isdigit():
+        x = int(x.strip())
+    elif isinstance(x, float) and x.is_integer():
+        x = int(x)
+    return x if _is_id(x) else None
 
 
 def _norm(title: str) -> str:
@@ -166,7 +242,7 @@ def _norm(title: str) -> str:
 # newline, CR) is invalid inside a JSON string per spec even though SQLite's
 # parser tolerates some of them inconsistently. _tags_to_str strips all four
 # rather than rejecting, so a cosmetic character in a tag never raises.
-_TAG_UNSAFE_CHARS = ('"', "\\", "\t", "\n", "\r")
+_TAG_UNSAFE_CHARS = ('"', "\\", "\t", "\n", "\r", "\x00")
 
 
 def _sanitize_tag(t: str) -> str:
@@ -184,7 +260,8 @@ def _tags_to_str(tags) -> str:
         parts = tags.split(",")
     else:
         parts = list(tags)
-    cleaned = (_sanitize_tag(t) for t in parts if t and t.strip())
+    cleaned = (_sanitize_tag(_scrub(t)) for t in parts
+               if isinstance(t, str) and t.strip())
     return ",".join(t for t in cleaned if t)
 
 
@@ -197,7 +274,10 @@ def _parse_tags(tags) -> list:
         parts = tags.split(",")
     else:
         parts = list(tags)
-    return [t.strip() for t in parts if t and t.strip()]
+    # Sanitized exactly as stored tags are, so a filter can match them.
+    cleaned = (_sanitize_tag(_scrub(t)) for t in parts
+               if isinstance(t, str) and t.strip())
+    return [t for t in cleaned if t]
 
 
 def _tags_match(stored_tags: str, required: list) -> bool:
@@ -249,12 +329,18 @@ def _fts_query(raw: str):
     unless that would empty the query. Returns None when nothing usable is
     left.
     """
+    # A NUL ends the string as far as FTS5's parser is concerned, leaving
+    # the quoting below unterminated - treat it as whitespace.
+    raw = raw.replace("\x00", " ")
     toks = [t for t in re.split(r"\s+", raw.strip()) if re.search(r"\w", t)]
     if not toks:
         return None
     kept = [t for t in toks
             if re.sub(r"[^\w]+", "", t).lower() not in _STOPWORDS]
-    toks = kept or toks
+    # Distinct terms, capped: FTS5's cost grows faster than linearly in the
+    # number of OR-ed terms (tens of thousands take seconds, with the store
+    # lock held), and nothing useful is asked with more than a few dozen.
+    toks = list(dict.fromkeys(kept or toks))[:_QUERY_MAX_TERMS]
     return " OR ".join('"' + t.replace('"', '""') + '"' for t in toks)
 
 
@@ -476,7 +562,10 @@ def _excerpt_anchor(low: str, query, max_chars: int):
     cost is linear in how often the query words appear; ties go to the
     earliest stretch, keeping the result deterministic.
     """
-    words = {t for t in re.split(r"\W+", (query or "").lower()) if len(t) >= 3}
+    # A word longer than the window can never fit in one (and broke the
+    # window bookkeeping below: recall raised KeyError on a pasted hash).
+    words = {t for t in re.split(r"\W+", (query or "").lower())
+             if 3 <= len(t) <= max_chars}
     words = {t for t in words if t not in _STOPWORDS} or words
     occurrences = []
     for word in words:
@@ -550,7 +639,13 @@ def _excerpt(body: str, query, max_chars: int):
     """
     if max_chars <= 0 or not body or len(body) <= max_chars:
         return body, False
-    anchor = _excerpt_anchor(body.lower(), query, max_chars)
+    low = body.lower()
+    if len(low) != len(body):
+        # A few characters lowercase to more than one code point ('İ'), which
+        # would shift every offset found in `low` away from `body`. Fold
+        # character by character instead, leaving those few as they are.
+        low = "".join(c if len(c.lower()) != 1 else c.lower() for c in body)
+    anchor = _excerpt_anchor(low, query, max_chars)
     if anchor is None:
         cut = body[:max_chars].rstrip()
         return cut + "…", True
@@ -558,13 +653,15 @@ def _excerpt(body: str, query, max_chars: int):
     start = max(0, first - max(0, max_chars - (last - first)) // 2)
     end = min(len(body), start + max_chars)
     start = max(0, end - max_chars)     # re-anchor if we hit the tail
+    # Snap to word boundaries, but never past the matched stretch itself:
+    # when it fills the window, snapping used to trim the matched words off.
     if start > 0:                       # snap forward to a word boundary
         space = body.find(" ", start, start + _EXCERPT_SNAP)
-        if space != -1:
+        if space != -1 and space + 1 <= first:
             start = space + 1
     if end < len(body):                 # snap back to a word boundary
         space = body.rfind(" ", max(start, end - _EXCERPT_SNAP), end)
-        if space != -1:
+        if space != -1 and space >= last:
             end = space
     out = body[start:end].strip()
     if start > 0:
@@ -572,6 +669,16 @@ def _excerpt(body: str, query, max_chars: int):
     if end < len(body):
         out = out + "…"
     return out, True
+
+
+def _index_line(mid, type_, title) -> str:
+    """One boot-index entry. The title is cleaned and capped again here, not
+    only when it is written, because rows written by an older tether or
+    pulled from another device never went through today's remember()."""
+    title = _clean_title(title or "")
+    if len(title) > _INDEX_TITLE_CHARS:
+        title = title[:_INDEX_TITLE_CHARS].rstrip() + "…"
+    return f"[{type_}] #{mid} {title}"
 
 
 class Store:
@@ -590,7 +697,10 @@ class Store:
         # #92: the project this server serves (config.project()), or None.
         # Drives the auto `proj:<name>` tag on remember, the "# This project"
         # slice of the boot index, and the same-project recall bonus.
-        self._project = project or None
+        # Exactly the treatment a stored tag gets (and no more: collapsing
+        # inner whitespace too would stop matching tags already stored for a
+        # directory like "My  App").
+        self._project = _sanitize_tag(project or "").replace(",", "-") or None
         # #83: every public method's DB work runs under this (see _locked),
         # making a call atomic from the agent's point of view. #105: it is
         # NOT held across a write-path sync or read-path pull any more -
@@ -709,22 +819,13 @@ class Store:
         # stale matrix. None when the pragma is unavailable (-> no check).
         self._emb_cache_version = None
 
-    def _degrade_to_local(self) -> bool:
-        """A replica write just failed (e.g. the network dropped mid-session).
-        Swap to a fresh local-only connection for the remainder of the
-        process so the caller's write can be retried instead of raised.
-        Returns False (nothing to degrade to, or already degraded) when the
-        original error should propagate instead."""
-        if self._degraded or self._db_path is None:
-            return False
-        try:
-            conn, sync_now, _mode = sync._local(self._db_path)
-        except Exception:
-            return False
+    def _use_connection(self, conn, sync_now) -> None:
         self._conn = conn
         self._graph._conn = conn
         self._sync_now = sync_now
-        self._invalidate_embedding_cache()   # different DB, different rows
+        self._invalidate_embedding_cache()   # different handle, maybe different rows
+
+    def _mark_degraded(self) -> None:
         self._degraded = True
         if self._on_degrade is not None:
             try:
@@ -734,6 +835,19 @@ class Store:
         sys.stderr.write(
             "tether: replica write failed; degrading to local-only for the "
             "remainder of the process\n")
+
+    def _degrade_to_local(self) -> bool:
+        """Swap to a fresh local-only connection for the remainder of the
+        process. Returns False (nothing to degrade to, or already degraded)
+        when there is nothing to swap to."""
+        if self._degraded or self._db_path is None:
+            return False
+        try:
+            conn, sync_now, _mode = sync._local(self._db_path)
+        except Exception:
+            return False
+        self._use_connection(conn, sync_now)
+        self._mark_degraded()
         return True
 
     def _invalidate_embedding_cache(self) -> None:
@@ -982,16 +1096,53 @@ class Store:
         self._invalidate_embedding_cache()
 
     def _write_with_replica_fallback(self, fn):
-        """Run a write; on failure, roll back the half-finished transaction so
-        the connection isn't left poisoned for the next call (#104), then
-        degrade to local once and retry, or re-raise."""
+        """Run a write. On failure, roll back the half-finished transaction
+        so the connection isn't left poisoned for the next call (#104), and -
+        only if the REPLICA was the problem - continue on a local connection.
+
+        "The replica was the problem" used to mean "anything raised": a
+        malformed argument, a deliberate refusal, a value SQLite cannot bind
+        all switched a healthy replica to local-only for the rest of the
+        process, silently ending cross-device sync. Two guards now:
+
+        - An error that is plainly about the request (_REQUEST_ERRORS) is
+          re-raised as it is. Arguments are validated before this wrapper
+          runs, so this is the second line of defence, not the first.
+        - A database that is merely busy (another writer held the lock past
+          the busy timeout) says nothing about the replica either: the retry
+          would succeed just because the lock had cleared.
+        - Anything else is retried on a fresh local connection, and the
+          switch is kept only if that retry SUCCEEDS. If the same call fails
+          locally too, the replica was not at fault: the replica connection
+          is put back and the original error raised. The retry's own partial
+          work is rolled back either way (it used to be left open, to be
+          committed by whatever call came next).
+        """
         try:
             return fn()
-        except Exception:
+        except Exception as first:
             self._rollback_quietly()
-            if not self._degrade_to_local():
+            if (isinstance(first, _REQUEST_ERRORS) or self._degraded
+                    or self._db_path is None or _is_busy(first)):
                 raise
-            return fn()
+            try:
+                local_conn, local_sync, _mode = sync._local(self._db_path)
+            except Exception:
+                raise first from None
+            replica = (self._conn, self._sync_now)
+            self._use_connection(local_conn, local_sync)
+            try:
+                result = fn()
+            except Exception:
+                self._rollback_quietly()
+                self._use_connection(*replica)
+                try:
+                    local_conn.close()
+                except Exception:
+                    pass
+                raise first from None
+            self._mark_degraded()
+            return result
 
     @_locked
     def migrate(self) -> None:
@@ -1022,6 +1173,7 @@ class Store:
             self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
         self._ensure_consolidation_columns()
         self._ensure_dedup_unique_index()
+        self._clean_legacy_titles()
         self._graph.migrate()
         if self._graph.enabled and not self._meta_get("explicit_links_backfilled"):
             # #113: link() (and, since #103, remember(links=...)) already wire
@@ -1076,6 +1228,31 @@ class Store:
         except Exception:
             return
 
+    def _clean_legacy_titles(self) -> None:
+        """One-time: bring titles written before titles were cleaned into the
+        shape remember() now stores. Without it, a memory whose old title
+        holds a control character could never be updated again: the cleaned
+        title normalizes to a different dedup key, so re-remembering it made
+        a second memory instead. A title whose cleaned form collides with
+        another current memory is left as it is. Never raises."""
+        try:
+            if self._meta_get("titles_cleaned"):
+                return
+            for mid, title in self._conn.execute(
+                    "SELECT id, title FROM memories").fetchall():
+                clean = _clean_title(title or "")
+                if not clean or clean == title:
+                    continue
+                try:
+                    self._conn.execute(
+                        "UPDATE memories SET title=?, title_norm=? WHERE id=?",
+                        (clean, _norm(clean), mid))
+                except Exception:
+                    continue
+            self._meta_set("titles_cleaned", "1")
+        except Exception:
+            return
+
     def _backfill_memory_tags(self) -> None:
         """One-time backfill of memory_tags (#111) for a DB that already has
         `memories` rows predating this table - the triggers only fire on
@@ -1102,11 +1279,25 @@ class Store:
             "AND EXISTS (SELECT 1 FROM memories LIMIT 1)").fetchone()[0]
         if not empty_and_populated:
             return
-        self._conn.execute(
-            "INSERT OR IGNORE INTO memory_tags(memory_id, tag) "
-            "SELECT m.id, trim(je.value) FROM memories m, "
-            f"json_each({_tags_json_array_sql('m.tags')}) je "
-            "WHERE trim(je.value) != ''")
+        try:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO memory_tags(memory_id, tag) "
+                "SELECT m.id, trim(je.value) FROM memories m, "
+                f"json_each({_tags_json_array_sql('m.tags')}) je "
+                "WHERE trim(je.value) != ''")
+        except Exception:
+            # The SQL sanitizer covers the characters a tag written through
+            # an older tether could hold, but not everything a hand-edited or
+            # synced row might (SQLite's replace() cannot remove a NUL, for
+            # one). One such row must not stop the server starting: redo the
+            # backfill row by row with the Python sanitizer instead.
+            self._conn.execute("DELETE FROM memory_tags")
+            for mid, tags in self._conn.execute(
+                    "SELECT id, tags FROM memories").fetchall():
+                for tag in dict.fromkeys(_parse_tags(tags or "")):
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO memory_tags(memory_id, tag) "
+                        "VALUES (?, ?)", (mid, tag))
 
     def _drop_unscoped_fts_update_trigger(self) -> None:
         """Drop a `memories_au` trigger created before it was scoped to
@@ -1325,13 +1516,32 @@ class Store:
 
     @_locked
     def remember(self, type, title, body, tags=None, links=None,
-                 crystallizes=None) -> dict:
+                 crystallizes=None, _any_title_length=False) -> dict:
+        # Everything about the REQUEST is checked here, before the write
+        # wrapper: a bad argument is the caller's mistake and must come back
+        # as a message, never be mistaken for a failed connection.
         if type not in VALID_TYPES:
-            raise ValueError(f"type must be one of {VALID_TYPES}, got {type!r}")
+            raise AgentError(f"type must be one of {VALID_TYPES}, got {type!r}")
+        if not isinstance(title, str) or not isinstance(body, str):
+            raise AgentError("title and body must be strings")
+        title = _clean_title(title)
+        if not title:
+            raise AgentError("title must not be empty")
+        body = _scrub(body)
+        if isinstance(tags, (set, frozenset)):
+            tags = sorted(tags, key=str)
+        if tags is not None and not isinstance(tags, (str, list, tuple)):
+            raise AgentError("tags must be a comma-separated string or a list")
+        if links is not None and not isinstance(links, (list, tuple)):
+            raise AgentError("links must be a list of memory ids")
+        if crystallizes is not None and not isinstance(crystallizes, (list, tuple)):
+            raise AgentError("crystallizes must be a list of memory ids")
         return self._write_with_replica_fallback(
-            lambda: self._remember_impl(type, title, body, tags, links, crystallizes))
+            lambda: self._remember_impl(type, title, body, tags, links,
+                                        crystallizes, _any_title_length))
 
-    def _remember_impl(self, type, title, body, tags, links, crystallizes) -> dict:
+    def _remember_impl(self, type, title, body, tags, links, crystallizes,
+                       any_title_length=False) -> dict:
         now = _now()
         norm = _norm(title)
         tags_s = _tags_to_str(tags)
@@ -1340,7 +1550,7 @@ class Store:
         if (self._project and type in _PROJECT_TAGGED_TYPES
                 and not _has_project_tag(tags_s)):
             tags_s = _tags_to_str([*_parse_tags(tags_s), _project_tag(self._project)])
-        incoming_links = _dedupe_links(links)
+        incoming_links = links or []
         emb = self._embed_or_none(title, body)
 
         # The partial unique index (#41) makes the upsert itself the source
@@ -1374,18 +1584,17 @@ class Store:
         # the upsert on an UPDATE; on a CREATE, `mid` doesn't exist as a
         # resolvable id yet, so a self-link there is already impossible to
         # pass validation and needs no separate check.
-        dropped_links = []
-        valid_links = []
+        # The title cap applies to NEW memories only. A memory that already
+        # has a longer title (written before the cap existed) must stay
+        # updatable, and import must restore a backup as it was - a cap there
+        # would silently drop the record and every link to it.
+        if (existing is None and not any_title_length
+                and len(title) > _TITLE_MAX_CHARS):
+            raise AgentError(
+                f"title is {len(title)} characters; keep it under "
+                f"{_TITLE_MAX_CHARS} and put the detail in the body")
         self_id = existing[0] if existing is not None else None
-        for other in incoming_links:
-            if other == self_id:
-                continue
-            try:
-                self._links_of(other)
-            except ValueError:
-                dropped_links.append(other)
-                continue
-            valid_links.append(other)
+        valid_links, dropped_links = self._valid_link_ids(incoming_links, self_id)
 
         if self._has_unique_dedup_index:
             mid, action = self._upsert_via_conflict(
@@ -1448,7 +1657,7 @@ class Store:
         instead of vanishing quietly."""
         candidates, dropped = [], []
         for x in crystallizes:
-            if isinstance(x, int) and not isinstance(x, bool) and x != mid:
+            if _is_id(x) and x != mid:
                 candidates.append(x)
             else:
                 dropped.append(x)
@@ -1462,6 +1671,44 @@ class Store:
         valid = [x for x in candidates if x in existing]
         dropped += [x for x in candidates if x not in existing]
         return valid, dropped
+
+    def _valid_link_ids(self, links, self_id=None) -> tuple:
+        """(valid, dropped) for a `links=` argument: `valid` are the distinct
+        ids of CURRENT memories other than `self_id`, in the order given;
+        `dropped` is everything else, reported back to the caller.
+
+        Ids are read with _as_id. Matching on `WHERE id = ?` alone
+        let SQLite's type affinity resolve '1', ' 1', 1.0 and True to memory
+        1 and store each spelling in the `links` column; it also accepted a
+        forgotten memory's id, and an unhashable item (a dict, a nested
+        list) raised from inside the write."""
+        candidates, dropped, given = [], [], {}
+        for raw in links:
+            x = _as_id(raw)
+            if x is None:
+                dropped.append(raw)
+            elif x != self_id and x not in given:
+                given[x] = raw                  # report a drop as it was sent
+                candidates.append(x)
+        current = set()
+        for k in range(0, len(candidates), 500):
+            chunk = candidates[k:k + 500]
+            ph = ",".join("?" for _ in chunk)
+            current.update(r[0] for r in self._conn.execute(
+                f"SELECT id FROM memories WHERE id IN ({ph}) "
+                "AND valid_to IS NULL", tuple(chunk)).fetchall())
+        valid = [x for x in candidates if x in current]
+        dropped += [given[x] for x in candidates if x not in current]
+        return valid, dropped
+
+    def _current_id(self, x):
+        """`x` if it is the id of a current memory; AgentError otherwise."""
+        mid = _as_id(x)
+        if mid is None or self._conn.execute(
+                "SELECT 1 FROM memories WHERE id=? AND valid_to IS NULL",
+                (mid,)).fetchone() is None:
+            raise AgentError(f"no memory with id {x!r}")
+        return mid
 
     def _memories_seq(self):
         """The last id AUTOINCREMENT handed out for `memories` (None before the
@@ -1843,9 +2090,24 @@ class Store:
         return self._hydrate(ids)
 
     @_locked
+    def stats(self) -> dict:
+        """Counts for the status resource. A locked Store method because the
+        server used to run these two queries on the connection directly,
+        outside the lock: on another thread's shared connection that both
+        failed itself and made concurrent boot-index reads come back wrong
+        ("no memories yet" for a full store)."""
+        memories = self._conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE valid_to IS NULL").fetchone()[0]
+        edges = self._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        return {"memory_count": memories, "edge_count": edges}
+
+    @_locked
     def get(self, id) -> dict:
         """One memory, whole - the fetch half of snippet-plus-fetch (#30).
         Returns None when the id doesn't exist or is no longer current."""
+        id = _as_id(id)
+        if id is None:
+            return None
         self._maybe_sync_for_read()
         hits = self._hydrate([id])
         return hits[0] if hits else None
@@ -1872,8 +2134,33 @@ class Store:
     @_locked
     def recall(self, query, type=None, limit=20, budget=None, session=None,
                tags=None, full=False) -> list:
+        if query is None:
+            query = ""
+        if not isinstance(query, str):
+            raise AgentError("query must be a string")
+        query = _scrub(query)
+        if type is not None and type not in VALID_TYPES:
+            raise AgentError(f"type must be one of {VALID_TYPES}, got {type!r}")
+        try:
+            # A negative limit is not "no limit": Python's [:-1] dropped the
+            # last hit and SQL's LIMIT -1 returned everything.
+            limit = 20 if limit is None else min(max(0, int(limit)), _LIMIT_MAX)
+            if budget is not None:
+                budget = min(max(0, int(budget)), _BUDGET_MAX)
+        except (TypeError, ValueError, OverflowError):
+            raise AgentError("limit and budget must be integers") from None
+        if isinstance(tags, (set, frozenset)):
+            tags = sorted(tags, key=str)
+        if tags is not None and not isinstance(tags, (str, list, tuple)):
+            raise AgentError("tags must be a comma-separated string or a list")
+        tag_list = list(dict.fromkeys(_parse_tags(tags)))
+        if len(tag_list) > _TAG_FILTER_MAX:
+            raise AgentError(f"at most {_TAG_FILTER_MAX} tags can be filtered on")
+        if session is not None:
+            session = _scrub(str(session))[:_SESSION_MAX_CHARS]
+        if limit == 0:
+            return []
         self._maybe_sync_for_read()      # #62: a read-only device pulls too
-        tag_list = _parse_tags(tags)
         if not query or not query.strip():
             if not tag_list:
                 return []
@@ -1984,7 +2271,7 @@ class Store:
     def _links_of(self, mid) -> list:
         row = self._conn.execute("SELECT links FROM memories WHERE id=?", (mid,)).fetchone()
         if row is None:
-            raise ValueError(f"no memory with id {mid}")
+            raise AgentError(f"no memory with id {mid}")
         return json.loads(row[0])
 
     # #38: union the new id into links inside the statement itself, rather than
@@ -2008,8 +2295,13 @@ class Store:
         # Validate ids outside the retry wrapper: a bad id raises ValueError
         # here, which must surface as-is rather than be mistaken for a replica
         # write failure and trigger a needless degrade.
-        self._links_of(id_a)
-        self._links_of(id_b)
+        # Both must be current memories: linking to a forgotten one "worked"
+        # and bumped its timestamp, and a memory linked to itself stored its
+        # own id in its own links.
+        id_a = self._current_id(id_a)
+        id_b = self._current_id(id_b)
+        if id_a == id_b:
+            raise AgentError("cannot link a memory to itself")
         return self._write_with_replica_fallback(
             lambda: self._link_impl(id_a, id_b))
 
@@ -2031,14 +2323,20 @@ class Store:
         feature does get enabled. Nothing else in tether consumes the table,
         so writing it while disabled is pure future damage."""
         if not self._crystallize:
-            raise ValueError(
+            raise AgentError(
                 "crystallization is not enabled (set TETHER_CRYSTALLIZE=1); "
                 "dismiss_cluster has nothing to dismiss")
+        id_a, id_b = _as_id(id_a), _as_id(id_b)
+        if id_a is None or id_b is None:
+            raise AgentError("dismiss_cluster takes two integer memory ids")
         self._graph.dismiss_peak(id_a, id_b)
         return {"dismissed": [id_a, id_b]}
 
     @_locked
     def forget(self, id) -> dict:
+        if _as_id(id) is None:
+            raise AgentError(f"id must be an integer memory id, got {id!r}")
+        id = _as_id(id)
         return self._write_with_replica_fallback(lambda: self._forget_impl(id))
 
     def _forget_impl(self, id) -> dict:
@@ -2069,6 +2367,9 @@ class Store:
         is that reversal, kept CLI-only for the same reason purge is: it is an
         operator action, not something an agent should reach for.
         """
+        if _as_id(id) is None:
+            raise AgentError(f"id must be an integer memory id, got {id!r}")
+        id = _as_id(id)
         return self._write_with_replica_fallback(lambda: self._restore_impl(id))
 
     def _restore_impl(self, id) -> dict:
@@ -2089,7 +2390,7 @@ class Store:
             "SELECT id FROM memories WHERE type=? AND title_norm=? "
             "AND valid_to IS NULL AND id != ?", (type_, norm, id)).fetchone()
         if clash is not None:
-            raise ValueError(
+            raise AgentError(
                 f"cannot restore #{id}: memory #{clash[0]} is already the "
                 f"current {type_!r} titled {norm!r}. forget #{clash[0]} first, "
                 f"or edit one of the titles.")
@@ -2117,6 +2418,7 @@ class Store:
         silently pointed at the wrong memory.
         """
         created = updated = skipped = 0
+        skipped_titles = []
         id_map = {}
         for rec in records:
             try:
@@ -2152,14 +2454,16 @@ class Store:
                 skipped += 1
                 continue
             try:
-                res = self.remember(type_, title, body, tags=tags)
+                res = self.remember(type_, title, body, tags=tags,
+                                    _any_title_length=True)
             except Exception:
                 # One bad record must not abort the whole import; the rollback
                 # in _write_with_replica_fallback (#104) guarantees the store
                 # is still writable for the next record in this loop.
                 skipped += 1
+                skipped_titles.append(_clean_title(title)[:80])
                 continue
-            if rec.get("id") is not None:
+            if _is_id(rec.get("id")):
                 id_map[rec["id"]] = res["id"]
             if res["action"] == "created":
                 created += 1
@@ -2169,11 +2473,16 @@ class Store:
         linked = dropped_links = 0
         seen_pairs = set()
         for rec in records:
-            src = id_map.get(rec.get("id")) if isinstance(rec, dict) else None
+            if not isinstance(rec, dict) or not _is_id(rec.get("id")):
+                continue
+            src = id_map.get(rec["id"])
             if src is None:
                 continue
-            for old_dst in (rec.get("links") or []):
-                new_dst = id_map.get(old_dst)
+            old_links = rec.get("links")
+            if not isinstance(old_links, (list, tuple)):
+                continue                    # a hand-edited file; nothing to remap
+            for old_dst in old_links:
+                new_dst = id_map.get(old_dst) if _is_id(old_dst) else None
                 if new_dst is None:
                     dropped_links += 1      # points outside the file: unresolvable
                     continue
@@ -2186,8 +2495,11 @@ class Store:
                     linked += 1
                 except Exception:
                     dropped_links += 1
-        return {"created": created, "updated": updated, "skipped": skipped,
-                "linked": linked, "dropped_links": dropped_links}
+        report = {"created": created, "updated": updated, "skipped": skipped,
+                  "linked": linked, "dropped_links": dropped_links}
+        if skipped_titles:
+            report["skipped_titles"] = skipped_titles   # which ones, not just how many
+        return report
 
     @_locked
     def purge(self, id) -> dict:
@@ -2195,6 +2507,9 @@ class Store:
         Deliberately NOT exposed as a default MCP tool argument (#49); reserved
         for an explicit admin path (the CLI) so an agent can't trigger it by
         hallucinating a flag."""
+        if _as_id(id) is None:
+            raise AgentError(f"id must be an integer memory id, got {id!r}")
+        id = _as_id(id)
         return self._write_with_replica_fallback(lambda: self._purge_impl(id))
 
     def _purge_impl(self, id) -> dict:
@@ -2272,10 +2587,10 @@ class Store:
             if shown:
                 shown_ids = {r[0] for r in shown}
                 prefix = "\n".join(
-                    [f"# This project ({self._project})",
-                     *(f"[{t}] #{i} {title}" for i, t, title, *_ in shown)])
+                    [f"# This project ({_clean_title(self._project)})",
+                     *(_index_line(i, t, title) for i, t, title, *_ in shown)])
                 cap = max(0, cap - len(shown))
-                if total == len(shown):
+                if total == len(shown) or cap == 0:
                     return prefix
                 prefix += "\n# Everything else\n"
         # The newest `cap` memories outside the project slice: everything the
@@ -2285,7 +2600,7 @@ class Store:
             "ORDER BY m.updated_at DESC, m.id DESC LIMIT ?",
             (cap + len(shown_ids),)).fetchall() if r[0] not in shown_ids][:cap]
         if total - len(shown_ids) <= cap:
-            body = "\n".join(f"[{t}] #{i} {title}" for i, t, title, *_ in rows)
+            body = "\n".join(_index_line(i, t, title) for i, t, title, *_ in rows)
             return prefix + body
         body = None
         if self._graph.enabled and cap > 0:
@@ -2301,7 +2616,7 @@ class Store:
         return prefix + body
 
     def _recency_capped_index(self, rows, cap) -> str:
-        return "\n".join(f"[{t}] #{i} {title}" for i, t, title, *_ in rows[:cap])
+        return "\n".join(_index_line(i, t, title) for i, t, title, *_ in rows[:cap])
 
     def _index_rows(self, ids) -> dict:
         """{id: (id, type, title, updated_at)} for the current memories among
@@ -2356,7 +2671,7 @@ class Store:
 
         def line(mid):
             _, t, title, _ = info[mid]
-            return f"[{t}] #{mid} {title}"
+            return _index_line(mid, t, title)
 
         if not hubs:
             return "\n".join(line(mid) for mid in recent)
