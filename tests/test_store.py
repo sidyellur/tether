@@ -2,6 +2,7 @@ import json as _json
 import sqlite3
 import threading
 import warnings
+import zlib
 
 import pytest
 
@@ -4493,20 +4494,24 @@ def test_an_update_that_leaves_the_text_alone_leaves_its_neighbours_alone():
         name, dims = "rand", 16
 
         def embed(self, text):
-            v = np.random.default_rng(abs(hash(text)) % 2 ** 32).standard_normal(16)
+            # crc32, not hash(): str hashing is randomized per process
+            v = np.random.default_rng(zlib.crc32(text.encode())).standard_normal(16)
             return [float(x) for x in v / np.linalg.norm(v)]
 
     conn = sqlite3.connect(":memory:")
     s = Store(conn, "d", lambda *a, **k: None, embedder=Rand(), assoc=True)
     s.migrate()
     ids = [s.remember("user", f"T{i}", f"body number {i}")["id"] for i in range(40)]
-    target = ids[1]
+    # the memory with the most neighbours: others chose it as theirs too, and
+    # those are the edges a careless replace would lose
+    target = max(ids, key=lambda m: len(_semantic_edges(conn, m)))
+    n = ids.index(target)
     before = _semantic_edges(conn, target)
-    assert len(before) > 8                      # others chose it as a neighbour too
-    s.remember("user", "T1", "body number 1", tags="new-tag")        # tags only
+    assert len(before) > 8
+    s.remember("user", f"T{n}", f"body number {n}", tags="new-tag")  # tags only
     assert _semantic_edges(conn, target) == before
     s._embedder = None                                               # embedder gone
-    s.remember("user", "T1", "body number 1", tags="another")
+    s.remember("user", f"T{n}", f"body number {n}", tags="another")
     assert _semantic_edges(conn, target) == before
     assert conn.execute("SELECT embedding IS NOT NULL FROM memories WHERE id=?",
                         (target,)).fetchone()[0] == 1
