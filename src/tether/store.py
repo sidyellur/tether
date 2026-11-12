@@ -235,10 +235,13 @@ def _is_id(x) -> bool:
 def _as_id(x):
     """`x` as a memory id, or None. Agents send ids as "12" or 12.0 often
     enough that refusing them would lose links that used to work; those are
-    read as the integer they plainly mean. What is NOT accepted is letting
-    SQLite decide: its affinity also matches ' 1', '1e0' and True to id 1,
-    and stored each spelling."""
-    if isinstance(x, str) and x.strip().isascii() and x.strip().isdigit():
+    read as the integer they plainly mean (surrounding spaces ignored). What
+    is NOT accepted is letting SQLite decide: its affinity also matches '1e0',
+    '1.0' and True to id 1, and stored each spelling as it came."""
+    # No 64-bit id has more than 19 digits; longer strings are not ids (and
+    # int() refuses to parse more than a few thousand digits at all).
+    if (isinstance(x, str) and 0 < len(x.strip()) <= 19
+            and x.strip().isascii() and x.strip().isdigit()):
         x = int(x.strip())
     elif isinstance(x, float) and x.is_integer():
         x = int(x)
@@ -1571,7 +1574,7 @@ class Store:
                     # don't bump PRAGMA data_version, so a pre-existing cache
                     # wouldn't otherwise notice these rows) reflects every row
                     # embedded this run, not just rows visible before we started.
-                    # Archived rows (forgotten, superseded versions) get their
+                    # Archived rows (forgotten, consolidated away) get their
                     # vector back too, but only CURRENT rows belong in the
                     # cache and the graph: putting an archived one in made it
                     # a semantic candidate and a neighbour until restart.
@@ -1612,6 +1615,7 @@ class Store:
     def remember(self, type, title, body, tags=None, links=None,
                  crystallizes=None, _any_title_length=False,
                  _exact_tags=False) -> dict:
+        raw_title = title
         # Everything about the REQUEST is checked here, before the write
         # wrapper: a bad argument is the caller's mistake and must come back
         # as a message, never be mistaken for a failed connection.
@@ -1634,10 +1638,11 @@ class Store:
         return self._write_with_replica_fallback(
             lambda: self._remember_impl(type, title, body, tags, links,
                                         crystallizes, _any_title_length,
-                                        _exact_tags))
+                                        _exact_tags, _norm(_scrub(raw_title))))
 
     def _remember_impl(self, type, title, body, tags, links, crystallizes,
-                       any_title_length=False, exact_tags=False) -> dict:
+                       any_title_length=False, exact_tags=False,
+                       legacy_norm=None) -> dict:
         now = _now()
         norm = _norm(title)
         tags_s = _tags_to_str(tags)
@@ -1664,6 +1669,23 @@ class Store:
             "SELECT id, links, title, body FROM memories "
             "WHERE type=? AND title_norm=? AND valid_to IS NULL",
             (type, norm)).fetchone()
+        if existing is None and legacy_norm not in (None, norm):
+            # A row whose title was written before titles were cleaned (and
+            # arrived after migrate()'s one-time clean-up - synced from a
+            # device on an older version, say) sits under the old key. Adopt
+            # it under the cleaned one, so this is an update, not a twin.
+            try:
+                moved = self._conn.execute(
+                    "UPDATE memories SET title=?, title_norm=? "
+                    "WHERE type=? AND title_norm=? AND valid_to IS NULL",
+                    (title, norm, type, legacy_norm)).rowcount
+            except Exception:
+                moved = 0
+            if moved:
+                existing = self._conn.execute(
+                    "SELECT id, links, title, body FROM memories "
+                    "WHERE type=? AND title_norm=? AND valid_to IS NULL",
+                    (type, norm)).fetchone()
         # Did the text the vector is computed from change? Only then are the
         # memory's semantic neighbours out of date.
         text_changed = existing is not None and (
@@ -1798,7 +1820,7 @@ class Store:
             x = _as_id(raw)
             if x is None:
                 dropped.append(raw)
-            elif x != self_id and x not in given:
+            elif x != self_id and x not in given:   # a self-link is just ignored
                 given[x] = raw                  # report a drop as it was sent
                 candidates.append(x)
         current = set()
@@ -2763,7 +2785,9 @@ class Store:
     def export_all(self) -> list:
         """Dump every CURRENT memory as a plain dict - a backup/export path
         independent of the DB file itself (#49). Excludes the embedding
-        vector: it's derived data, cheaply recomputed by backfill_embeddings."""
+        vector: it's derived data, cheaply recomputed by backfill_embeddings.
+        Earlier versions (history()) are not exported either; a copy of the
+        database file is the backup that carries them."""
         rows = self._conn.execute(
             "SELECT id, type, title, body, tags, links, created_at, updated_at, "
             "device_id, author FROM memories WHERE valid_to IS NULL ORDER BY id ASC"

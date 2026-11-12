@@ -454,7 +454,9 @@ version (the newest 10 per memory), so an update is as reversible as a
 `forget`. `revert` puts a version back on the same memory - same id, so links
 to it still hold - and keeps what it replaced as a version in turn.
 
-`purge` removes a memory's versions with it, and refuses to run without `--yes`. All commands honor the same
+`purge` removes a memory's versions with it, and refuses to run without
+`--yes`. `export` writes current memories only; versions are not in an export,
+so a copy of the database file is the backup that carries them. All commands honor the same
 `TETHER_DB`/`TETHER_SYNC_*` env vars as the server.
 
 ## Safety limits and privacy
@@ -468,8 +470,8 @@ and what it is asked, as untrusted:
   title could forge further entries or section headers there. The index also
   shows at most 200 characters of any title.
 - **Links take the ids of current memories only.** Anything else (a word, a
-  forgotten memory, the memory itself) is dropped and reported in
-  `dropped_links`.
+  forgotten memory) is dropped and reported in `dropped_links`; a link from a
+  memory to itself is ignored.
 - **Requests are bounded:** `limit`, `budget`, the number of tag filters and
   the number of distinct query words all have ceilings well above real use.
 - **Errors meant for the agent are plain messages;** anything internal is
