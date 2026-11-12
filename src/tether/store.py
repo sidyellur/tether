@@ -1262,6 +1262,11 @@ class Store:
             # its own links argument. Filtering against the id set here, once,
             # keeps every future migrate() from re-minting the same dangling
             # `explicit` edges forever.
+            # Clear the marker BEFORE reading what to replay, not after: the
+            # delete takes the write lock, so a graph-less process linking at
+            # the same time either commits first (and is read below) or
+            # commits after us and finds the marker gone, and sets it again.
+            self._conn.execute("DELETE FROM meta WHERE key=?", (_UNWIRED_LINKS,))
             valid_ids = {r[0] for r in
                          self._conn.execute("SELECT id FROM memories").fetchall()}
             pairs = []
@@ -1274,7 +1279,6 @@ class Store:
                         pairs.append((rid, other))
             self._graph.backfill_explicit(pairs)
             self._meta_set("explicit_links_backfilled", "1")
-            self._conn.execute("DELETE FROM meta WHERE key=?", (_UNWIRED_LINKS,))
         self._prune_legacy_session_meta()
         self._commit()
 
@@ -1583,18 +1587,21 @@ class Store:
                 # embedded while the graph was disabled (_note_unwired) and
                 # it is enabled now. Both mean every current memory needs
                 # (re-)wiring; anything cached may be stale.
-                self._invalidate_embedding_cache()
-                self._graph.backfill_semantic(matrix=self._embedding_matrix())
-                if catch_up:
+                if catch_up:        # before the scan, as in migrate()
                     self._conn.execute(
                         "DELETE FROM meta WHERE key=?", (_UNWIRED_SEMANTIC,))
+                self._invalidate_embedding_cache()
+                self._graph.backfill_semantic(matrix=self._embedding_matrix())
             elif done > 0:
                 # Only the rows embedded this run are new; the incremental
                 # cache (_cache_put, above) already reflects them, so
                 # _embedding_matrix() here is a cache hit, not a rescan.
                 shared = self._embedding_matrix()
                 for mid, blob in embedded:
-                    self._graph.on_remember(mid, blob, matrix=shared)
+                    # A row with no vector until now is either new or was
+                    # rewritten while no embedder was available; in the
+                    # second case its old neighbours are stale, so replace.
+                    self._graph.on_remember(mid, blob, matrix=shared, replace=True)
             # else: wiped is False and done == 0 - nothing changed, nothing to wire.
             self._commit()
             return done
@@ -1603,7 +1610,8 @@ class Store:
 
     @_locked
     def remember(self, type, title, body, tags=None, links=None,
-                 crystallizes=None, _any_title_length=False) -> dict:
+                 crystallizes=None, _any_title_length=False,
+                 _exact_tags=False) -> dict:
         # Everything about the REQUEST is checked here, before the write
         # wrapper: a bad argument is the caller's mistake and must come back
         # as a message, never be mistaken for a failed connection.
@@ -1625,17 +1633,18 @@ class Store:
             raise AgentError("crystallizes must be a list of memory ids")
         return self._write_with_replica_fallback(
             lambda: self._remember_impl(type, title, body, tags, links,
-                                        crystallizes, _any_title_length))
+                                        crystallizes, _any_title_length,
+                                        _exact_tags))
 
     def _remember_impl(self, type, title, body, tags, links, crystallizes,
-                       any_title_length=False) -> dict:
+                       any_title_length=False, exact_tags=False) -> dict:
         now = _now()
         norm = _norm(title)
         tags_s = _tags_to_str(tags)
         # #92: stamp the current project on work-related memories unless the
         # caller already said which project (any proj: tag is respected).
         if (self._project and type in _PROJECT_TAGGED_TYPES
-                and not _has_project_tag(tags_s)):
+                and not exact_tags and not _has_project_tag(tags_s)):
             tags_s = _tags_to_str([*_parse_tags(tags_s), _project_tag(self._project)])
         incoming_links = links or []
         emb = self._embed_or_none(title, body)
@@ -1867,8 +1876,8 @@ class Store:
     def _stored_embedding(self, mid, emb):
         """The vector the row holds after an upsert: `emb` if this write had
         one, otherwise whatever _KEEP_EMBEDDING_SQL left in place."""
-        if emb is not None:
-            return emb
+        if emb is not None or self._emb_cache is None:
+            return emb                  # nothing to look up, or no cache to feed
         row = self._conn.execute(
             "SELECT embedding FROM memories WHERE id=?", (mid,)).fetchone()
         return row[0] if row else None
@@ -2272,20 +2281,28 @@ class Store:
         It is an ordinary update of the same memory - same id, so links,
         edges and citations still point at it - and what it replaces is kept
         as a version in turn, so a revert can itself be undone."""
-        id, version = _as_id(id), _as_id(version)
-        row = None if id is None else self._conn.execute(
-            "SELECT type FROM memories WHERE id=? AND valid_to IS NULL",
-            (id,)).fetchone()
+        mid, vid = _as_id(id), _as_id(version)
+        row = None if mid is None else self._conn.execute(
+            "SELECT type, title_norm FROM memories WHERE id=? AND valid_to IS NULL",
+            (mid,)).fetchone()
         if row is None:
             raise AgentError(f"no current memory with id {id!r}")
-        old = None if version is None else self._conn.execute(
+        old = None if vid is None else self._conn.execute(
             "SELECT title, body, tags FROM memory_versions "
-            "WHERE id=? AND memory_id=?", (version, id)).fetchone()
+            "WHERE id=? AND memory_id=?", (vid, mid)).fetchone()
         if old is None:
-            raise AgentError(f"memory #{id} has no version {version!r}")
-        result = self.remember(row[0], old[0], old[1], tags=old[2],
-                               _any_title_length=True)
-        return {"reverted": result["id"], "version": version}
+            raise AgentError(f"memory #{mid} has no version {version!r}")
+        # The write goes through remember(), which finds its row by title:
+        # make sure that is THIS row before anything is written. (A version
+        # only ever differs from its memory in case and spacing, so this
+        # holds unless the table was edited by hand.)
+        if _norm(_clean_title(old[0])) != row[1]:
+            raise AgentError(
+                f"version {vid} of memory #{mid} has a different title; "
+                "it cannot be put back on this memory")
+        self.remember(row[0], old[0], old[1], tags=old[2],
+                      _any_title_length=True, _exact_tags=True)
+        return {"reverted": mid, "version": vid}
 
     @_locked
     def stats(self) -> dict:

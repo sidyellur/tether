@@ -230,31 +230,61 @@ class Graph:
             neighbours = [(mid, ids[i], "semantic", float(sims[i]))
                           for i in order[:KNN_K] if float(sims[i]) > 0]
             if replace:
-                # `mid` was rewritten: its semantic edges were weighted for
-                # text that is gone. Upserting on top kept every old edge at
-                # full weight forever, so a memory rewritten from cars to
-                # pizza still surfaced for "automobile". Start its edges
-                # over - but an edge is shared with the memory at the other
-                # end, which may have chosen `mid` as ITS neighbour, so a
-                # former neighbour is kept, at its new similarity, when it is
-                # still at least as close as the weakest of the new top-k.
-                former = {r[0] for r in self._conn.execute(
-                    "SELECT CASE WHEN src=? THEN dst ELSE src END FROM edges "
-                    "WHERE kind='semantic' AND (src=? OR dst=?)",
-                    (mid, mid, mid)).fetchall()}
-                chosen = {n[1] for n in neighbours}
-                floor = min((n[3] for n in neighbours), default=0.0)
-                index = {ids[i]: i for i in range(len(ids))} if former - chosen else {}
-                for other in sorted(former - chosen):
-                    i = index.get(other)
-                    if i is not None and float(sims[i]) > 0 and float(sims[i]) >= floor:
-                        neighbours.append((mid, other, "semantic", float(sims[i])))
-                self._conn.execute(
-                    "DELETE FROM edges WHERE kind='semantic' AND (src=? OR dst=?)",
-                    (mid, mid))
+                self._replace_semantic_edges(mid, neighbours, ids, mat, sims, np)
+                return
             self._upsert_edges(neighbours, _now(), mode="max")
         except Exception:
             return
+
+    # How many former neighbours a rewrite re-checks (the closest first).
+    _REWIRE_CHECK_MAX = 64
+
+    def _replace_semantic_edges(self, mid, neighbours, ids, mat, sims, np) -> None:
+        """Start `mid`'s semantic edges over after its text was rewritten.
+
+        Its old edges were weighted for text that is gone; upserting on top
+        kept every one at full weight forever, so a memory rewritten from
+        cars to pizza still surfaced for "automobile". But an edge is shared
+        with the memory at the other end, and many exist because THAT memory
+        chose `mid` as one of its nearest. So besides `mid`'s own new top-k
+        (`neighbours`), a former neighbour keeps its edge, at the new
+        similarity, exactly when `mid` is still among its own nearest k -
+        which is what a clean re-wire of the whole store would produce.
+        (Comparing against the weakest of `mid`'s new top-k instead kept
+        nothing: everything outside the top-k is below it by definition, so
+        one typo fix stripped a hub of every edge others had to it.)
+
+        The delete and the re-insert happen together or not at all.
+        """
+        former = [r[0] for r in self._conn.execute(
+            "SELECT CASE WHEN src=? THEN dst ELSE src END FROM edges "
+            "WHERE kind='semantic' AND (src=? OR dst=?)", (mid, mid, mid)).fetchall()]
+        chosen = {n[1] for n in neighbours}
+        index = {m: i for i, m in enumerate(ids)}
+        candidates = sorted(
+            ((float(sims[index[o]]), o) for o in set(former) - chosen
+             if o in index and float(sims[index[o]]) > 0), reverse=True)
+        keep = list(neighbours)
+        for sim, other in candidates[:self._REWIRE_CHECK_MAX]:
+            theirs = mat @ mat[index[other]]
+            theirs[index[other]] = -np.inf               # not its own neighbour
+            if len(theirs) > KNN_K:
+                kth = float(np.partition(theirs, -KNN_K)[-KNN_K])
+            else:
+                kth = -np.inf
+            if sim >= kth:
+                keep.append((mid, other, "semantic", sim))
+        self._conn.execute("SAVEPOINT tether_rewire")
+        try:
+            self._conn.execute(
+                "DELETE FROM edges WHERE kind='semantic' AND (src=? OR dst=?)",
+                (mid, mid))
+            self._upsert_edges(keep, _now(), mode="max")
+        except Exception:
+            self._conn.execute("ROLLBACK TO tether_rewire")
+            self._conn.execute("RELEASE tether_rewire")
+            raise
+        self._conn.execute("RELEASE tether_rewire")
 
     def on_link(self, id_a, id_b) -> None:
         if not self.enabled:
