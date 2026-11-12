@@ -258,3 +258,17 @@ def test_posix_default_is_unchanged(monkeypatch):
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setattr(config, "_is_windows", lambda: False)
     assert config.db_path() == Path.home() / ".local" / "share" / "tether" / "memory.db"
+
+
+def test_dedup_threshold_must_be_a_cosine_in_range(monkeypatch):
+    for bad in ("0", "-0.2", "1.5", "nan", "inf", "junk"):
+        monkeypatch.setenv("TETHER_DEDUP_THRESHOLD", bad)
+        assert config.dedup_threshold() == 0.92
+    monkeypatch.setenv("TETHER_DEDUP_THRESHOLD", "0.8")
+    assert config.dedup_threshold() == 0.8
+
+
+def test_project_name_drops_characters_tags_cannot_hold(monkeypatch):
+    monkeypatch.delenv("TETHER_PROJECT", raising=False)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", '/home/u/my"app\\ two,three')
+    assert config.project() == "myapp two-three"
