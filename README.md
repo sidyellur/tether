@@ -177,9 +177,18 @@ matches `test` and `deciding` matches `decided`. Stemming is English-only;
 turn it off for a store in another language and tether rebuilds the index
 on the next start.
 
+Matching on *some* of the words means a memory that shares one common word
+with the query is technically a hit. Ranking puts it last, but it would still
+fill the result, so recall applies a **relevance floor**: a direct hit is kept
+only if its bm25 score is at least 40% of the best hit's (or the semantic arm
+found it at cosine ≥ 0.5). The floor is relative to the best hit, which always
+passes, so it never empties a result; it means `recall` can return fewer than
+`limit` memories when the rest are weak.
+
 | Var | Default | Effect |
 |---|---|---|
 | `TETHER_FTS_STEMMING` | on | set `0`/`false`/`off` to index words exactly as written |
+| `TETHER_RELEVANCE_FLOOR` | `0.4` | fraction of the best hit's bm25 score a direct hit needs to be returned; `0` returns every match up to `limit` |
 
 Measured on the LoCoMo long-conversation benchmark (one memory per dialogue
 turn, 1,536 questions, "did recall return the turns that answer it" in the
@@ -250,10 +259,17 @@ edge it came through), and two optional `recall` args tune it:
 | `TETHER_RECALL_BUDGET` | `8` | default association breadth |
 | `TETHER_PROTECT_HEAD` | `8` | how many top direct hits are locked above associations |
 | `TETHER_SEED_FLOOR` | `0.35` | minimum cosine similarity a semantic hit needs to seed an associative walk; below it a memory is only reachable through an edge. `0` disables the floor |
+| `TETHER_ASSOC_MAX` | `3` | how many graph-reached memories a recall may add after its direct matches; `0` = direct matches only; `off` = no cap (direct and graph-reached memories below the protected head are ranked together on activation) |
 
-Associative recall is **seed-dominant**: the top direct matches are locked in
-place, and associations only fill the slots below them — so turning association
-on never demotes a hit that keyword/semantic search already ranked highly.
+Associative recall is **seed-dominant**: every direct match comes first, in
+the order keyword/semantic search ranked it, and at most `TETHER_ASSOC_MAX`
+graph-reached memories follow — so turning association on never demotes or
+displaces a direct hit. The cap exists because a memory reached through an
+edge is right far less often than one that matched the query: on 68 real
+queries against a 318-memory store, graph-reached memories were relevant 21%
+of the time against 72% for direct matches. (`TETHER_PROTECT_HEAD` only
+matters with `TETHER_ASSOC_MAX=off`, where everything below the protected
+head is ranked on activation.)
 
 With `TETHER_ASSOC=0` (or `budget=0`, or an empty graph), `recall` behaves exactly
 as before — associative recall is purely additive and never breaks a lookup.

@@ -144,6 +144,9 @@ _ASSOC_OFF = {"0", "false", "no", "off"}
 _DEFAULT_RECALL_BUDGET = 8
 _DEFAULT_PROTECT_HEAD = 8
 _DEFAULT_SEED_FLOOR = 0.35
+_DEFAULT_RELEVANCE_FLOOR = 0.4
+_DEFAULT_ASSOC_MAX = 3
+_UNLIMITED = {"off", "none", "unlimited"}
 
 
 def assoc_enabled() -> bool:
@@ -192,6 +195,38 @@ def seed_floor() -> float:
     except ValueError:
         return _DEFAULT_SEED_FLOOR
     return val if 0.0 <= val <= 1.0 else _DEFAULT_SEED_FLOOR
+
+
+def relevance_floor() -> float:
+    """Fraction of the best hit's bm25 score a direct hit needs to stay in a
+    recall result; weaker matches are dropped instead of filling `limit`.
+    Out-of-range or unparseable values fall back to the default; 0 disables."""
+    raw = os.environ.get("TETHER_RELEVANCE_FLOOR")
+    if not raw:
+        return _DEFAULT_RELEVANCE_FLOOR
+    try:
+        val = float(raw)
+    except ValueError:
+        return _DEFAULT_RELEVANCE_FLOOR
+    return val if 0.0 <= val <= 1.0 else _DEFAULT_RELEVANCE_FLOOR
+
+
+def assoc_max():
+    """How many graph-reached memories a recall may add after its direct
+    matches. 0 = direct matches only. `off`/`none`/`unlimited` returns None:
+    no cap, and below the protected head direct and graph-reached memories
+    are ranked together on activation, as before the cap existed. Negative
+    or unparseable values fall back to the default."""
+    raw = (os.environ.get("TETHER_ASSOC_MAX") or "").strip().lower()
+    if not raw:
+        return _DEFAULT_ASSOC_MAX
+    if raw in _UNLIMITED:
+        return None
+    try:
+        val = int(raw)
+    except ValueError:
+        return _DEFAULT_ASSOC_MAX
+    return val if val >= 0 else _DEFAULT_ASSOC_MAX
 
 
 _CRYSTALLIZE_ON = {"1", "true", "yes", "on"}
