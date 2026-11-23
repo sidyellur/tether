@@ -277,3 +277,33 @@ def test_project_name_drops_characters_tags_cannot_hold(monkeypatch):
     monkeypatch.delenv("TETHER_PROJECT")
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", '/home/u/my"app')
     assert config.project() == "myapp"
+
+
+def test_relevance_floor_default_and_parsing(monkeypatch):
+    monkeypatch.delenv("TETHER_RELEVANCE_FLOOR", raising=False)
+    assert config.relevance_floor() == 0.4
+    monkeypatch.setenv("TETHER_RELEVANCE_FLOOR", "0.6")
+    assert config.relevance_floor() == 0.6
+    monkeypatch.setenv("TETHER_RELEVANCE_FLOOR", "0")
+    assert config.relevance_floor() == 0.0       # 0 disables the floor
+    monkeypatch.setenv("TETHER_RELEVANCE_FLOOR", "1.5")
+    assert config.relevance_floor() == 0.4       # out of [0,1] -> default
+    monkeypatch.setenv("TETHER_RELEVANCE_FLOOR", "abc")
+    assert config.relevance_floor() == 0.4
+    monkeypatch.setenv("TETHER_RELEVANCE_FLOOR", "")
+    assert config.relevance_floor() == 0.4
+
+
+def test_assoc_max_default_and_parsing(monkeypatch):
+    monkeypatch.delenv("TETHER_ASSOC_MAX", raising=False)
+    assert config.assoc_max() == 3
+    monkeypatch.setenv("TETHER_ASSOC_MAX", "5")
+    assert config.assoc_max() == 5
+    monkeypatch.setenv("TETHER_ASSOC_MAX", "0")
+    assert config.assoc_max() == 0               # direct matches only
+    for unlimited in ("off", "none", "unlimited", "OFF"):
+        monkeypatch.setenv("TETHER_ASSOC_MAX", unlimited)
+        assert config.assoc_max() is None        # the uncapped ranking
+    for bad in ("-2", "abc", ""):
+        monkeypatch.setenv("TETHER_ASSOC_MAX", bad)
+        assert config.assoc_max() == 3

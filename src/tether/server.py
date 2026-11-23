@@ -94,6 +94,8 @@ def _get_store() -> Store:
                       recall_budget=config.recall_budget(),
                       protect_head=config.protect_head(),
                       seed_floor=config.seed_floor(),
+                      relevance_floor=config.relevance_floor(),
+                      assoc_max=config.assoc_max(),
                       crystallize=config.crystallize_enabled(),
                       boot_index_cap=config.boot_index_cap(),
                       forget=config.forget_enabled(),
@@ -192,7 +194,9 @@ def recall(query: str = "", type: str | None = None, limit: int = 20,
     Args:
         query: free text; punctuation is safe. May be omitted if `tags` is given.
         type: optional filter ("user"/"feedback"/"project"/"reference").
-        limit: max results (default 20).
+        limit: max results (default 20). Matches far weaker than the best
+            one are dropped rather than used to fill this, so fewer may come
+            back.
         budget: how far to follow associations (0 = direct matches only).
         session: optional id grouping related recalls so they prime each other.
         tags: optional comma-separated tags; exact-match filter (a memory must

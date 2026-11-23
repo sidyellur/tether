@@ -332,6 +332,38 @@ def test_server_wires_forget_config(monkeypatch, tmp_path):
         server._store = None
 
 
+def test_server_wires_relevance_floor(monkeypatch, tmp_path):
+    from tether import server
+    monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")
+    for value, expected in ((None, 0.4), ("0", 0.0), ("0.6", 0.6)):
+        if value is None:
+            monkeypatch.delenv("TETHER_RELEVANCE_FLOOR", raising=False)
+        else:
+            monkeypatch.setenv("TETHER_RELEVANCE_FLOOR", value)
+        server._store = None
+        try:
+            assert server._get_store()._relevance_floor == expected
+        finally:
+            server._store = None
+
+
+def test_server_wires_assoc_max(monkeypatch, tmp_path):
+    from tether import server
+    monkeypatch.setenv("TETHER_DB", str(tmp_path / "m.db"))
+    monkeypatch.setenv("TETHER_SEMANTIC", "0")
+    for value, expected in ((None, 3), ("0", 0), ("off", None)):
+        if value is None:
+            monkeypatch.delenv("TETHER_ASSOC_MAX", raising=False)
+        else:
+            monkeypatch.setenv("TETHER_ASSOC_MAX", value)
+        server._store = None
+        try:
+            assert server._get_store()._assoc_max == expected
+        finally:
+            server._store = None
+
+
 def test_mcp_status_resource(tmp_path):
     env = dict(os.environ, TETHER_DB=str(tmp_path / "mem.db"),
                TETHER_DEVICE_ID="ci")

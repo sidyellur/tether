@@ -4712,3 +4712,207 @@ def test_a_legacy_title_arriving_after_the_cleanup_is_adopted_not_duplicated():
     assert s._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
     assert s.get(mid)["title"] == "Build [1m notes"
     assert [v["body"] for v in s.history(mid)] == ["old"]
+
+
+# --- relevance floor: recall drops matches far weaker than its best ----------
+#
+# Keyword recall OR-joins the query's words (#89), so a memory sharing one
+# generic word with the query is a hit. Ranking puts it last, but recall used
+# to fill `limit` with such hits regardless: on a real 318-memory store, half
+# of a default 20-hit result was irrelevant. The floor keeps a hit only when
+# its bm25 score is at least `relevance_floor` x the best hit's.
+
+_FLOOR_FILLER = ["gardening tulips", "sailing knots", "chess openings",
+                 "bread sourdough", "astronomy nebula", "knitting wool",
+                 "cycling gears", "pottery glaze", "birdwatching finch",
+                 "origami crane", "woodwork chisel", "hiking trail"]
+
+
+def _floor_store(floor, embedder=None, assoc=False):
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, embedder=embedder, assoc=assoc,
+              relevance_floor=floor)
+    s.migrate()
+    # enough unrelated rows that bm25's idf behaves as it does in a real store
+    for topic in _FLOOR_FILLER:
+        s.remember("reference", f"note {topic}", f"{topic} notes and details")
+    return s
+
+
+def _strong_and_weak(s):
+    strong = s.remember(
+        "project", "DoorDash onsite schedule",
+        "DoorDash onsite schedule: two days, four rounds")["id"]
+    weak = s.remember(
+        "project", "Reading list",
+        "Books to get through this winter, in no particular order, with a "
+        "loose schedule for the long ones and nothing else of note")["id"]
+    return strong, weak
+
+
+def test_relevance_floor_is_off_unless_asked_for():
+    s = make_store()
+    assert s._relevance_floor == 0.0
+    s = _floor_store(0.0)
+    strong, weak = _strong_and_weak(s)
+    ids = [h["id"] for h in s.recall("DoorDash onsite schedule")]
+    assert ids[0] == strong and weak in ids       # ranked last, still returned
+
+
+def test_relevance_floor_drops_a_match_far_weaker_than_the_best():
+    s = _floor_store(0.4)
+    strong, weak = _strong_and_weak(s)
+    assert [h["id"] for h in s.recall("DoorDash onsite schedule")] == [strong]
+
+
+def test_relevance_floor_always_keeps_the_best_hit():
+    # The floor is relative: however poor the best match is, it is the best
+    # there is, so a query never comes back empty because of the floor.
+    s = _floor_store(1.0)
+    strong, weak = _strong_and_weak(s)
+    assert [h["id"] for h in s.recall("schedule nothing")] != []
+    assert [h["id"] for h in s.recall("DoorDash onsite schedule")] == [strong]
+
+
+def test_relevance_floor_keeps_comparably_strong_hits():
+    s = _floor_store(0.4)
+    a = s.remember("project", "DoorDash onsite schedule",
+                   "DoorDash onsite schedule: two days")["id"]
+    b = s.remember("project", "DoorDash onsite prep",
+                   "DoorDash onsite prep plan and schedule")["id"]
+    assert {h["id"] for h in s.recall("DoorDash onsite schedule")} == {a, b}
+
+
+def test_relevance_floor_applies_with_the_graph_on():
+    s = _floor_store(0.4, assoc=True)
+    strong, weak = _strong_and_weak(s)
+    hits = s.recall("DoorDash onsite schedule")
+    assert [h["id"] for h in hits] == [strong]
+    assert hits[0]["via"] == {"seed": True}
+
+
+def test_relevance_floor_is_relative_to_the_best_hit_the_tag_filter_allows():
+    # A tag filter narrows what is being searched. The one tagged memory is
+    # the best match in that set and must not be dropped for being weaker
+    # than an untagged memory the filter excludes anyway.
+    s = _floor_store(0.4)
+    strong, _ = _strong_and_weak(s)
+    tagged = s.remember(
+        "project", "Winter plans",
+        "A loose schedule for the long weekends and nothing else of note, "
+        "to be filled in once the dates are known for certain",
+        tags="personal")["id"]
+    assert [h["id"] for h in s.recall("DoorDash onsite schedule")] == [strong]
+    assert [h["id"] for h in s.recall(
+        "DoorDash onsite schedule", tags="personal")] == [tagged]
+
+
+def test_relevance_floor_leaves_a_purely_semantic_result_alone():
+    # No memory contains the query's words, so there is no keyword score to
+    # be relative to: the vector hits are the result, as before.
+    pytest.importorskip("numpy")
+    s = _floor_store(0.4, embedder=FakeEmbedder())
+    car = s.remember("user", "Commute", "car")["id"]
+    assert [h["id"] for h in s.recall("automobile")] == [car]
+
+
+def test_relevance_floor_keeps_a_strong_semantic_hit_beside_keyword_hits():
+    # "automobile" matches the car note by meaning only. Keyword hits exist
+    # for the rest of the query, but a close semantic match is kept on its
+    # own strength; a loose one (cosine 0.45) with no keyword match is not.
+    pytest.importorskip("numpy")
+    s = _floor_store(0.4, embedder=FakeEmbedder())
+    paperwork = s.remember("user", "Renewal paperwork",
+                           "insurance renewal paperwork is due in March")["id"]
+    close = s.remember("user", "Commute", "car")["id"]
+    loose = s.remember("user", "Saturday", "car pizza food")["id"]
+    ids = [h["id"] for h in s.recall("automobile insurance renewal")]
+    assert paperwork in ids and close in ids
+    assert loose not in ids
+
+
+# --- assoc_max: direct matches first, then a bounded number of associations --
+#
+# Spread activation is not on the same scale as a seed's score (an edge of
+# weight > 1 amplifies), so below the protected head a graph-reached memory
+# used to outrank direct matches and fill whatever room `limit` left. On the
+# real-store eval those additions were relevant 21% of the time, against 72%
+# for direct matches. With assoc_max set, every direct match comes first, in
+# its own order, and at most that many graph-reached memories follow.
+
+def _assoc_store(assoc_max, protect_head=8):
+    conn = sqlite3.connect(":memory:")
+    s = Store(conn, "d", lambda *a, **k: None, assoc=True,
+              protect_head=protect_head, assoc_max=assoc_max)
+    s.migrate()
+    return s
+
+
+def _hub_with_neighbours(s, n=5, tags=None):
+    hub = s.remember("project", "DoorDash onsite schedule",
+                     "DoorDash onsite schedule: two days")["id"]
+    nbrs = []
+    for i, topic in enumerate(_FLOOR_FILLER[:n]):
+        nid = s.remember("reference", f"note {topic}", f"{topic} details",
+                         tags=(tags[i] if tags else ""))["id"]
+        s.link(hub, nid)
+        nbrs.append(nid)
+    return hub, nbrs
+
+
+def test_assoc_max_is_unset_unless_asked_for():
+    assert make_store()._assoc_max is None
+    s = _assoc_store(None)
+    hub, nbrs = _hub_with_neighbours(s)
+    assert len(s.recall("DoorDash onsite schedule")) == 1 + len(nbrs)
+
+
+def test_assoc_max_caps_graph_reached_memories():
+    s = _assoc_store(3)
+    hub, nbrs = _hub_with_neighbours(s)
+    hits = s.recall("DoorDash onsite schedule")
+    assert hits[0]["id"] == hub and hits[0]["via"] == {"seed": True}
+    reached = hits[1:]
+    assert len(reached) == 3
+    assert all(h["id"] in nbrs and "path" in h["via"] for h in reached)
+
+
+def test_assoc_max_zero_returns_direct_matches_only():
+    s = _assoc_store(0)
+    hub, _ = _hub_with_neighbours(s)
+    assert [h["id"] for h in s.recall("DoorDash onsite schedule")] == [hub]
+
+
+def test_assoc_max_puts_every_direct_match_ahead_of_a_graph_reached_one():
+    # protect_head=1, so only the first direct match is in the protected
+    # head. The neighbour matches nothing in the query but is linked to all
+    # six direct matches, so it collects activation from each: uncapped it
+    # outranks a direct match; capped, it follows all of them.
+    def build(assoc_max):
+        s = _assoc_store(assoc_max, protect_head=1)
+        direct = [s.remember("project", f"DoorDash onsite {word}",
+                             f"DoorDash onsite {word} notes")["id"]
+                  for word in ("schedule", "prep", "rounds", "travel",
+                               "hotel", "debrief")]
+        nbr = s.remember("reference", "note sailing knots", "sailing details")["id"]
+        for d in direct:
+            s.link(d, nbr)
+        return s, direct, nbr
+
+    s, direct, nbr = build(None)
+    ids = [h["id"] for h in s.recall("DoorDash onsite")]
+    assert set(ids) == {*direct, nbr} and ids[-1] != nbr
+    s, direct, nbr = build(3)
+    ids = [h["id"] for h in s.recall("DoorDash onsite")]
+    assert set(ids[:6]) == set(direct) and ids[6] == nbr
+
+
+def test_assoc_max_counts_only_memories_the_tag_filter_allows():
+    s = _assoc_store(2)
+    hub, nbrs = _hub_with_neighbours(
+        s, n=5, tags=["", "", "keep", "keep", "keep"])
+    s.remember("project", "DoorDash onsite schedule",
+               "DoorDash onsite schedule: two days", tags="keep")
+    hits = s.recall("DoorDash onsite schedule", tags="keep")
+    reached = [h["id"] for h in hits if "path" in h["via"]]
+    assert len(reached) == 2 and set(reached) <= set(nbrs[2:])

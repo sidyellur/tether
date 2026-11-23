@@ -442,6 +442,13 @@ _PROTECT_HEAD = 8
 # corpus shows between entry targets (>=0.49) and distant golds (<=0.29 -- these
 # should be reached by edges, not seeded); it leaves margin for real paraphrases.
 _SEED_FLOOR = 0.35
+# The relevance floor (Store(relevance_floor=...)) drops a direct hit whose
+# bm25 score is under that fraction of the best hit's. A hit the vector arm
+# found is exempt when its cosine reaches this: it matched by meaning, which
+# a keyword score says nothing about. 0.5 is deliberately above _SEED_FLOOR -
+# a hit can be similar enough to seed a walk without being similar enough to
+# stand in a result on similarity alone.
+_SEMANTIC_KEEP = 0.5
 
 
 def _locked(method):
@@ -732,7 +739,7 @@ class Store:
                  author="", consolidate=False, dedup_threshold=0.92,
                  decay_half_life_days=None, assoc=False, recall_budget=8,
                  protect_head=_PROTECT_HEAD, seed_floor=_SEED_FLOOR,
-                 crystallize=False,
+                 relevance_floor=0.0, assoc_max=None, crystallize=False,
                  boot_index_cap=50, forget=False, forget_age_days=90,
                  forget_interval=20, forget_max_per_sweep=10,
                  session_sweep_interval=50, sync_read_interval=30,
@@ -793,6 +800,14 @@ class Store:
         self._recall_budget = recall_budget
         self._protect_head = protect_head
         self._seed_floor = seed_floor
+        # 0 = recall fills `limit` with every match, however weak (the
+        # behavior before the floor existed). See _above_relevance_floor.
+        self._relevance_floor = relevance_floor
+        # None = below the protected head, direct matches and graph-reached
+        # memories compete on spread activation (the ranking before the cap
+        # existed). An int = every direct match first, then at most that
+        # many graph-reached memories. See recall().
+        self._assoc_max = assoc_max
         self._crystallize = crystallize
         self._cryst_sig = None
         self._cryst_cache = []
@@ -2132,11 +2147,13 @@ class Store:
         except Exception:
             return None
 
-    def _fts_ids(self, query, type=None, limit=200):
+    def _fts_ids(self, query, type=None, limit=200, bm=None):
+        """Ids matching the query, best bm25 first. When `bm` is a dict it is
+        filled with {id: bm25 score}, larger = better (FTS5's `rank` negated)."""
         match = _fts_query(query)
         if match is None:
             return []
-        sql = ("SELECT m.id FROM memories_fts f JOIN memories m ON m.id = f.rowid "
+        sql = ("SELECT m.id, rank FROM memories_fts f JOIN memories m ON m.id = f.rowid "
                "WHERE memories_fts MATCH ? AND m.valid_to IS NULL")
         params = [match]
         if type is not None:
@@ -2147,12 +2164,16 @@ class Store:
         # rank apart, which swamps the gentle recency weight applied later)
         sql += " ORDER BY rank, m.updated_at DESC LIMIT ?"
         params.append(limit)
-        return [r[0] for r in self._conn.execute(sql, tuple(params)).fetchall()]
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        if bm is not None:
+            bm.update((r[0], -r[1]) for r in rows)
+        return [r[0] for r in rows]
 
-    def _vector_ids(self, query, type=None, limit=200):
+    def _vector_ids(self, query, type=None, limit=200, cos=None):
         """Ids ranked by cosine similarity to the query, or [] when semantic
         recall is unavailable (no embedder / no numpy / no stored vectors).
-        Never raises - any failure degrades to keyword-only recall."""
+        Never raises - any failure degrades to keyword-only recall. When `cos`
+        is a dict it is filled with {id: cosine} for the ids returned."""
         if self._embedder is None or not query.strip():
             return []
         try:
@@ -2182,6 +2203,8 @@ class Store:
             # near-tied noise. (floor 0 -> pre-#15 behavior: keep the whole store.)
             order = [i for i in np.argsort(-sims)[:limit]
                      if sims[i] >= self._seed_floor]
+            if cos is not None:
+                cos.update((ids[i], float(sims[i])) for i in order)
             return [ids[i] for i in order]
         except Exception:
             return []
@@ -2198,13 +2221,15 @@ class Store:
                  for r in rows}
         return [by_id[i] for i in ids if i in by_id]
 
-    def _seed_scores(self, query, type) -> dict:
+    def _seed_scores(self, query, type, bm=None, cos=None) -> dict:
         """The v0.2 hybrid recall scoring (FTS5 + semantic RRF, gentle recency,
         optional decay) as a {id: score} map - the seeds an associative walk
-        starts from.
+        starts from. `bm` and `cos`, when dicts, receive each arm's raw
+        strength per id: the fused score is rank-based, so it cannot say how
+        good a match is, only where it placed.
         """
-        fts_ids = self._fts_ids(query, type)
-        vec_ids = self._vector_ids(query, type)
+        fts_ids = self._fts_ids(query, type, bm=bm)
+        vec_ids = self._vector_ids(query, type, cos=cos)
         lists = [fts_ids] + ([vec_ids] if vec_ids else [])
         scores = _rrf_scores(lists)
         if not scores:
@@ -2229,6 +2254,32 @@ class Store:
                 scores[mid] *= _decay_factor(
                     _age_days(updated[mid], now), self._decay_half_life_days)
         return scores
+
+    def _above_relevance_floor(self, seeds, bm, cos) -> dict:
+        """Drop the direct hits that are far weaker than the best one.
+
+        Keyword recall OR-joins the query's words, so a memory sharing one
+        common word with the query is a hit; ranking puts it last, but
+        nothing used to stop it filling the result. A hit is kept when its
+        bm25 score is at least `relevance_floor` x the best hit's, or when
+        the vector arm found it at cosine >= _SEMANTIC_KEEP.
+
+        Relative, not absolute: bm25 scores are only comparable within one
+        query, and the best hit always passes, so the floor never empties a
+        result. When nothing matched by keyword there is no score to be
+        relative to and the vector hits stand as they are.
+
+        Measured on 68 real queries against a 318-memory store, graded by
+        hand: at 0.4 this kept 97% of the exact matches and 68% of the
+        related ones while dropping 61% of the irrelevant hits, and a
+        default 20-hit result shrank to 12. Cosine was tried as the signal
+        and does not separate relevant from irrelevant for this model."""
+        top = max((bm.get(m, 0.0) for m in seeds), default=0.0)
+        if top <= 0.0:
+            return seeds
+        cut = self._relevance_floor * top
+        return {m: s for m, s in seeds.items()
+                if bm.get(m, 0.0) >= cut or cos.get(m, 0.0) >= _SEMANTIC_KEEP}
 
     def _ids_matching_tags(self, ids, tag_list) -> set:
         """Subset of `ids` whose stored tags are a superset of `tag_list`
@@ -2403,13 +2454,18 @@ class Store:
                 return []
             return self._excerpt_hits(
                 self._recall_by_tags(type, tag_list, limit), query, full)
-        seeds = self._seed_scores(query, type)
+        bm, cos = {}, {}
+        seeds = self._seed_scores(query, type, bm, cos)
         if tag_list:
             # #111: an indexed memory_tags lookup scoped to just the seed
             # ids, replacing the old _tags_of_many + _tags_match combination
             # (which pulled every seed's raw tags into Python to filter).
             matching = self._ids_matching_tags(list(seeds), tag_list)
             seeds = {mid: s for mid, s in seeds.items() if mid in matching}
+        # After the tag filter, so the floor is relative to the best hit in
+        # the set actually being searched.
+        if self._relevance_floor:
+            seeds = self._above_relevance_floor(seeds, bm, cos)
         # #124 follow-up (#126): gate on `seeds` here, before anything below
         # can write. resolve_session() below used to write two `meta` rows
         # (session bookkeeping - it is in-memory now) whether or not the
@@ -2471,8 +2527,22 @@ class Store:
             seeds.items(), key=lambda kv: (-kv[1], kv[0]))]
         head = seed_order[:self._protect_head]
         head_set = set(head)
-        tail = sorted((m for m in activation if m not in head_set),
-                      key=lambda m: (-activation[m], m))
+        if self._assoc_max is None:
+            direct_tail = []
+            tail = sorted((m for m in activation if m not in head_set),
+                          key=lambda m: (-activation[m], m))
+        else:
+            # Activation is not on a seed score's scale: an edge of weight
+            # above 1 amplifies, so a graph-reached memory routinely carries
+            # many times the best seed's activation and, ranked on it,
+            # outranks direct matches and fills whatever `limit` leaves.
+            # Measured on 68 real queries those additions were relevant 21%
+            # of the time against 72% for direct matches. So: every direct
+            # match first, in its own order, then a bounded number of
+            # graph-reached (or session-primed) memories.
+            direct_tail = seed_order[self._protect_head:]
+            tail = sorted((m for m in activation if m not in seeds),
+                          key=lambda m: (-activation[m], m))
         if tag_list:
             # a tag filter must hold for the whole result, not just the seed
             # tier - otherwise associative spread could hand back a hit the
@@ -2480,7 +2550,9 @@ class Store:
             # just the tail ids, in place of _tags_of_many + _tags_match.
             matching_tail = self._ids_matching_tags(tail, tag_list)
             tail = [m for m in tail if m in matching_tail]
-        order = (head + tail)[:limit]
+        if self._assoc_max is not None:
+            tail = tail[:self._assoc_max]
+        order = (head + direct_tail + tail)[:limit]
         # B1: learn from what the query was ABOUT (the direct-hit head), not
         # from everything the recall returned. Spread- and priming-surfaced
         # tail members consume session activation but never produce it —
